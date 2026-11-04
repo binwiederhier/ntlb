@@ -1,0 +1,51 @@
+# ntfy-lb config. Reload with "systemctl reload ntfy-lb" (SIGHUP) or "ntfy-lb reload":
+# everything but the listen addresses and client-keepalive applies without cutting a stream.
+
+# Public listeners. HTTPS serves HTTP/2 and HTTP/1.1; the certificate is re-read on reload,
+# so a certbot deploy hook can just run "systemctl reload ntfy-lb".
+listen-http: ":80"
+listen-https: ":443"
+cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
+key-file: /etc/letsencrypt/live/ntfy.sh/privkey.pem
+
+# Admin API, /v1/health, /v1/ready and /metrics. No auth: keep it on localhost or a private IP.
+listen-admin: "127.0.0.1:2590"
+
+# Access log in nginx "combined" format plus key=value fields. Reopened on reload (logrotate).
+# access-log: /var/log/ntfy-lb/access.log
+
+# TCP keepalive probes towards the clients and towards the upstreams. Dead peers are detected
+# after idle + interval*count. Set "disable: true" to turn them off.
+client-keepalive:
+  idle: 1m
+  interval: 15s
+  count: 4
+upstream-keepalive:
+  idle: 1m
+  interval: 15s
+  count: 4
+
+upstream-connect-timeout: 5s # A node that does not accept within this is down, try the next
+upstream-read-timeout: 3m    # Cut a stream after this long without a byte (ntfy sends keepalives every 45s)
+
+drain-duration: 5m           # Default for "drain" commands and for upstreams removed from this file
+shutdown-drain-duration: 2m  # SIGTERM: not ready right away, streams closed over this long
+
+health-check:
+  path: /v1/ready # ntfy's readiness: 503 while draining or passive
+  interval: 5s
+  timeout: 3s
+  fails: 3        # Failed probes in a row before an upstream leaves the rotation
+  passes: 2       # Good probes in a row before it comes back
+
+# Clients are hashed to upstream NAMES (rendezvous hashing over their IP, IPv6 by /64), so every
+# load balancer with the same names routes a client to the same node. Several addresses per
+# upstream (e.g. one node's ports) each hold up to ~63k connections from one source IP.
+# Example addresses
+upstreams:
+  - name: app1
+    addresses: ["10.108.0.11:2586", "10.108.0.11:2587"]
+  - name: app3
+    addresses: ["10.108.0.13:2586", "10.108.0.13:2587"]
+  - name: app5
+    addresses: ["10.108.0.15:2586", "10.108.0.15:2587"]

@@ -1,0 +1,262 @@
+// Package server runs the load balancer's listeners: the HTTP/HTTPS listeners that proxy to the
+// upstreams, and the admin listener with /v1/health, /v1/ready, the admin API and the metrics.
+package server
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"heckel.io/ntfy-lb/balancer"
+	"heckel.io/ntfy-lb/config"
+)
+
+const (
+	readHeaderTimeout = 30 * time.Second
+	idleTimeout       = 65 * time.Second // Like nginx's keepalive_timeout
+	maxHeaderBytes    = 64 * 1024
+	shutdownGrace     = 5 * time.Second // After the drain: how long the last responses get to finish
+)
+
+// Server is the load balancer process: listeners, proxy and admin API around a balancer.Balancer
+type Server struct {
+	configFile string
+	config     atomic.Pointer[config.Config]
+	balancer   *balancer.Balancer
+	proxy      *proxy
+	certs      *certStore
+	accessLog  *accessLog
+	servers    []*http.Server // Proxying servers (HTTP, HTTPS)
+	admin      *http.Server
+	listeners  map[string]net.Listener
+	reloadMu   sync.Mutex // Serializes reloads
+	stopOnce   sync.Once
+	stopped    chan struct{}
+}
+
+// New loads the config file and binds all listeners, so that a bad address fails right away.
+// Call Serve to start serving.
+func New(configFile string) (*Server, error) {
+	conf, err := config.Load(configFile)
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{
+		configFile: configFile,
+		balancer:   balancer.New(conf),
+		listeners:  make(map[string]net.Listener),
+		stopped:    make(chan struct{}),
+	}
+	s.config.Store(conf)
+	s.proxy = newProxy(s.balancer, conf)
+	if conf.ListenHTTPS != "" {
+		s.certs = &certStore{}
+		if err := s.certs.load(conf.CertFile, conf.KeyFile); err != nil {
+			return nil, err
+		}
+	}
+	if conf.AccessLog != "" {
+		if s.accessLog, err = newAccessLog(conf.AccessLog); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.listen(conf); err != nil {
+		s.closeListeners()
+		return nil, err
+	}
+	return s, nil
+}
+
+// Serve probes the upstreams once, then serves until Shutdown is done. ctx bounds the balancer's
+// background loops.
+func (s *Server) Serve(ctx context.Context) error {
+	s.balancer.Start(ctx)
+	errChan := make(chan error, len(s.listeners))
+	serve := func(name string, srv *http.Server, ln net.Listener, tls bool) {
+		slog.Info("Listening", "listener", name, "addr", ln.Addr().String())
+		var err error
+		if tls {
+			err = srv.ServeTLS(ln, "", "")
+		} else {
+			err = srv.Serve(ln)
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errChan <- fmt.Errorf("%s listener: %w", name, err)
+		}
+	}
+	for _, srv := range s.servers {
+		go serve(srv.Addr, srv, s.listeners[srv.Addr], srv.TLSConfig != nil)
+	}
+	go serve(listenerAdmin, s.admin, s.listeners[listenerAdmin], false)
+	select {
+	case err := <-errChan:
+		s.Shutdown(0)
+		return err
+	case <-s.stopped:
+		return nil
+	}
+}
+
+// Reload re-reads the config file and applies it: upstreams, health checks, timeouts, drain
+// durations, the certificate and the access log. Listener addresses and client keepalives only
+// change with a restart. A broken config is rejected as a whole.
+func (s *Server) Reload() error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	conf, err := config.Load(s.configFile)
+	if err != nil {
+		return err
+	}
+	old := s.config.Load()
+	if !old.ListenersEqual(conf) {
+		slog.Warn("Listener addresses changed, restart to apply them")
+	}
+	if s.certs != nil {
+		if err := s.certs.load(conf.CertFile, conf.KeyFile); err != nil {
+			return err
+		}
+	}
+	if s.accessLog != nil {
+		if err := s.accessLog.reopen(); err != nil {
+			return err
+		}
+	}
+	if err := s.balancer.Update(conf); err != nil {
+		return err
+	}
+	s.proxy.update(conf)
+	s.config.Store(conf)
+	slog.Info("Config reloaded", "upstreams", len(conf.Upstreams))
+	return nil
+}
+
+// Shutdown drains the load balancer over d (not ready right away, streams closed oldest first),
+// then closes the listeners and returns once every response finished or the grace period passed
+func (s *Server) Shutdown(d time.Duration) {
+	s.stopOnce.Do(func() {
+		slog.Info("Shutting down", "drain", d)
+		s.balancer.Drain(d)
+		ctx, cancel := context.WithTimeout(context.Background(), d+shutdownGrace)
+		defer cancel()
+		if err := s.balancer.WaitIdle(ctx); err != nil {
+			slog.Warn("Streams still open after the drain", "error", err)
+		}
+		graceCtx, graceCancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer graceCancel()
+		var wg sync.WaitGroup
+		for _, srv := range append(s.servers, s.admin) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := srv.Shutdown(graceCtx); err != nil {
+					srv.Close()
+				}
+			}()
+		}
+		wg.Wait()
+		if s.accessLog != nil {
+			s.accessLog.close()
+		}
+		close(s.stopped)
+	})
+}
+
+// HTTPAddr returns the address the HTTP listener is bound to, or "" if there is none
+func (s *Server) HTTPAddr() string {
+	return s.listenerAddr(listenerHTTP)
+}
+
+// HTTPSAddr returns the address the HTTPS listener is bound to, or "" if there is none
+func (s *Server) HTTPSAddr() string {
+	return s.listenerAddr(listenerHTTPS)
+}
+
+// AdminAddr returns the address the admin listener is bound to
+func (s *Server) AdminAddr() string {
+	return s.listenerAddr(listenerAdmin)
+}
+
+// Listener names, also the http.Server.Addr of each server
+const (
+	listenerHTTP  = "http"
+	listenerHTTPS = "https"
+	listenerAdmin = "admin"
+)
+
+func (s *Server) listen(conf *config.Config) error {
+	// Proxying listeners, with the configured TCP keepalives towards the clients
+	ka := conf.ClientKeepalive.KeepAliveConfig()
+	lc := &net.ListenConfig{
+		KeepAliveConfig: ka,
+	}
+	if !ka.Enable {
+		lc.KeepAlive = -1
+	}
+	handler := http.Handler(s.proxy)
+	if s.accessLog != nil {
+		handler = s.accessLog.handler(handler)
+	}
+	if conf.ListenHTTP != "" {
+		ln, err := lc.Listen(context.Background(), "tcp", conf.ListenHTTP)
+		if err != nil {
+			return err
+		}
+		s.listeners[listenerHTTP] = ln
+		s.servers = append(s.servers, newHTTPServer(listenerHTTP, handler))
+	}
+	if conf.ListenHTTPS != "" {
+		ln, err := lc.Listen(context.Background(), "tcp", conf.ListenHTTPS)
+		if err != nil {
+			return err
+		}
+		s.listeners[listenerHTTPS] = ln
+		srv := newHTTPServer(listenerHTTPS, handler)
+		srv.TLSConfig = &tls.Config{
+			MinVersion:     tls.VersionTLS12,
+			GetCertificate: s.certs.get,
+		}
+		s.servers = append(s.servers, srv)
+	}
+
+	// Admin listener
+	ln, err := net.Listen("tcp", conf.ListenAdmin)
+	if err != nil {
+		return err
+	}
+	s.listeners[listenerAdmin] = ln
+	s.admin = newHTTPServer(listenerAdmin, s.adminHandler())
+	return nil
+}
+
+func (s *Server) closeListeners() {
+	for _, ln := range s.listeners {
+		ln.Close()
+	}
+}
+
+func (s *Server) listenerAddr(name string) string {
+	if ln, ok := s.listeners[name]; ok {
+		return ln.Addr().String()
+	}
+	return ""
+}
+
+// newHTTPServer creates a server without read or write timeouts beyond the request header: its
+// requests are long-lived streams in both directions
+func newHTTPServer(name string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              name,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelDebug), // TLS handshake errors and the like
+	}
+}

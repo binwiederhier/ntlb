@@ -1,0 +1,23 @@
+[Unit]
+Description=ntfy-lb, load balancer for ntfy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ntfy-lb serve --config /etc/ntfy-lb/config.yml
+ExecReload=/bin/kill -HUP $MAINPID
+# SIGTERM drains over shutdown-drain-duration (default 2m) before exiting: give it that plus a margin
+TimeoutStopSec=5m
+KillMode=mixed
+Restart=on-failure
+RestartSec=2s
+# One fd per client connection plus one per upstream connection
+LimitNOFILE=1000000
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+DynamicUser=yes
+# The certificate must be readable by the dynamic user, e.g. add "SupplementaryGroups=ssl-cert"
+# and give that group read access to /etc/letsencrypt/{live,archive}
+LogsDirectory=ntfy-lb
+
+[Install]
+WantedBy=multi-user.target
