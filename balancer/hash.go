@@ -17,6 +17,9 @@ const (
 // masked prefix, cut to whole bytes; with the defaults of 32 and 64 it is 4 or 8 bytes.
 func ClientKey(addr netip.Addr, ipv4PrefixBits, ipv6PrefixBits int) []byte {
 	addr = addr.Unmap()
+	if !addr.IsValid() {
+		return nil
+	}
 	bits := ipv6PrefixBits
 	if addr.Is4() {
 		bits = ipv4PrefixBits

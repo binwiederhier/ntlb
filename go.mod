@@ -3,6 +3,7 @@ module heckel.io/ntfy-lb
 go 1.24
 
 require (
+	github.com/expr-lang/expr v1.17.8
 	github.com/prometheus/client_golang v1.22.0
 	github.com/stretchr/testify v1.12.1
 	github.com/urfave/cli/v3 v3.14.0

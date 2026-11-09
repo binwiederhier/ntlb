@@ -124,3 +124,8 @@ func TestClientKey_InvalidPrefixBits(t *testing.T) {
 	require.Equal(t, []byte{1, 2, 3, 4}, ClientKey(netip.MustParseAddr("1.2.3.4"), 33, 64))
 	require.Len(t, ClientKey(netip.MustParseAddr("2001:db8::1"), 32, 129), 16)
 }
+
+func TestClientKey_InvalidAddr(t *testing.T) {
+	// net/http always sets a valid remote address; an invalid one must not panic
+	require.Empty(t, ClientKey(netip.Addr{}, 32, 64))
+}

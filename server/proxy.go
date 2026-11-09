@@ -61,6 +61,7 @@ type proxyRequest struct {
 	kind           string // kindRequest, kindStream or kindWebSocket
 	session        *balancer.Session
 	cancel         context.CancelCauseFunc
+	rule           string // The rule that blocked or limited the request, if any
 	upstream       string // Set once an upstream answered
 	upstreamStatus int
 	status         int   // Set by the stream path, which may bypass the ResponseWriter

@@ -46,6 +46,7 @@ type metrics struct {
 	retries         *prometheus.CounterVec
 	refused         prometheus.Counter
 	streamsClosed   *prometheus.CounterVec
+	ruleMatches     *prometheus.CounterVec
 }
 
 // statusCollector exports the balancer's Status as gauges and counters
@@ -101,6 +102,11 @@ func newMetrics(b *balancer.Balancer) *metrics {
 			Name:      "streams_closed_total",
 			Help:      "Subscription streams the load balancer closed, by reason (drained, read_timeout)",
 		}, []string{"reason"}),
+		ruleMatches: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "rule_matches_total",
+			Help:      "Requests a rule blocked or limited, by rule",
+		}, []string{"rule"}),
 	}
 	for _, protocol := range []string{protocolHTTP1, protocolHTTP2, protocolWebSocket} {
 		m.streams.WithLabelValues(protocol)
@@ -119,6 +125,7 @@ func newMetrics(b *balancer.Balancer) *metrics {
 		m.retries,
 		m.refused,
 		m.streamsClosed,
+		m.ruleMatches,
 		newStatusCollector(b),
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),

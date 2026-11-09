@@ -58,16 +58,21 @@ func (w *statusWriter) Unwrap() http.ResponseWriter {
 }
 
 func newAccessLog(filename string) (*accessLog, error) {
-	l := &accessLog{
-		done: make(chan struct{}),
-	}
 	file, err := openAccessLog(filename)
 	if err != nil {
 		return nil, err
 	}
+	return newAccessLogFile(file), nil
+}
+
+// newAccessLogFile creates a log that writes to an opened file (nil: off)
+func newAccessLogFile(file *os.File) *accessLog {
+	l := &accessLog{
+		done: make(chan struct{}),
+	}
 	l.swap(file)
 	go l.flushLoop()
-	return l, nil
+	return l
 }
 
 // accessLogEntry holds what a log line needs from the request, taken upfront so that a stream
@@ -86,6 +91,10 @@ func (l *accessLog) entry(r *http.Request, start time.Time) *accessLogEntry {
 	if !l.enabled.Load() {
 		return nil
 	}
+	return newAccessLogEntry(r, start)
+}
+
+func newAccessLogEntry(r *http.Request, start time.Time) *accessLogEntry {
 	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		remoteAddr = r.RemoteAddr
@@ -106,9 +115,13 @@ func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest, status int) {
 	if pr.upstream != "" {
 		upstream, upstreamStatus = pr.upstream, fmt.Sprint(pr.upstreamStatus)
 	}
-	line := fmt.Sprintf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s request_time=%.3f upstream=%s upstream_status=%s\n",
+	line := fmt.Sprintf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s request_time=%.3f upstream=%s upstream_status=%s",
 		e.remoteAddr, e.start.Format(accessLogTimeFormat), e.request, status, bytes,
 		escape(e.referer), escape(e.userAgent), escape(e.host), time.Since(e.start).Seconds(), upstream, upstreamStatus)
+	if pr.rule != "" {
+		line += " rule=" + pr.rule
+	}
+	line += "\n"
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.w != nil { // Turned off while the request ran

@@ -1,0 +1,56 @@
+# ntfy-lb rules, an example. Point the config at it with "rules-file: /etc/ntfy-lb/rules.yml"
+# (or put a rules: list into the config itself; a rules-file's rules come after those).
+#
+# Rules change with a reload ("systemctl reload ntfy-lb" or "ntfy-lb reload"), which never cuts
+# open streams; a file with an error is rejected as a whole, and the old rules stay.
+#
+# match is a boolean expression in the expr language (https://expr-lang.org, the language of
+# CrowdSec's filters), checked when the config loads. A rule without match matches every request.
+#
+#   method                 "GET", "POST", ...
+#   path                   the URL path, decoded, without the query
+#   query                  the raw query string
+#   host                   the Host header
+#   ip                     the client address (IPv4-mapped IPv6 addresses as IPv4)
+#   header("Name")         the first value of a header, "" if missing
+#   ipIn(ip, "net", ...)   whether ip is in any of the networks (CIDR prefixes or addresses,
+#                          string literals only, so they are parsed once)
+#
+#   operators: == != && || ! in matches (RE2 regex) startsWith endsWith contains, ( ), and the
+#   expr builtins like lower() and len()
+#
+# Rules are checked in order, and the first one that decides wins:
+#
+#   action: block   answers status (default 403) and stops
+#   action: limit   a token bucket per client key (the client IP shortened like hash: in the
+#                   config): rate requests per s, m or h, plus burst at once (like nginx's
+#                   limit_req burst=N nodelay); over it, answers status (default 429) and stops;
+#                   under it, the next rules are checked
+#   action: allow   stops checking, so the request passes (e.g. to exempt clients from a limit)
+#
+# log: a file that gets the requests the rule blocks or limits, in the access log format with a
+# rule=<name> field (the access log gets that field too). Point CrowdSec (or fail2ban) at it to
+# ban repeat offenders. Rules may share a file. ntfy_lb_rule_matches_total{rule} counts them.
+
+rules:
+  # Abusive topics and clients
+  - name: abuse-topics
+    match: path matches "^/(spam-|my-bets($|/))"
+    log: /var/log/ntfy-lb/abuse.log
+  - name: abuse-clients
+    match: header("User-Agent") matches "(?i)ntfy-spy" || ipIn(ip, "192.0.2.0/24", "2001:db8:bad::/48")
+    log: /var/log/ntfy-lb/abuse.log
+  - name: abuse-topic-count # Subscribing to 150+ topics at once
+    match: path matches "^/[^/]*(,[^/,]*){150,}"
+    log: /var/log/ntfy-lb/abuse.log
+
+  # A request limit for everyone except a few known heavy users
+  - name: limit-exempt
+    match: ipIn(ip, "198.51.100.7", "203.0.113.0/24")
+    action: allow
+  - name: limit
+    action: limit
+    rate: 45/m
+    burst: 1000
+    status: 503 # What nginx's limit_req answers by default
+    log: /var/log/ntfy-lb/limit.log

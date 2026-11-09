@@ -16,6 +16,7 @@ import (
 
 	"heckel.io/ntfy-lb/balancer"
 	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntfy-lb/rules"
 )
 
 const (
@@ -32,8 +33,10 @@ type Server struct {
 	config     atomic.Pointer[config.Config]
 	balancer   *balancer.Balancer
 	proxy      *proxy
+	rules      *rules.Engine
 	certs      *certStore
 	accessLog  *accessLog
+	ruleLogs   *ruleLogs
 	metrics    *metrics
 	servers    []*http.Server // Proxying servers (HTTP, HTTPS)
 	admin      *http.Server
@@ -53,6 +56,8 @@ func New(configFile string) (*Server, error) {
 	s := &Server{
 		configFile: configFile,
 		balancer:   balancer.New(conf),
+		rules:      rules.New(conf),
+		ruleLogs:   newRuleLogs(),
 		listeners:  make(map[string]net.Listener),
 		stopped:    make(chan struct{}),
 	}
@@ -68,9 +73,16 @@ func New(configFile string) (*Server, error) {
 	if s.accessLog, err = newAccessLog(conf.AccessLog); err != nil {
 		return nil, err
 	}
+	ruleFiles, err := openRuleLogFiles(conf)
+	if err != nil {
+		s.accessLog.close()
+		return nil, err
+	}
+	s.ruleLogs.swap(ruleFiles)
 	if err := s.listen(conf); err != nil {
 		s.closeListeners()
 		s.accessLog.close()
+		s.ruleLogs.close()
 		return nil, err
 	}
 	return s, nil
@@ -107,7 +119,7 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 // Reload re-reads the config file and applies it: upstreams, health checks, timeouts, drain
-// durations, streams, hashing, the certificate and the access log. A broken config (or a
+// durations, streams, hashing, the rules and their logs, the certificate and the access log. A broken config (or a
 // certificate or log file that cannot be opened) is rejected as a whole. It returns the changed
 // settings that only a restart applies: listener addresses and client keepalives.
 func (s *Server) Reload() ([]string, error) {
@@ -134,14 +146,23 @@ func (s *Server) Reload() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	ruleFiles, err := openRuleLogFiles(conf)
+	if err != nil {
+		if logFile != nil {
+			logFile.Close()
+		}
+		return nil, err
+	}
 	if cert != nil {
 		s.certs.cert.Store(cert)
 	}
 	s.accessLog.swap(logFile)
+	s.ruleLogs.swap(ruleFiles)
+	s.rules.Update(conf)
 	s.balancer.Update(conf)
 	s.proxy.update(conf)
 	s.config.Store(conf)
-	slog.Info("Config reloaded", "upstreams", len(conf.Upstreams))
+	slog.Info("Config reloaded", "upstreams", len(conf.Upstreams), "rules", len(conf.Rules))
 	return restart, nil
 }
 
@@ -175,23 +196,39 @@ func (s *Server) Shutdown(d time.Duration) {
 		}
 		wg.Wait()
 		s.accessLog.close()
+		s.ruleLogs.close()
 		close(s.stopped)
 	})
 }
 
-// observe wraps the proxy to see every request's outcome, for the access log and the metrics.
-// The outcome is recorded by a finisher, when the request ends, which for a detached stream is
-// after the handler returned.
+// observe wraps the proxy to see every request's outcome, for the access log and the metrics,
+// and answers the requests that a rule blocks or limits itself. The outcome is recorded by a
+// finisher, when the request ends, which for a detached stream is after the handler returned.
 func (s *Server) observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		entry := s.accessLog.entry(r, start)
 		pr := &proxyRequest{}
 		sw := &statusWriter{ResponseWriter: w}
+		rule := s.rules.Check(r)
+		var ruleLog *accessLog
+		var ruleEntry *accessLogEntry
+		if rule != nil {
+			pr.rule, pr.kind = rule.Name, kindRequest
+			s.metrics.ruleMatches.WithLabelValues(rule.Name).Inc()
+			if rule.Log != "" {
+				if ruleLog, ruleEntry = s.ruleLogs.get(rule.Log), entry; ruleEntry == nil {
+					ruleEntry = newAccessLogEntry(r, start)
+				}
+			}
+		}
 		pr.onFinish(func() {
 			status := pr.finalStatus() // Must not use sw: it references the server's connection state
 			if entry != nil {
 				s.accessLog.write(entry, pr, status)
+			}
+			if ruleLog != nil {
+				ruleLog.write(ruleEntry, pr, status)
 			}
 			s.metrics.observe(pr, status, start)
 		})
@@ -203,6 +240,10 @@ func (s *Server) observe(next http.Handler) http.Handler {
 				pr.finish()
 			}
 		}()
+		if rule != nil {
+			http.Error(sw, http.StatusText(rule.Status), rule.Status)
+			return
+		}
 		next.ServeHTTP(sw, r.WithContext(withProxyRequest(r.Context(), pr)))
 	})
 }

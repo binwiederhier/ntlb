@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"time"
 
@@ -61,6 +62,8 @@ type Config struct {
 	Streams                *Streams      `yaml:"streams"`
 	Hash                   *Hash         `yaml:"hash"`
 	Upstreams              []*Upstream   `yaml:"upstreams"`
+	RulesFile              string        `yaml:"rules-file"` // More rules, appended to rules; reloaded with the config
+	Rules                  []*Rule       `yaml:"rules"`
 }
 
 // Keepalive configures TCP keepalive probes on a connection (see net.KeepAliveConfig)
@@ -110,16 +113,24 @@ func Load(filename string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Parse(b)
+	return parse(b, filepath.Dir(filename))
 }
 
 // Parse defaults and validates a config from YAML. Unknown fields are rejected, so that a typo
 // does not silently fall back to a default.
 func Parse(b []byte) (*Config, error) {
+	return parse(b, "")
+}
+
+// parse is Parse with the directory that a relative rules-file is relative to
+func parse(b []byte, dir string) (*Config, error) {
 	c := &Config{}
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
 	if err := dec.Decode(c); err != nil && !errors.Is(err, io.EOF) { // EOF: empty file
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	if err := c.loadRulesFile(dir); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	c.applyDefaults()
@@ -207,6 +218,7 @@ func (c *Config) applyDefaults() {
 	if c.Hash.IPv6PrefixBits == 0 {
 		c.Hash.IPv6PrefixBits = DefaultHashIPv6PrefixBits
 	}
+	c.applyRuleDefaults()
 }
 
 func (c *Config) validate() error {
@@ -263,7 +275,7 @@ func (c *Config) validate() error {
 			}
 		}
 	}
-	return nil
+	return c.validateRules()
 }
 
 func (k *Keepalive) applyDefaults() {

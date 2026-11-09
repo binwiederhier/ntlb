@@ -42,17 +42,25 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
 - **Several addresses per upstream** (e.g. one node's ports), each good for ~63k connections from
   one source IP; new streams go to the address with the fewest.
 - **Reload without cutting streams** (`SIGHUP`, `systemctl reload`, `ntfy-lb reload`): upstreams,
-  health checks, timeouts, drain durations, streams, hashing, the TLS certificate and the access
-  log (path, on/off). Streams to upstreams that stay are untouched. Listener addresses and client
+  health checks, timeouts, drain durations, streams, hashing, rules, the TLS certificate and the
+  access log (path, on/off). Streams to upstreams that stay are untouched. Listener addresses and client
   keepalives need a restart; a reload says so. A broken config (or certificate, or log path) is
   rejected as a whole.
+- **Rules, changed live**: block, rate limit or allow the requests a boolean expression matches
+  (method, path, query, host, client IP and networks, headers; `&&`, `||`, `!`, regexes), e.g.
+  abusive topics or user agents, a per-IP request limit like nginx's `limit_req`, and exemptions
+  from it. Expressions are in [expr](https://expr-lang.org), the language of CrowdSec's filters,
+  and are checked when the config loads. Rules are checked in order and reloaded with the config
+  (or a separate `rules-file`) without cutting open streams; a rule can log what it blocks to its
+  own file, for CrowdSec or fail2ban. See [packaging/rules.yml](packaging/rules.yml).
 - **Paced draining**: an upstream removed from the config, an upstream drained by command, and the
   load balancer itself (by command or on `SIGTERM`) close their streams oldest first, evenly spread
   over a duration. A draining load balancer turns away new *subscriptions* (so clients back off or
   go to another load balancer instead of coming back to be drained again) but keeps serving
   publishes.
 - **`/v1/health` and `/v1/ready`** like ntfy's, plus a status API, Prometheus metrics (requests by
-  upstream/code/kind, durations, streams by protocol, retries, drains, Go and process metrics),
+  upstream/code/kind, durations, streams by protocol, retries, drains, rule matches, Go and process
+  metrics),
   pprof, and a CLI on top.
 
 ## Status and results
@@ -133,8 +141,9 @@ cannot be hijacked.
 
 ### Open items
 
-- The nginx features not ported yet, listed under [nginx parity](#nginx-parity): abuse blocks,
-  `limit_req`, the CrowdSec log partitioning, website and docs redirects.
+- The nginx features not ported yet, listed under [nginx parity](#nginx-parity): the CrowdSec log
+  partitioning by status, logging the 400s Go answers before the handler, gzip, website and docs
+  redirects.
 - Optional: turn off HTTP/2 on the LB. The app would move to HTTP/1.1 over TLS (~32 KiB instead of
   ~37 KiB), at the cost of one TCP+TLS connection per subscription. Not worth it at today's size.
 - Rollout plan (one LB at a time behind DNS, or side by side on another port first).
@@ -171,6 +180,28 @@ upstreams:
 
 A reload applies everything except `listen-*` and `client-keepalive`, which need a restart
 (`ntfy-lb reload` lists them if they changed). Unknown keys are an error.
+
+Rules block, limit or allow requests; edit them and reload, open streams stay. The format is
+documented in [packaging/rules.yml](packaging/rules.yml):
+
+```yaml
+rules-file: /etc/ntfy-lb/rules.yml   # and/or a rules: list right here, checked first
+```
+```yaml
+rules:
+  - name: abuse                               # block (403) is the default action
+    match: method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7") || path matches "^/nz_")
+    log: /var/log/ntfy-lb/abuse.log           # for CrowdSec: one access log line per match
+  - name: abuse-user-agents
+    match: header("User-Agent") matches "(?i)ntfy-spy"
+  - name: limit-exempt
+    match: ipIn(ip, "116.203.112.46", "176.126.240.0/24")
+    action: allow                             # stops checking: these skip the limit below
+  - name: limit                               # no match: every request
+    action: limit                             # per client IP (IPv6 /64), like limit_req nodelay
+    rate: 45/m
+    burst: 1000
+```
 
 For a backend other than ntfy, set which requests are long-lived streams, and the health path:
 
@@ -251,8 +282,9 @@ log in the `combined_ssl` format, and `worker_shutdown_timeout`-style draining (
 
 **Not** taken over (yet), so nginx-only today:
 
-- the edge abuse blocks (`$abuse_topic`, `$abuse_user_agent`, over-long topic lists -> 403/414)
-- `limit_req` (45r/m, burst 1000) and its exemption list
+- the ntfy.sh abuse maps and `limit_req` themselves: rules can express them now (see
+  [packaging/rules.yml](packaging/rules.yml)), but the translation of today's nginx config lives
+  in ansible and is not written yet
 - the access-log partitioning (`access_error_*.log`) that the CrowdSec jails read
 - the HTTP -> HTTPS redirect for web pages, the static website (`/`, `/_next`, `/_site`) and the
   `/docs` redirects

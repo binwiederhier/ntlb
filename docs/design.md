@@ -172,6 +172,38 @@ request: the outermost handler (`finishUnlessDetached`), or the stream goroutine
 not reference the `ResponseWriter` or the request (the access log copies what it needs into an
 `accessLogEntry` upfront), or they pin the very server state the detach frees.
 
+## Rules (`rules/`, `match/`, `config/rules.go`, `server/rules.go`)
+
+A rule's `match` is an [expr](https://expr-lang.org) expression (`match/`): it is compiled and
+type-checked as a boolean when the config loads, so a typo or a bad regex rejects the reload.
+Expressions see `method`, `path`, `query`, `host`, `ip`, `header(name)`, and `ipIn(ip, net...)`,
+whose networks must be string literals: a patch visitor parses them at compile time into a map
+per program, so the runtime side is a map lookup and `Prefix.Contains`. Constant regexes are
+compiled once by expr. VMs are pooled. Why expr: AND/OR/NOT without inventing YAML structure or
+a parser of our own, it is what CrowdSec's filters use, it has no side effects, and it costs
+~0.3 us per expression of the size we use.
+
+`rules.Engine` holds one generation of rules in an atomic pointer; `Check` walks them in order:
+`allow` and `block` decide, a `limit` decides only when the client's bucket is empty. The
+request's expression environment is built once, for the first rule that has an expression.
+
+Limits are token buckets per client key (`balancer.ClientKey`, the same prefix as routing), with
+`burst + 1` tokens, like `limit_req ... burst=N nodelay`. A limited request takes no token.
+Buckets that refilled are forgotten by a sweep at most once a minute, inline in `take`, so there
+is no goroutine. On `Update`, a limit rule with the same name, rate and burst (and unchanged hash
+prefix bits) keeps its buckets, so a reload for an unrelated change does not reset clients.
+
+`Server.observe` checks the rules before the proxy, so blocked requests never reach an upstream
+and still get an access log line (with `rule=<name>`), metrics (`ntfy_lb_rule_matches_total`) and
+their rule's own log line. Rule logs are `accessLog`s by path (`ruleLogs`): a reload opens every
+path first (so an unopenable one rejects the reload), reopens paths that stay (logrotate), and
+closes paths that are gone. Open streams are not re-checked: CrowdSec's firewall bouncer cuts a
+banned client's connections anyway, and keeping each stream's request around would cost memory.
+
+Cost: rules shaped like ntfy.sh's nginx config (13 topic patterns, a user agent, the topic count,
+6 exempt networks, a limit) take ~1.1 us and 9 small allocations per request on one core
+(`BenchmarkEngine_Check`), about 0.1% of a core at ntfy.sh's ~720 requests/s.
+
 ## Metrics (`server/metrics.go`)
 
 Prometheus client on the admin listener's `/metrics`. Request outcomes are recorded by the same
@@ -183,6 +215,7 @@ finisher as the access log (`Server.observe`), so detached streams are counted w
 - `ntfy_lb_streams{protocol}` (http1, http2, websocket), `ntfy_lb_open_requests`
 - `ntfy_lb_retries_total{reason}` (connect, error, 503), `ntfy_lb_refused_total`,
   `ntfy_lb_streams_closed_total{reason}` (drained, read_timeout)
+- `ntfy_lb_rule_matches_total{rule}`: requests a rule blocked or limited
 - `ntfy_lb_ready`, `ntfy_lb_draining`, `ntfy_lb_upstream_{healthy,draining,streams,requests_total,failures_total}`
 - the Go and process collectors (`go_*`, `process_*`: memory, goroutines, fds)
 

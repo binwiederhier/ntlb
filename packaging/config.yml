@@ -58,6 +58,10 @@ hash:
   ipv4-prefix-bits: 32
   ipv6-prefix-bits: 64
 
+# Rules that block, rate limit or allow requests by path, query, method, IP and headers, e.g. for
+# abusive clients; see rules.yml for the format. Reloaded with the config, open streams untouched.
+# rules-file: /etc/ntfy-lb/rules.yml
+
 # Clients are hashed to upstream NAMES (rendezvous hashing over their IP, IPv6 by /64), so every
 # load balancer with the same names routes a client to the same node. Several addresses per
 # upstream (e.g. one node's ports) each hold up to ~63k connections from one source IP.
