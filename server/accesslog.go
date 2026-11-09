@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,14 +19,14 @@ const (
 )
 
 // accessLog writes one line per request in the format of the nginx log_format "combined_ssl" on
-// ntfy.sh (combined, then key=value fields), so the existing log parsers keep working. It is
-// reopened on reload, for logrotate.
+// ntfy.sh (combined, then key=value fields), so the existing log parsers keep working. A reload
+// reopens it (for logrotate), moves it, or turns it on or off; with no file, nothing is logged.
 type accessLog struct {
-	filename string
-	file     *os.File
-	w        *bufio.Writer
-	done     chan struct{}
-	mu       sync.Mutex // Protects file and w
+	enabled atomic.Bool
+	file    *os.File
+	w       *bufio.Writer
+	done    chan struct{}
+	mu      sync.Mutex // Protects file and w
 }
 
 // statusWriter records the status and body size of a response. Unwrap lets
@@ -58,12 +59,13 @@ func (w *statusWriter) Unwrap() http.ResponseWriter {
 
 func newAccessLog(filename string) (*accessLog, error) {
 	l := &accessLog{
-		filename: filename,
-		done:     make(chan struct{}),
+		done: make(chan struct{}),
 	}
-	if err := l.reopen(); err != nil {
+	file, err := openAccessLog(filename)
+	if err != nil {
 		return nil, err
 	}
+	l.swap(file)
 	go l.flushLoop()
 	return l, nil
 }
@@ -79,43 +81,27 @@ type accessLogEntry struct {
 	host       string
 }
 
-// handler logs every request served by next, when it ends
-func (l *accessLog) handler(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			remoteAddr = r.RemoteAddr
-		}
-		entry := &accessLogEntry{
-			start:      time.Now(),
-			remoteAddr: remoteAddr,
-			request:    r.Method + " " + escape(r.RequestURI) + " " + r.Proto,
-			referer:    r.Referer(),
-			userAgent:  r.UserAgent(),
-			host:       r.Host,
-		}
-		pr := &proxyRequest{}
-		sw := &statusWriter{ResponseWriter: w}
-		pr.onFinish(func() {
-			l.write(entry, pr) // Must not hold sw: it references the server's connection state
-		})
-		defer func() { // Deferred: a stream cut short ends in a http.ErrAbortHandler panic
-			if !pr.detached {
-				if pr.status == 0 {
-					pr.status, pr.bytes = sw.status, sw.bytes
-				}
-				pr.finish()
-			}
-		}()
-		next.ServeHTTP(sw, r.WithContext(withProxyRequest(r.Context(), pr)))
-	})
+// entry takes what a log line needs from the request, or returns nil if logging is off
+func (l *accessLog) entry(r *http.Request, start time.Time) *accessLogEntry {
+	if !l.enabled.Load() {
+		return nil
+	}
+	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteAddr = r.RemoteAddr
+	}
+	return &accessLogEntry{
+		start:      start,
+		remoteAddr: remoteAddr,
+		request:    r.Method + " " + escape(r.RequestURI) + " " + r.Proto,
+		referer:    r.Referer(),
+		userAgent:  r.UserAgent(),
+		host:       r.Host,
+	}
 }
 
-func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest) {
-	status, bytes := pr.status, pr.bytes
-	if status == 0 && pr.upstreamStatus == http.StatusSwitchingProtocols {
-		status = http.StatusSwitchingProtocols // Hijacked: the 101 went out on the raw connection
-	}
+func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest, status int) {
+	bytes := pr.bytes
 	upstream, upstreamStatus := "-", "-"
 	if pr.upstream != "" {
 		upstream, upstreamStatus = pr.upstream, fmt.Sprint(pr.upstreamStatus)
@@ -125,31 +111,42 @@ func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest) {
 		escape(e.referer), escape(e.userAgent), escape(e.host), time.Since(e.start).Seconds(), upstream, upstreamStatus)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.w.WriteString(line)
+	if l.w != nil { // Turned off while the request ran
+		l.w.WriteString(line)
+	}
 }
 
-// reopen (re)opens the log file, e.g. after logrotate moved it
-func (l *accessLog) reopen() error {
-	file, err := os.OpenFile(l.filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return err
+// openAccessLog opens (or creates) the log file for appending; nil if filename is empty
+func openAccessLog(filename string) (*os.File, error) {
+	if filename == "" {
+		return nil, nil
 	}
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open access log: %w", err)
+	}
+	return file, nil
+}
+
+// swap makes file the log file (nil turns logging off), flushing and closing the old one. It
+// takes an opened file, so a reload can fail before it changes anything.
+func (l *accessLog) swap(file *os.File) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.file != nil {
 		l.w.Flush()
 		l.file.Close()
 	}
-	l.file, l.w = file, bufio.NewWriterSize(file, 64*1024)
-	return nil
+	l.file, l.w = file, nil
+	if file != nil {
+		l.w = bufio.NewWriterSize(file, 64*1024)
+	}
+	l.enabled.Store(file != nil)
 }
 
 func (l *accessLog) close() {
 	close(l.done)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.w.Flush()
-	l.file.Close()
+	l.swap(nil)
 }
 
 func (l *accessLog) flushLoop() {
@@ -161,8 +158,10 @@ func (l *accessLog) flushLoop() {
 			return
 		case <-ticker.C:
 			l.mu.Lock()
-			if err := l.w.Flush(); err != nil {
-				slog.Warn("Cannot write access log", "error", err)
+			if l.w != nil {
+				if err := l.w.Flush(); err != nil {
+					slog.Warn("Cannot write access log", "error", err)
+				}
 			}
 			l.mu.Unlock()
 		}

@@ -3,12 +3,14 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +28,8 @@ const (
 	// reverse proxy's default of 32 KiB would be half of the memory a stream costs; ntfy's
 	// events are small, and larger bodies (attachments) just take more reads.
 	copyBufferSize = 4 * 1024
+
+	statusClientClosedRequest = 499 // nginx's status for a request that ended before a response
 )
 
 var (
@@ -39,11 +43,14 @@ type proxyContextKey struct{}
 // proxy forwards requests to the upstream the balancer picks, streaming both bodies, like
 // nginx with proxy_buffering and proxy_request_buffering off
 type proxy struct {
-	balancer    *balancer.Balancer
-	reverse     *httputil.ReverseProxy
-	transport   atomic.Pointer[http.Transport]
-	dialer      atomic.Pointer[net.Dialer]
-	readTimeout atomic.Int64 // time.Duration
+	balancer  *balancer.Balancer
+	metrics   *metrics
+	reverse   *httputil.ReverseProxy
+	transport atomic.Pointer[http.Transport]
+	dialer    atomic.Pointer[net.Dialer]
+	config    atomic.Pointer[config.Config]
+	active    map[*proxyRequest]struct{}
+	mu        sync.Mutex // Protects active
 }
 
 // proxyRequest is the per-request state shared between ServeHTTP, the transport, the stream path
@@ -51,13 +58,15 @@ type proxy struct {
 // handler returns, or, for a stream the stream path detached from the handler, when it ends.
 type proxyRequest struct {
 	key            []byte
+	kind           string // kindRequest, kindStream or kindWebSocket
 	session        *balancer.Session
 	cancel         context.CancelCauseFunc
 	upstream       string // Set once an upstream answered
 	upstreamStatus int
 	status         int   // Set by the stream path, which may bypass the ResponseWriter
 	bytes          int64 // Body bytes written by the stream path
-	detached       bool  // The stream path took over, and runs the finishers itself
+	readTimeout    time.Duration
+	detached       bool // The stream path took over, and runs the finishers itself
 	finishers      []func()
 	finishOnce     sync.Once
 }
@@ -84,6 +93,19 @@ func (pr *proxyRequest) finishUnlessDetached() {
 	}
 }
 
+// finalStatus is the status as the client saw it: 101 for an upgrade (written on the hijacked
+// connection), and 499 like nginx if the request ended before any response
+func (pr *proxyRequest) finalStatus() int {
+	switch {
+	case pr.status != 0:
+		return pr.status
+	case pr.upstreamStatus == http.StatusSwitchingProtocols:
+		return http.StatusSwitchingProtocols
+	default:
+		return statusClientClosedRequest
+	}
+}
+
 // dialError marks a failure to connect: the request never reached that upstream
 type dialError struct {
 	err error
@@ -107,6 +129,125 @@ type trackingBody struct {
 func (b *trackingBody) Read(p []byte) (int, error) {
 	b.touched.Store(true)
 	return b.rc.Read(p)
+}
+
+var errBodyRetired = errors.New("request body handed to another attempt")
+
+// attemptBody is one attempt's handle on the shared request body. The transport may still read
+// a failed attempt's body after RoundTrip returned (its writer runs on), so before the next
+// attempt the old handle is retired: it reads nothing more, and retire tells whether it read
+// anything, which rules out the retry.
+type attemptBody struct {
+	body    *trackingBody
+	retired bool
+	read    bool
+	mu      sync.Mutex // Protects retired and read
+}
+
+func (b *trackingBody) attempt() *attemptBody {
+	return &attemptBody{body: b}
+}
+
+func (a *attemptBody) Read(p []byte) (int, error) {
+	a.mu.Lock()
+	if a.retired {
+		a.mu.Unlock()
+		return 0, errBodyRetired
+	}
+	a.read = true
+	a.mu.Unlock()
+	return a.body.Read(p)
+}
+
+func (a *attemptBody) Close() error {
+	return nil // The server closes the real body when the handler returns
+}
+
+// retire stops the handle from reading and returns true if the body was touched by any attempt
+func (a *attemptBody) retire() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.retired = true
+	return a.read || a.body.touched.Load()
+}
+
+// clientBody is the request body as read from the client: each read must make progress within
+// the timeout (a client that stalls an upload is cut, like nginx's client_body_timeout), and a
+// drain interrupts a blocked read (see ServeHTTP)
+type clientBody struct {
+	rc      io.ReadCloser
+	conn    *clientConn
+	timeout time.Duration
+}
+
+func (b *clientBody) Read(p []byte) (int, error) {
+	b.conn.setReadDeadline(time.Now().Add(b.timeout))
+	return b.rc.Read(p)
+}
+
+func (b *clientBody) Close() error {
+	return b.rc.Close()
+}
+
+// clientConn sets deadlines on the client connection for as long as the handler runs. A drain
+// cancels requests from other goroutines, and the transport may read a request body after the
+// handler returned; after that, the ResponseWriter must not be touched (an HTTP/2 one panics),
+// so the handler's end and every deadline change are serialized.
+type clientConn struct {
+	ctrl *http.ResponseController
+	done bool
+	mu   sync.Mutex // Protects done, and serializes ctrl calls with the handler's end
+}
+
+func (c *clientConn) setReadDeadline(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done {
+		c.ctrl.SetReadDeadline(t)
+	}
+}
+
+func (c *clientConn) setWriteDeadline(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done {
+		c.ctrl.SetWriteDeadline(t)
+	}
+}
+
+// interrupt makes blocked reads and writes on the client connection fail right away
+func (c *clientConn) interrupt() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done {
+		c.ctrl.SetReadDeadline(time.Now())
+		c.ctrl.SetWriteDeadline(time.Now())
+	}
+}
+
+// end is called when the handler returns; from then on, nothing touches the connection
+func (c *clientConn) end() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.done = true
+}
+
+// deadlineWriter bounds every write to the client by the timeout, so a client that stops reading
+// is cut instead of holding the handler (and the upstream) forever. Unwrap keeps Flush and
+// Hijack reachable for the reverse proxy.
+type deadlineWriter struct {
+	http.ResponseWriter
+	conn    *clientConn
+	timeout time.Duration
+}
+
+func (w *deadlineWriter) Write(p []byte) (int, error) {
+	w.conn.setWriteDeadline(time.Now().Add(w.timeout))
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *deadlineWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (b *trackingBody) Close() error {
@@ -150,9 +291,11 @@ func (p *bufferPool) Put(b []byte) {
 	p.pool.Put(&b)
 }
 
-func newProxy(b *balancer.Balancer, conf *config.Config) *proxy {
+func newProxy(b *balancer.Balancer, m *metrics, conf *config.Config) *proxy {
 	p := &proxy{
 		balancer: b,
+		metrics:  m,
+		active:   make(map[*proxyRequest]struct{}),
 	}
 	p.reverse = &httputil.ReverseProxy{
 		Rewrite:       p.rewrite,
@@ -171,33 +314,108 @@ func newProxy(b *balancer.Balancer, conf *config.Config) *proxy {
 // be drained again, so the closes would snowball towards the deadline. Publishes and other short
 // requests are still served until the drain is done, so no message is lost.
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if p.balancer.Draining() && (p.balancer.Drained() || isSubscription(r)) {
-		w.Header().Set("Connection", "close")
-		http.Error(w, "load balancer is draining", http.StatusServiceUnavailable)
-		return
-	}
-	pr := proxyRequestFromContext(r.Context()) // Set (and finished) by the access log, if any
+	conf := p.config.Load()
+	pr := proxyRequestFromContext(r.Context()) // Set (and finished) by Server.observe, if any
 	if pr == nil {
 		pr = &proxyRequest{}
 		defer pr.finishUnlessDetached()
 	}
+	subscription := isSubscription(r, conf.Streams)
+	stream := subscription && r.Header.Get("Upgrade") == "" && r.ContentLength == 0 // WebSockets and requests with a body stay on the reverse proxy
+	switch {
+	case stream:
+		pr.kind = kindStream
+	case subscription:
+		pr.kind = kindWebSocket
+	default:
+		pr.kind = kindRequest
+	}
+	if p.balancer.Draining() && (p.balancer.Drained() || subscription) {
+		p.metrics.refused.Inc()
+		w.Header().Set("Connection", "close")
+		http.Error(w, "load balancer is draining", http.StatusServiceUnavailable)
+		return
+	}
 	parent := r.Context()
-	if isStream(r) && r.ProtoMajor == 1 {
+	if stream && r.ProtoMajor == 1 {
 		parent = context.WithoutCancel(parent) // Detached from the handler, see serveStream
 	}
 	ctx, cancel := context.WithCancelCause(parent)
-	pr.key, pr.cancel = clientKey(r.RemoteAddr), cancel
+	pr.key, pr.cancel = clientKey(r.RemoteAddr, conf.Hash), cancel
+	pr.readTimeout = conf.UpstreamReadTimeout
 	pr.session = p.balancer.NewSession(cancel)
+	if subscription {
+		gauge := p.metrics.streams.WithLabelValues(streamProtocol(pr.kind, r.ProtoMajor))
+		gauge.Inc()
+		pr.onFinish(func() {
+			gauge.Dec()
+			switch cause := context.Cause(ctx); {
+			case errors.Is(cause, balancer.ErrDrained):
+				p.metrics.streamsClosed.WithLabelValues(closedDrained).Inc()
+			case errors.Is(cause, errUpstreamReadTimeout):
+				p.metrics.streamsClosed.WithLabelValues(closedReadTimeout).Inc()
+			}
+		})
+	}
 	pr.onFinish(func() {
 		p.balancer.Close(pr.session)
 		cancel(nil)
 	})
+	p.track(pr)
 	r = r.WithContext(withProxyRequest(ctx, pr))
-	if isStream(r) {
+	if stream {
 		p.serveStream(w, r, pr)
 		return
 	}
-	p.reverse.ServeHTTP(w, r)
+
+	// Bound reads from and writes to the client, and let a drain interrupt both
+	cc := &clientConn{ctrl: http.NewResponseController(w)}
+	defer cc.end() // Before the finishers cancel ctx: a finished request must not touch the connection
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = &clientBody{rc: r.Body, conn: cc, timeout: conf.UpstreamReadTimeout}
+	}
+	stop := context.AfterFunc(ctx, func() {
+		safely("request cancel", cc.interrupt)
+	})
+	defer stop()
+	p.reverse.ServeHTTP(&deadlineWriter{ResponseWriter: w, conn: cc, timeout: conf.UpstreamReadTimeout}, r)
+}
+
+// track registers an open request, so Shutdown can end what the drain did not
+func (p *proxy) track(pr *proxyRequest) {
+	p.mu.Lock()
+	p.active[pr] = struct{}{}
+	p.mu.Unlock()
+	pr.onFinish(func() {
+		p.mu.Lock()
+		delete(p.active, pr)
+		p.mu.Unlock()
+	})
+}
+
+// closeAll cancels every open request (as drained) and waits until all of them finished, their
+// finishers (access log line, metrics) included, or ctx is done
+func (p *proxy) closeAll(ctx context.Context) error {
+	p.mu.Lock()
+	for pr := range p.active {
+		pr.cancel(balancer.ErrDrained)
+	}
+	p.mu.Unlock()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		p.mu.Lock()
+		n := len(p.active)
+		p.mu.Unlock()
+		if n == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%d request(s) still open: %w", n, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // RoundTrip sends the request to the best upstream for the client, and to the next ones as
@@ -218,42 +436,54 @@ func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	transport := p.transport.Load()
 	for i, u := range candidates {
 		last := i == len(candidates)-1
-		addr := u.NextAddress()
-		out := req.Clone(req.Context())
-		out.URL.Scheme, out.URL.Host = "http", addr
-		if body != nil {
-			out.Body = body
-		}
-		resp, err := transport.RoundTrip(out)
-		if err != nil {
-			if req.Context().Err() != nil {
-				return nil, err // Client went away or the stream was drained
+		for try := 0; ; try++ {
+			addr := p.balancer.Reserve(pr.session, u)
+			out := req.Clone(req.Context())
+			out.URL.Scheme, out.URL.Host = "http", addr
+			var attempt *attemptBody
+			if body != nil {
+				attempt = body.attempt()
+				out.Body = attempt
 			}
-			p.balancer.RecordFailure(u)
-			if !last && retryable(err, req.Method, body) {
-				slog.Debug("Upstream failed, trying the next one", "upstream", u.Name(), "error", err)
-				continue
+			resp, err := transport.RoundTrip(out)
+			if err != nil {
+				untouched := attempt == nil || !attempt.retire()
+				if req.Context().Err() != nil {
+					return nil, err // Client went away or the stream was drained
+				}
+				p.balancer.RecordAddressFailure(u, addr)
+				if isDialError(err) && untouched && try+1 < u.AddressCount() {
+					slog.Debug("Upstream address failed, trying another address", "upstream", u.Name(), "addr", addr, "error", err)
+					p.metrics.retries.WithLabelValues(retryConnect).Inc()
+					continue // Another port of the same node: its clients stay where their limits are
+				}
+				if !last && untouched && retryable(err, req.Method) {
+					slog.Debug("Upstream failed, trying the next one", "upstream", u.Name(), "error", err)
+					p.metrics.retries.WithLabelValues(retryReason(err)).Inc()
+					break
+				}
+				slog.Debug("Upstream failed", "upstream", u.Name(), "error", err)
+				return nil, err
 			}
-			slog.Debug("Upstream failed", "upstream", u.Name(), "error", err)
-			return nil, err
-		}
-		if resp.StatusCode == http.StatusServiceUnavailable && !last && !touched(body) {
-			resp.Body.Close()
-			continue
-		}
-		p.balancer.Attach(pr.session, u, addr)
-		pr.upstream, pr.upstreamStatus = u.Name(), resp.StatusCode
-		if resp.StatusCode != http.StatusSwitchingProtocols { // An upgraded body must stay an io.ReadWriteCloser
-			timeout := time.Duration(p.readTimeout.Load())
-			resp.Body = &idleTimeoutBody{
-				rc:      resp.Body,
-				timeout: timeout,
-				timer: time.AfterFunc(timeout, func() {
-					pr.cancel(errUpstreamReadTimeout)
-				}),
+			if resp.StatusCode == http.StatusServiceUnavailable && !last && (attempt == nil || !attempt.retire()) {
+				resp.Body.Close()
+				p.metrics.retries.WithLabelValues(retry503).Inc()
+				break
 			}
+			p.balancer.Attach(pr.session, u, addr)
+			pr.upstream, pr.upstreamStatus = u.Name(), resp.StatusCode
+			if resp.StatusCode != http.StatusSwitchingProtocols { // An upgraded body must stay an io.ReadWriteCloser
+				timeout := pr.readTimeout
+				resp.Body = &idleTimeoutBody{
+					rc:      resp.Body,
+					timeout: timeout,
+					timer: time.AfterFunc(timeout, func() {
+						pr.cancel(errUpstreamReadTimeout)
+					}),
+				}
+			}
+			return resp, nil
 		}
-		return resp, nil
 	}
 	return nil, errNoUpstream // Not reached: the last candidate always returns
 }
@@ -282,7 +512,7 @@ func (p *proxy) update(conf *config.Config) {
 		ResponseHeaderTimeout: conf.UpstreamReadTimeout,
 		DisableCompression:    true, // Pass encodings through as they are
 	}
-	p.readTimeout.Store(int64(conf.UpstreamReadTimeout))
+	p.config.Store(conf)
 	p.dialer.Store(dialer)
 	if old := p.transport.Swap(transport); old != nil {
 		old.CloseIdleConnections()
@@ -334,45 +564,66 @@ func proxyRequestFromContext(ctx context.Context) *proxyRequest {
 	return pr
 }
 
-func clientKey(remoteAddr string) []byte {
+func clientKey(remoteAddr string, hash *config.Hash) []byte {
 	addrPort, err := netip.ParseAddrPort(remoteAddr)
 	if err != nil {
 		return []byte(remoteAddr)
 	}
-	return balancer.ClientKey(addrPort.Addr())
+	return balancer.ClientKey(addrPort.Addr(), hash.IPv4PrefixBits, hash.IPv6PrefixBits)
 }
 
-// isSubscription returns true for an ntfy subscription stream: GET /<topics>/json|sse|raw|ws,
-// unless it only polls
-func isSubscription(r *http.Request) bool {
-	if r.Method != http.MethodGet {
+// isSubscription returns true for a long-lived stream (see config.Streams): a GET whose path
+// matches, unless the first exclude param that is set (headers first, then query parameters,
+// each in list order, like ntfy's readParam) is 1, yes or true. With the defaults, that is an
+// ntfy subscription (GET /<topics>/json|sse|raw|ws) that does not poll.
+func isSubscription(r *http.Request, streams *config.Streams) bool {
+	if streams.Disable || r.Method != http.MethodGet || !streams.PathRegex.MatchString(r.URL.Path) {
 		return false
 	}
-	i := strings.LastIndexByte(r.URL.Path, '/')
-	if i <= 0 {
-		return false
+	for _, param := range streams.ExcludeParams {
+		if value := strings.TrimSpace(r.Header.Get(param)); value != "" {
+			return !isTrue(value)
+		}
 	}
-	switch r.URL.Path[i+1:] {
-	case "json", "sse", "raw", "ws":
-	default:
-		return false
+	if len(streams.ExcludeParams) == 0 {
+		return true
 	}
-	switch strings.ToLower(r.URL.Query().Get("poll")) {
-	case "1", "yes", "true":
-		return false
+	query := r.URL.Query()
+	for _, param := range streams.ExcludeParams {
+		if value := strings.TrimSpace(query.Get(param)); value != "" {
+			return !isTrue(value)
+		}
 	}
 	return true
 }
 
-func retryable(err error, method string, body *trackingBody) bool {
-	if touched(body) {
-		return false
+func isTrue(s string) bool {
+	switch strings.ToLower(s) {
+	case "1", "yes", "true":
+		return true
 	}
-	var dialErr *dialError
-	if errors.As(err, &dialErr) {
+	return false
+}
+
+// retryable returns true if a request whose body was not touched may go to the next upstream
+// after err: always if it never reached the upstream, else only if it is idempotent
+func retryable(err error, method string) bool {
+	if isDialError(err) {
 		return true
 	}
 	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
+}
+
+func isDialError(err error) bool {
+	var dialErr *dialError
+	return errors.As(err, &dialErr)
+}
+
+func retryReason(err error) string {
+	if isDialError(err) {
+		return retryConnect
+	}
+	return retryError
 }
 
 func touched(body *trackingBody) bool {
@@ -382,4 +633,16 @@ func touched(body *trackingBody) bool {
 func isTimeout(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// safely runs f and contains a panic: f runs in a goroutine of our own (a detached stream, a
+// cancel callback), where a panic would end the process, and with it every stream on this load
+// balancer, which then all reconnect at once
+func safely(where string, f func()) {
+	defer func() {
+		if v := recover(); v != nil && v != http.ErrAbortHandler {
+			slog.Error("Recovered from panic", "where", where, "panic", v, "stack", string(debug.Stack()))
+		}
+	}()
+	f()
 }

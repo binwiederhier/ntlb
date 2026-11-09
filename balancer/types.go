@@ -54,18 +54,21 @@ type UpstreamStatus struct {
 // Session is one proxied request, typically a long-lived subscription stream. It is attached to
 // an upstream once the upstream answered, and canceled to drain it.
 type Session struct {
-	id       uint64
-	cancel   context.CancelCauseFunc
-	upstream *Upstream // Protected by Balancer.mu
-	addr     string    // Protected by Balancer.mu
-	canceled bool      // Protected by Balancer.mu
+	id           uint64
+	cancel       context.CancelCauseFunc
+	upstream     *Upstream // Protected by Balancer.mu
+	addr         string    // Protected by Balancer.mu
+	reserved     *Upstream // Upstream of the attempt in flight (see Reserve), protected by Balancer.mu
+	reservedAddr string    // Protected by Balancer.mu
+	canceled     bool      // Protected by Balancer.mu
 }
 
 // drainState is a drain in progress (or done) for an upstream or the load balancer itself. The
 // streams are closed oldest first, paced so that the last one closes before the deadline: each
-// tick earns the share of the remaining streams that matches the share of the remaining time that
-// passed since the last tick, and closes the whole streams of it. The fraction carries over, so
-// that 4 streams over 100s close at about 12s, 37s, 62s and 87s, not one per tick upfront.
+// tick earns the share of the streams not earned yet (open streams minus credit) that matches the
+// share of the remaining time that passed since the last tick, and closes the whole streams of it.
+// The fraction carries over, so that 4 streams over 100s close at about 12.5s, 37.5s, 62.5s and
+// 87.5s, not one per tick upfront (and 1 stream at 50s).
 // Spreading the closes keeps tens of thousands of clients from reconnecting all at once.
 type drainState struct {
 	deadline time.Time

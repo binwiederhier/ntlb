@@ -13,21 +13,31 @@ import (
 	"heckel.io/ntfy-lb/server"
 )
 
-var cmdServe = &cli.Command{
-	Name:  "serve",
-	Usage: "Run the load balancer",
-	Description: `Runs the load balancer with the config file (--config).
+var (
+	// notifySignals and osExit are replaced in tests, so that no real signal reaches the test process
+	notifySignals = signal.Notify
+	osExit        = os.Exit
+)
+
+func newServeCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "serve",
+		Usage: "Run the load balancer",
+		Description: `Runs the load balancer with the config file (--config).
 
 Signals:
   SIGHUP           reload the config file (same as "ntfy-lb reload")
   SIGTERM, SIGINT  drain over shutdown-drain-duration, then exit; a second one exits right away`,
-	Action: execServe,
+		Action: execServe,
+	}
 }
 
-var cmdCheckConfig = &cli.Command{
-	Name:   "check-config",
-	Usage:  "Validate a config file",
-	Action: execCheckConfig,
+func newCheckConfigCommand() *cli.Command {
+	return &cli.Command{
+		Name:   "check-config",
+		Usage:  "Validate a config file",
+		Action: execCheckConfig,
+	}
 }
 
 func execServe(ctx context.Context, cmd *cli.Command) error {
@@ -37,7 +47,11 @@ func execServe(ctx context.Context, cmd *cli.Command) error {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go handleSignals(s, cmd.String(flagConfig))
+	signals := make(chan os.Signal, 2)
+	notifySignals(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
+	go handleSignals(s, cmd.String(flagConfig), signals, func() {
+		osExit(1)
+	})
 	return s.Serve(ctx)
 }
 
@@ -50,19 +64,19 @@ func execCheckConfig(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
-func handleSignals(s *server.Server, configFile string) {
-	signals := make(chan os.Signal, 2)
-	signal.Notify(signals, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
+// handleSignals reloads on SIGHUP and shuts down on SIGTERM or SIGINT; a second stop signal calls
+// exit. It returns when signals is closed.
+func handleSignals(s *server.Server, configFile string, signals <-chan os.Signal, exit func()) {
 	stopping := false
 	for sig := range signals {
 		switch {
 		case sig == syscall.SIGHUP:
-			if err := s.Reload(); err != nil {
+			if _, err := s.Reload(); err != nil {
 				slog.Error("Reload failed, keeping the current config", "error", err)
 			}
 		case stopping:
 			slog.Warn("Second stop signal, exiting right away")
-			os.Exit(1)
+			exit()
 		default:
 			stopping = true
 			d := config.DefaultShutdownDrainDuration

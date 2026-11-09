@@ -38,8 +38,8 @@ func (d *drainState) pick(now time.Time, sessions []*Session) []*Session {
 	if elapsed <= 0 {
 		return nil
 	}
-	d.credit += float64(len(sessions)) * float64(elapsed) / float64(remaining)
-	n := min(int(math.Floor(d.credit+0.5)), len(sessions)) // Rounded: evenly spaced, centered in their slots
+	d.credit += (float64(len(sessions)) - d.credit) * float64(elapsed) / float64(remaining) // Of what is not earned yet, so the credit grows linearly
+	n := min(int(math.Floor(d.credit+0.5)), len(sessions))                                  // Rounded: evenly spaced, centered in their slots
 	if n <= 0 {
 		return nil
 	}
@@ -79,10 +79,15 @@ func (b *Balancer) drainTick(now time.Time) {
 func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	var all []*Session
+	var all, orphans []*Session
 	byUpstream := make(map[*Upstream][]*Session)
 	for _, s := range b.sessions {
 		if s.canceled {
+			continue
+		} else if s.upstream != nil && b.upstreams[s.upstream.name] != s.upstream {
+			// Attached after its removed upstream was forgotten (Attach raced the last tick), so
+			// no drain would ever close it
+			orphans = append(orphans, s)
 			continue
 		}
 		all = append(all, s)
@@ -100,6 +105,7 @@ func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 			}
 		}
 	}
+	victims = append(victims, orphans...)
 	for _, s := range victims {
 		s.canceled = true
 	}

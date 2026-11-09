@@ -6,6 +6,7 @@ package balancer
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"sync"
@@ -18,6 +19,8 @@ import (
 const (
 	drainTickInterval = time.Second
 	waitIdleInterval  = 50 * time.Millisecond
+	addressBackoffMin = time.Second
+	addressBackoffMax = 30 * time.Second
 )
 
 // Balancer routes clients to upstreams by rendezvous hashing their IP over the healthy upstreams,
@@ -42,14 +45,19 @@ type Upstream struct {
 	requests    atomic.Uint64
 	failures    atomic.Uint64
 	addresses   []string
-	addrStreams map[string]int
+	generation  uint64               // Bumped when the addresses change, so a probe of the old ones is dropped
+	addrStreams map[string]int       // Attached streams per address
+	addrPending map[string]int       // Reserved attempts per address, not attached yet
+	addrFails   map[string]int       // Consecutive failures per address
+	addrRetry   map[string]time.Time // An address that failed is skipped until then
+	addrDown    map[string]bool      // Failed its last health check: skipped while others are up
 	healthy     bool
 	probed      bool
 	fails       int
 	passes      int
 	lastCheck   time.Time
 	lastError   string
-	mu          sync.Mutex // Protects addresses, addrStreams, healthy, probed, fails, passes, lastCheck, lastError
+	mu          sync.Mutex // Protects addresses, generation, addrStreams, addrPending, addrFails, addrRetry, addrDown, healthy, probed, fails, passes, lastCheck, lastError
 }
 
 // New creates a balancer for the upstreams in the config. Call Start to run the health checks.
@@ -123,15 +131,35 @@ func (b *Balancer) NewSession(cancel context.CancelCauseFunc) *Session {
 	return s
 }
 
+// Reserve returns the address a session should try on an upstream, and counts the attempt
+// towards that address until the session attaches, reserves again (a retry) or closes, so that
+// concurrent attempts spread over the addresses. Use it instead of NextAddress for requests.
+func (b *Balancer) Reserve(s *Session, u *Upstream) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s.releaseNoLock()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	addr := u.nextAddressNoLock(time.Now())
+	if _, ok := b.sessions[s.id]; ok { // A closed session would never release it
+		u.addrPending[addr]++
+		s.reserved, s.reservedAddr = u, addr
+	}
+	return addr
+}
+
 // Attach records that a session is being served by an upstream address
 func (b *Balancer) Attach(s *Session, u *Upstream, addr string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	s.releaseNoLock()
 	s.upstream, s.addr = u, addr
 	u.requests.Add(1)
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.addrStreams[addr]++
+	delete(u.addrFails, addr)
+	delete(u.addrRetry, addr)
 }
 
 // Close unregisters a session
@@ -142,6 +170,7 @@ func (b *Balancer) Close(s *Session) {
 		return
 	}
 	delete(b.sessions, s.id)
+	s.releaseNoLock()
 	if s.upstream != nil {
 		s.upstream.mu.Lock()
 		defer s.upstream.mu.Unlock()
@@ -154,24 +183,60 @@ func (b *Balancer) RecordFailure(u *Upstream) {
 	u.failures.Add(1)
 }
 
+// RecordAddressFailure counts a request that failed on an upstream address (see RecordFailure),
+// and skips that address for new attempts for a while, longer with each failure in a row, since
+// the health check only probes an upstream's first address
+func (b *Balancer) RecordAddressFailure(u *Upstream, addr string) {
+	b.RecordFailure(u)
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.recordAddressFailure(addr, time.Now())
+}
+
 // Update applies a reloaded config. New upstreams are probed before they take traffic. Upstreams
 // that left the config drain over the config's drain-duration and are forgotten once drained;
 // streams to every other upstream are untouched. Drains started by command survive the update.
-func (b *Balancer) Update(conf *config.Config) error {
-	// Probe the new upstreams first, outside the lock
+func (b *Balancer) Update(conf *config.Config) {
+	for !b.tryUpdate(conf) {
+		slog.Debug("Re-added upstream was forgotten while probing, probing again")
+	}
+}
+
+// tryUpdate applies a reloaded config (see Update). It changes nothing and returns false if a
+// removed upstream that the config re-adds was forgotten by the drain tick while the added ones
+// were probed (it is a new upstream now, and must be probed too), or if an upstream's addresses
+// changed in between.
+func (b *Balancer) tryUpdate(conf *config.Config) bool {
+	// Probe the new upstreams and the new addresses of existing ones first, outside the lock.
+	// The probes of new addresses run on a copy, whose health replaces the upstream's below.
 	b.mu.RLock()
-	var added []*Upstream
+	var added, changed []*Upstream
+	addedNames := make(map[string]bool)
+	changedByName := make(map[string]*Upstream)
 	for _, uc := range conf.Upstreams {
-		if _, ok := b.upstreams[uc.Name]; !ok {
+		if u, ok := b.upstreams[uc.Name]; !ok {
 			added = append(added, newUpstream(uc))
+			addedNames[uc.Name] = true
+		} else if !u.hasAddresses(uc.Addresses) {
+			probed := newUpstream(uc)
+			changed = append(changed, probed)
+			changedByName[uc.Name] = probed
 		}
 	}
 	b.mu.RUnlock()
-	b.probe(context.Background(), conf.HealthCheck, added)
+	b.probe(context.Background(), conf.HealthCheck, slices.Concat(added, changed))
 
-	// Swap in the new set
+	// Swap in the new set, unless an upstream went away or changed in between
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	for _, uc := range conf.Upstreams {
+		u, ok := b.upstreams[uc.Name]
+		if !ok && !addedNames[uc.Name] {
+			return false
+		} else if ok && !u.hasAddresses(uc.Addresses) && changedByName[uc.Name] == nil {
+			return false
+		}
+	}
 	now := time.Now()
 	wanted := make(map[string]bool)
 	order := make([]string, 0, len(conf.Upstreams))
@@ -189,7 +254,10 @@ func (b *Balancer) Update(conf *config.Config) error {
 				u.drain = nil
 			}
 		}
-		u.setAddresses(uc.Addresses)
+		if probed := changedByName[uc.Name]; probed != nil && !u.hasAddresses(uc.Addresses) {
+			slog.Info("Upstream addresses changed", "upstream", uc.Name, "addresses", uc.Addresses, "healthy", probed.isHealthy())
+			u.replaceAddresses(probed)
+		}
 	}
 	for _, u := range added {
 		slog.Info("Upstream added", "upstream", u.name, "healthy", u.isHealthy())
@@ -211,7 +279,7 @@ func (b *Balancer) Update(conf *config.Config) error {
 	}
 	b.order = order
 	b.config = conf
-	return nil
+	return true
 }
 
 // DrainUpstream takes an upstream out of rotation and closes its streams over d
@@ -322,17 +390,19 @@ func (u *Upstream) Name() string {
 	return u.name
 }
 
-// NextAddress returns the upstream address with the fewest streams
+// AddressCount returns how many addresses the upstream has
+func (u *Upstream) AddressCount() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return len(u.addresses)
+}
+
+// NextAddress returns the upstream address with the fewest streams and reserved attempts,
+// skipping addresses that failed recently (unless all did). It reserves nothing, see Reserve.
 func (u *Upstream) NextAddress() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	best := u.addresses[0]
-	for _, addr := range u.addresses[1:] {
-		if u.addrStreams[addr] < u.addrStreams[best] {
-			best = addr
-		}
-	}
-	return best
+	return u.nextAddressNoLock(time.Now())
 }
 
 func newUpstream(uc *config.Upstream) *Upstream {
@@ -340,6 +410,10 @@ func newUpstream(uc *config.Upstream) *Upstream {
 		name:        uc.Name,
 		addresses:   slices.Clone(uc.Addresses),
 		addrStreams: make(map[string]int),
+		addrPending: make(map[string]int),
+		addrFails:   make(map[string]int),
+		addrRetry:   make(map[string]time.Time),
+		addrDown:    make(map[string]bool),
 		healthy:     true,
 	}
 }
@@ -394,16 +468,64 @@ func (u *Upstream) status(now time.Time) *UpstreamStatus {
 	return s
 }
 
+// nextAddressNoLock picks the least loaded address that is neither backing off nor failing its
+// health checks; if none is, the least loaded one. Ties go to the first. The caller must hold u.mu.
+func (u *Upstream) nextAddressNoLock(now time.Time) string {
+	best, bestReady, bestLoad := "", false, 0
+	for _, addr := range u.addresses {
+		ready := !now.Before(u.addrRetry[addr]) && !u.addrDown[addr]
+		load := u.addrStreams[addr] + u.addrPending[addr]
+		switch {
+		case best == "", ready && !bestReady, ready == bestReady && load < bestLoad:
+			best, bestReady, bestLoad = addr, ready, load
+		}
+	}
+	return best
+}
+
+// recordAddressFailure backs off an address: addressBackoffMin after the first failure in a
+// row, doubling up to addressBackoffMax. The caller must hold u.mu.
+func (u *Upstream) recordAddressFailure(addr string, now time.Time) {
+	u.addrFails[addr]++
+	backoff := addressBackoffMax
+	if shift := u.addrFails[addr] - 1; shift < 16 {
+		backoff = min(addressBackoffMin<<shift, addressBackoffMax)
+	}
+	u.addrRetry[addr] = now.Add(backoff)
+}
+
 func (u *Upstream) isHealthy() bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.healthy
 }
 
-func (u *Upstream) setAddresses(addresses []string) {
+func (u *Upstream) hasAddresses(addresses []string) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.addresses = slices.Clone(addresses)
+	return slices.Equal(u.addresses, addresses)
+}
+
+// replaceAddresses takes the addresses and the first-probe health of probed, a copy of u with
+// the new addresses. The hysteresis starts over, and probes of the old addresses still in flight
+// are dropped. Streams and their per-address counts stay. The caller must hold Balancer.mu.
+func (u *Upstream) replaceAddresses(probed *Upstream) {
+	probed.mu.Lock()
+	defer probed.mu.Unlock()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.addresses = slices.Clone(probed.addresses)
+	u.generation++
+	u.healthy, u.probed = probed.healthy, probed.probed
+	u.fails, u.passes = 0, 0
+	u.lastCheck, u.lastError = probed.lastCheck, probed.lastError
+	u.addrDown = maps.Clone(probed.addrDown)
+	for addr := range u.addrRetry {
+		if !slices.Contains(u.addresses, addr) {
+			delete(u.addrFails, addr)
+			delete(u.addrRetry, addr)
+		}
+	}
 }
 
 func (u *Upstream) streamCount() int {
@@ -419,4 +541,16 @@ func (u *Upstream) streamCountNoLock() int {
 		n += c
 	}
 	return n
+}
+
+// releaseNoLock gives back the session's reserved attempt, if any. The caller must hold
+// Balancer.mu.
+func (s *Session) releaseNoLock() {
+	if s.reserved == nil {
+		return
+	}
+	s.reserved.mu.Lock()
+	defer s.reserved.mu.Unlock()
+	s.reserved.addrPending[s.reservedAddr]--
+	s.reserved, s.reservedAddr = nil, ""
 }

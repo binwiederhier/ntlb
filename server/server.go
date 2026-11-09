@@ -23,6 +23,7 @@ const (
 	idleTimeout       = 65 * time.Second // Like nginx's keepalive_timeout
 	maxHeaderBytes    = 64 * 1024
 	shutdownGrace     = 5 * time.Second // After the drain: how long the last responses get to finish
+	drainTickSlack    = 2 * time.Second // The drain closes the last streams on its first tick after the deadline
 )
 
 // Server is the load balancer process: listeners, proxy and admin API around a balancer.Balancer
@@ -33,6 +34,7 @@ type Server struct {
 	proxy      *proxy
 	certs      *certStore
 	accessLog  *accessLog
+	metrics    *metrics
 	servers    []*http.Server // Proxying servers (HTTP, HTTPS)
 	admin      *http.Server
 	listeners  map[string]net.Listener
@@ -55,20 +57,20 @@ func New(configFile string) (*Server, error) {
 		stopped:    make(chan struct{}),
 	}
 	s.config.Store(conf)
-	s.proxy = newProxy(s.balancer, conf)
+	s.metrics = newMetrics(s.balancer)
+	s.proxy = newProxy(s.balancer, s.metrics, conf)
 	if conf.ListenHTTPS != "" {
 		s.certs = &certStore{}
 		if err := s.certs.load(conf.CertFile, conf.KeyFile); err != nil {
 			return nil, err
 		}
 	}
-	if conf.AccessLog != "" {
-		if s.accessLog, err = newAccessLog(conf.AccessLog); err != nil {
-			return nil, err
-		}
+	if s.accessLog, err = newAccessLog(conf.AccessLog); err != nil {
+		return nil, err
 	}
 	if err := s.listen(conf); err != nil {
 		s.closeListeners()
+		s.accessLog.close()
 		return nil, err
 	}
 	return s, nil
@@ -105,36 +107,42 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 // Reload re-reads the config file and applies it: upstreams, health checks, timeouts, drain
-// durations, the certificate and the access log. Listener addresses and client keepalives only
-// change with a restart. A broken config is rejected as a whole.
-func (s *Server) Reload() error {
+// durations, streams, hashing, the certificate and the access log. A broken config (or a
+// certificate or log file that cannot be opened) is rejected as a whole. It returns the changed
+// settings that only a restart applies: listener addresses and client keepalives.
+func (s *Server) Reload() ([]string, error) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 	conf, err := config.Load(s.configFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	old := s.config.Load()
-	if !old.ListenersEqual(conf) {
-		slog.Warn("Listener addresses changed, restart to apply them")
+	restart := old.RestartRequired(conf)
+	if len(restart) > 0 {
+		slog.Warn("Some settings changed that only a restart applies", "settings", restart)
 	}
-	if s.certs != nil {
-		if err := s.certs.load(conf.CertFile, conf.KeyFile); err != nil {
-			return err
+
+	// Open everything that can fail first, then apply
+	var cert *tls.Certificate
+	if s.certs != nil && conf.CertFile != "" && conf.KeyFile != "" {
+		if cert, err = loadCert(conf.CertFile, conf.KeyFile); err != nil {
+			return nil, err
 		}
 	}
-	if s.accessLog != nil {
-		if err := s.accessLog.reopen(); err != nil {
-			return err
-		}
+	logFile, err := openAccessLog(conf.AccessLog)
+	if err != nil {
+		return nil, err
 	}
-	if err := s.balancer.Update(conf); err != nil {
-		return err
+	if cert != nil {
+		s.certs.cert.Store(cert)
 	}
+	s.accessLog.swap(logFile)
+	s.balancer.Update(conf)
 	s.proxy.update(conf)
 	s.config.Store(conf)
 	slog.Info("Config reloaded", "upstreams", len(conf.Upstreams))
-	return nil
+	return restart, nil
 }
 
 // Shutdown drains the load balancer over d (not ready right away, streams closed oldest first),
@@ -143,13 +151,18 @@ func (s *Server) Shutdown(d time.Duration) {
 	s.stopOnce.Do(func() {
 		slog.Info("Shutting down", "drain", d)
 		s.balancer.Drain(d)
-		ctx, cancel := context.WithTimeout(context.Background(), d+shutdownGrace)
+		ctx, cancel := context.WithTimeout(context.Background(), d+drainTickSlack)
 		defer cancel()
 		if err := s.balancer.WaitIdle(ctx); err != nil {
-			slog.Warn("Streams still open after the drain", "error", err)
+			slog.Warn("Streams still open after the drain, closing them", "error", err)
 		}
+
+		// End whatever the drain did not (e.g. its loop stopped), and wait for the finishers
 		graceCtx, graceCancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer graceCancel()
+		if err := s.proxy.closeAll(graceCtx); err != nil {
+			slog.Warn("Requests still open after closing them", "error", err)
+		}
 		var wg sync.WaitGroup
 		for _, srv := range append(s.servers, s.admin) {
 			wg.Add(1)
@@ -161,10 +174,36 @@ func (s *Server) Shutdown(d time.Duration) {
 			}()
 		}
 		wg.Wait()
-		if s.accessLog != nil {
-			s.accessLog.close()
-		}
+		s.accessLog.close()
 		close(s.stopped)
+	})
+}
+
+// observe wraps the proxy to see every request's outcome, for the access log and the metrics.
+// The outcome is recorded by a finisher, when the request ends, which for a detached stream is
+// after the handler returned.
+func (s *Server) observe(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		entry := s.accessLog.entry(r, start)
+		pr := &proxyRequest{}
+		sw := &statusWriter{ResponseWriter: w}
+		pr.onFinish(func() {
+			status := pr.finalStatus() // Must not use sw: it references the server's connection state
+			if entry != nil {
+				s.accessLog.write(entry, pr, status)
+			}
+			s.metrics.observe(pr, status, start)
+		})
+		defer func() { // Deferred: a stream cut short ends in a http.ErrAbortHandler panic
+			if !pr.detached {
+				if pr.status == 0 {
+					pr.status, pr.bytes = sw.status, sw.bytes
+				}
+				pr.finish()
+			}
+		}()
+		next.ServeHTTP(sw, r.WithContext(withProxyRequest(r.Context(), pr)))
 	})
 }
 
@@ -199,10 +238,7 @@ func (s *Server) listen(conf *config.Config) error {
 	if !ka.Enable {
 		lc.KeepAlive = -1
 	}
-	handler := http.Handler(s.proxy)
-	if s.accessLog != nil {
-		handler = s.accessLog.handler(handler)
-	}
+	handler := s.observe(s.proxy)
 	if conf.ListenHTTP != "" {
 		ln, err := lc.Listen(context.Background(), "tcp", conf.ListenHTTP)
 		if err != nil {

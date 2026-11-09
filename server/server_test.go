@@ -18,8 +18,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,6 +40,9 @@ import (
 //	/body-progress reads 5 bytes, reports them on bodyCh, then echoes the rest
 //	/silent        sends the headers, then nothing
 //	/ws            a raw upgrade that echoes every byte
+//	every request  records lastProto, lastHeaders and lastRequest (except /v1/ready)
+//	on(path, h)    registers a handler that takes precedence over everything below
+//	/bcast/json    a subscription that gets every message sent to broadcast
 //	/*/json        an ntfy subscription: "start\n", then every message sent to push, until
 //	               testStreamEnd; "polled" with ?poll=1; ?status=N answers N; /silent/json sends
 //	               the headers only
@@ -50,6 +55,48 @@ type testUpstream struct {
 	hits        atomic.Int64
 	lastProto   atomic.Value // string
 	lastHeaders atomic.Value // string
+	lastRequest atomic.Value // *http.Request, a clone without the body
+	handlers    sync.Map     // path -> http.HandlerFunc, checked before the paths above
+	broadcast   *testBroadcast
+}
+
+// testBroadcast fans messages out to every open /bcast/json subscription of an upstream
+type testBroadcast struct {
+	subscribers map[chan string]struct{}
+	mu          sync.Mutex
+}
+
+func (b *testBroadcast) subscribe() chan string {
+	ch := make(chan string, 100)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.subscribers[ch] = struct{}{}
+	return ch
+}
+
+func (b *testBroadcast) unsubscribe(ch chan string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.subscribers, ch)
+}
+
+func (b *testBroadcast) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.subscribers)
+}
+
+func (b *testBroadcast) send(m string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ch := range b.subscribers {
+		ch <- m
+	}
+}
+
+// on registers a handler for a path, overriding the built-in ones
+func (u *testUpstream) on(path string, h http.HandlerFunc) {
+	u.handlers.Store(path, h)
 }
 
 // testStreamEnd sent to testUpstream.push ends the subscription from the upstream side
@@ -60,6 +107,9 @@ func newTestUpstream(t *testing.T, name string) *testUpstream {
 		name:   name,
 		bodyCh: make(chan string, 10),
 		push:   make(chan string, 10),
+		broadcast: &testBroadcast{
+			subscribers: make(map[chan string]struct{}),
+		},
 	}
 	u.server = httptest.NewServer(http.HandlerFunc(u.handle))
 	t.Cleanup(func() {
@@ -72,10 +122,31 @@ func newTestUpstream(t *testing.T, name string) *testUpstream {
 func (u *testUpstream) handle(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/v1/ready" {
 		u.hits.Add(1)
-	}
-	if strings.HasSuffix(r.URL.Path, "/json") { // An ntfy subscription, see the doc comment above
 		u.lastProto.Store(r.Proto)
 		u.lastHeaders.Store(fmt.Sprintf("host=%s xff=%s", r.Host, r.Header.Get("X-Forwarded-For")))
+		u.lastRequest.Store(r.Clone(context.Background()))
+	}
+	if h, ok := u.handlers.Load(r.URL.Path); ok {
+		h.(http.HandlerFunc)(w, r)
+		return
+	}
+	if r.URL.Path == "/bcast/json" {
+		ch := u.broadcast.subscribe()
+		defer u.broadcast.unsubscribe(ch)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		io.WriteString(w, "start\n")
+		w.(http.Flusher).Flush()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case m := <-ch:
+				io.WriteString(w, m+"\n")
+				w.(http.Flusher).Flush()
+			}
+		}
+	}
+	if strings.HasSuffix(r.URL.Path, "/json") { // An ntfy subscription, see the doc comment above
 		if r.URL.Query().Get("poll") == "1" {
 			io.WriteString(w, "polled")
 			return
@@ -169,6 +240,11 @@ func writeConfig(t *testing.T, filename, extra string, upstreams ...*testUpstrea
 func newTestServer(t *testing.T, extra string, upstreams ...*testUpstream) (*Server, string) {
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	writeConfig(t, filename, extra, upstreams...)
+	return startTestServer(t, filename), filename
+}
+
+// startTestServer runs a server from a config file until the test ends
+func startTestServer(t *testing.T, filename string) *Server {
 	s, err := New(filename)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -190,7 +266,7 @@ func newTestServer(t *testing.T, extra string, upstreams ...*testUpstream) (*Ser
 		resp.Body.Close()
 		return true
 	})
-	return s, filename
+	return s
 }
 
 // clientFrom returns an HTTP client whose connections come from a given loopback IP, so tests
@@ -303,7 +379,7 @@ func TestServer_ReloadRemovesAndAddsUpstreams(t *testing.T) {
 
 	// app2 leaves: its stream is drained, app1's keeps running; app3 joins
 	writeConfig(t, filename, "drain-duration: 1ms", app1, app3)
-	require.NoError(t, s.Reload())
+	requireReload(t, s)
 	waitFor(t, func() bool {
 		return streamClosed(r2)
 	})
@@ -315,7 +391,8 @@ func TestServer_ReloadRemovesAndAddsUpstreams(t *testing.T) {
 
 	// A broken config is rejected and changes nothing
 	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'\nupstreams: []"), 0600))
-	require.Error(t, s.Reload())
+	_, err := s.Reload()
+	require.Error(t, err)
 	require.Len(t, s.balancer.Status().Upstreams, 2)
 }
 
@@ -365,7 +442,7 @@ func TestServer_HTTPSAndCertReload(t *testing.T) {
 
 	// A reload picks up a renewed certificate
 	writeTestCert(t, certFile, keyFile, "second")
-	require.NoError(t, s.Reload())
+	requireReload(t, s)
 	client.CloseIdleConnections()
 	resp, err = client.Get("https://" + s.HTTPSAddr() + "/name")
 	require.NoError(t, err)
@@ -407,4 +484,139 @@ func writeTestCert(t *testing.T, certFile, keyFile, commonName string) {
 func readFileString(filename string) (string, error) {
 	b, err := os.ReadFile(filename)
 	return string(b), err
+}
+
+func requireReload(t *testing.T, s *Server) {
+	t.Helper()
+	restart, err := s.Reload()
+	require.NoError(t, err)
+	require.Empty(t, restart)
+}
+
+func TestServer_ReloadReportsRestartRequired(t *testing.T) {
+	app1 := newTestUpstream(t, "app1")
+	s, filename := newTestServer(t, "", app1)
+	conf := "listen-http: '127.0.0.1:1'\nlisten-admin: '127.0.0.1:0'\nhealth-check: {interval: 1h, timeout: 1s}\nclient-keepalive: {idle: 7m}\ndrain-duration: 9m\n" + upstreamsYAML(app1)
+	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
+	restart, err := s.Reload()
+	require.NoError(t, err)
+	require.Equal(t, []string{"listen-http", "client-keepalive"}, restart)
+	require.Equal(t, 9*time.Minute, s.config.Load().DrainDuration) // The rest is applied
+	status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
+	require.Equal(t, http.StatusOK, status) // Still on the old listener
+}
+
+func TestServer_ReloadAppliesStreamsAndHash(t *testing.T) {
+	app1 := newTestUpstream(t, "app1")
+	s, filename := newTestServer(t, "", app1)
+	_, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
+	closeStream()
+	require.Equal(t, "HTTP/1.0", app1.lastProto.Load())
+	writeConfig(t, filename, "streams: {disable: true}\nhash: {ipv4-prefix-bits: 8}", app1)
+	requireReload(t, s)
+	_, closeStream = openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
+	closeStream()
+	require.Equal(t, "HTTP/1.1", app1.lastProto.Load())
+	require.Equal(t, 8, s.config.Load().Hash.IPv4PrefixBits)
+}
+
+// newRawUpstream is an upstream that hands every connection to handle, for malformed or
+// misbehaving responses. Health checks get garbage too, so it is used fail-open.
+func newRawUpstream(t *testing.T, name string, handle func(conn net.Conn)) *testUpstream {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				handle(conn)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+	})
+	return &testUpstream{
+		name: name,
+		server: &httptest.Server{
+			URL: "http://" + ln.Addr().String(),
+		},
+	}
+}
+
+// readRequestHead reads a request's head from a raw upstream connection
+func readRequestHead(conn net.Conn) (string, *bufio.Reader) {
+	r := bufio.NewReader(conn)
+	var head strings.Builder
+	for {
+		line, err := r.ReadString('\n')
+		head.WriteString(line)
+		if err != nil || line == "\r\n" {
+			return head.String(), r
+		}
+	}
+}
+
+// answerReady answers a raw upstream's health check, returning true if head was one
+func answerReady(conn net.Conn, head string) bool {
+	if !strings.HasPrefix(head, "GET /v1/ready ") {
+		return false
+	}
+	io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+	return true
+}
+
+func TestServer_ShutdownAfterContextCanceled(t *testing.T) {
+	// Even with the background loops stopped (Serve's context canceled first), Shutdown closes
+	// every stream, detached ones included, and returns
+	app1 := newTestUpstream(t, "app1")
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	writeConfig(t, filename, "", app1)
+	s, err := New(filename)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	go s.Serve(ctx)
+	waitFor(t, func() bool {
+		return s.HTTPAddr() != "" && s.balancer.Healthy()
+	})
+	_, r := openSubscription(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
+	_, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/stream")
+	defer closeStream()
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Shutdown(100 * time.Millisecond)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown did not return")
+	}
+	_, err = r.ReadString('\n')
+	require.Error(t, err)
+	require.Zero(t, s.balancer.Status().Streams)
+}
+
+func TestServer_NewFailureLeaksNothing(t *testing.T) {
+	// A listener that cannot bind fails New, and closes what New had opened already
+	app1 := newTestUpstream(t, "app1")
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer busy.Close()
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	conf := fmt.Sprintf("listen-http: '127.0.0.1:0'\nlisten-admin: %q\naccess-log: %s\n%s", busy.Addr().String(), filepath.Join(t.TempDir(), "access.log"), upstreamsYAML(app1))
+	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
+	before := runtime.NumGoroutine()
+	for i := 0; i < 10; i++ {
+		_, err := New(filename)
+		require.Error(t, err)
+	}
+	waitFor(t, func() bool {
+		return runtime.NumGoroutine() <= before
+	})
 }

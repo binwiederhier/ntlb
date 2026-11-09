@@ -3,31 +3,29 @@ package balancer
 import (
 	"net/netip"
 	"slices"
+	"strings"
 )
 
 const (
-	// ipv6PrefixBits groups IPv6 clients by /64 when hashing, like ntfy's visitor-prefix-bits-ipv6
-	// default: a client rotating through its privacy addresses stays on the node holding its limits
-	ipv6PrefixBits = 64
-
 	fnvOffset64 = 14695981039346656037
 	fnvPrime64  = 1099511628211
 )
 
-// ClientKey returns the hash key for a client address: the IPv4 address, or the IPv6 /64
-func ClientKey(addr netip.Addr) []byte {
+// ClientKey returns the hash key for a client address: the IPv4 address shortened to
+// ipv4PrefixBits, or the IPv6 address shortened to ipv6PrefixBits (with 64, a client rotating
+// through its privacy addresses stays on the node holding its rate limits). The key is the
+// masked prefix, cut to whole bytes; with the defaults of 32 and 64 it is 4 or 8 bytes.
+func ClientKey(addr netip.Addr, ipv4PrefixBits, ipv6PrefixBits int) []byte {
 	addr = addr.Unmap()
+	bits := ipv6PrefixBits
 	if addr.Is4() {
-		b := addr.As4()
-		return b[:]
+		bits = ipv4PrefixBits
 	}
-	prefix, err := addr.Prefix(ipv6PrefixBits)
+	prefix, err := addr.Prefix(bits)
 	if err != nil {
-		b := addr.As16()
-		return b[:]
+		return addr.AsSlice()
 	}
-	b := prefix.Addr().As16()
-	return b[:ipv6PrefixBits/8]
+	return prefix.Addr().AsSlice()[:(bits+7)/8]
 }
 
 // rank orders upstream names by preference for a key, using rendezvous (highest random weight)
@@ -50,7 +48,7 @@ func rank(key []byte, names []string) []string {
 			}
 			return 1
 		}
-		return compareStrings(a.name, b.name)
+		return strings.Compare(a.name, b.name)
 	})
 	ranked := make([]string, len(scores))
 	for i, s := range scores {
@@ -76,13 +74,4 @@ func score(key []byte, name string) uint64 {
 	h *= 0x94d049bb133111eb
 	h ^= h >> 31
 	return h
-}
-
-func compareStrings(a, b string) int {
-	if a < b {
-		return -1
-	} else if a > b {
-		return 1
-	}
-	return 0
 }

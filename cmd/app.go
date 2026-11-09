@@ -5,8 +5,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
-	"strings"
 
 	"github.com/urfave/cli/v3"
 	"heckel.io/ntfy-lb/client"
@@ -21,23 +21,9 @@ const (
 	flagLogLevel = "log-level"
 )
 
-var (
-	configFlag = &cli.StringFlag{
-		Name:    flagConfig,
-		Aliases: []string{"c"},
-		Sources: cli.EnvVars("NTFY_LB_CONFIG"),
-		Value:   config.DefaultFile,
-		Usage:   "config file",
-	}
-	durationFlag = &cli.StringFlag{
-		Name:    flagDuration,
-		Aliases: []string{"d"},
-		Usage:   "close all streams over this long, e.g. 10m (default: drain-duration from the config)",
-	}
-)
-
 // New returns the ntfy-lb CLI app. Its flags work anywhere on the command line, also after a
-// subcommand and its arguments.
+// subcommand and its arguments. Commands and flags are created fresh for every app, because
+// urfave/cli keeps parse state in them, e.g. a flag set once ignores its env var from then on.
 func New() *cli.Command {
 	return &cli.Command{
 		Name:                   "ntfy-lb",
@@ -47,7 +33,13 @@ func New() *cli.Command {
 		Writer:                 os.Stdout,
 		ErrWriter:              os.Stderr,
 		Flags: []cli.Flag{
-			configFlag,
+			&cli.StringFlag{
+				Name:    flagConfig,
+				Aliases: []string{"c"},
+				Sources: cli.EnvVars("NTFY_LB_CONFIG"),
+				Value:   config.DefaultFile,
+				Usage:   "config file",
+			},
 			&cli.StringFlag{
 				Name:    flagAdminURL,
 				Aliases: []string{"a"},
@@ -70,13 +62,13 @@ func New() *cli.Command {
 			return ctx, nil
 		},
 		Commands: []*cli.Command{
-			cmdServe,
-			cmdCheckConfig,
-			cmdStatus,
-			cmdReload,
-			cmdDrain,
-			cmdUndrain,
-			cmdUpstream,
+			newServeCommand(),
+			newCheckConfigCommand(),
+			newStatusCommand(),
+			newReloadCommand(),
+			newDrainCommand(),
+			newUndrainCommand(),
+			newUpstreamCommand(),
 		},
 	}
 }
@@ -90,8 +82,27 @@ func newClient(cmd *cli.Command) *client.Client {
 	if conf, err := config.Load(cmd.String(flagConfig)); err == nil {
 		listenAdmin = conf.ListenAdmin
 	}
-	if strings.HasPrefix(listenAdmin, ":") {
-		listenAdmin = "127.0.0.1" + listenAdmin
+	return client.New("http://" + dialAddr(listenAdmin))
+}
+
+// newDurationFlag returns the --duration flag of the drain commands
+func newDurationFlag() *cli.StringFlag {
+	return &cli.StringFlag{
+		Name:    flagDuration,
+		Aliases: []string{"d"},
+		Usage:   "close all streams over this long, e.g. 10m (default: drain-duration from the config)",
 	}
-	return client.New("http://" + listenAdmin)
+}
+
+// dialAddr turns a listen address into one to connect to: a wildcard host (":2590",
+// "0.0.0.0:2590", "[::]:2590") becomes 127.0.0.1, which a Go wildcard listener also accepts on
+func dialAddr(listenAddr string) string {
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return listenAddr
+	}
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
 }

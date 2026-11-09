@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -94,23 +95,73 @@ func TestAdmin_Reload(t *testing.T) {
 	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
 	s, filename := newTestServer(t, "", app1)
 	writeConfig(t, filename, "", app1, app2)
-	code, _ := adminDo(t, s, http.MethodPost, "/v1/reload", "")
+	code, body := adminDo(t, s, http.MethodPost, "/v1/reload", "")
 	require.Equal(t, http.StatusOK, code)
+	require.JSONEq(t, `{"success":true}`, body)
 	require.Len(t, adminStatus(t, s).Upstreams, 2)
 
+	writeConfig(t, filename, "client-keepalive: {count: 9}", app1, app2)
+	code, body = adminDo(t, s, http.MethodPost, "/v1/reload", "")
+	require.Equal(t, http.StatusOK, code)
+	require.JSONEq(t, `{"success":true,"restart_required":["client-keepalive"]}`, body)
+
 	writeConfig(t, filename, "listen-https: ':443'", app1)
-	code, body := adminDo(t, s, http.MethodPost, "/v1/reload", "")
+	code, body = adminDo(t, s, http.MethodPost, "/v1/reload", "")
 	require.Equal(t, http.StatusBadRequest, code)
 	require.Contains(t, body, "cert-file")
 }
 
 func TestAdmin_Metrics(t *testing.T) {
-	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "", app1)
-	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
+	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
+	s, _ := newTestServer(t, "", app1, app2)
+	client := clientForRank(t, s, "app1", "app2")
+	get(t, client, "http://"+s.HTTPAddr()+"/name")
+	get(t, client, "http://"+s.HTTPAddr()+"/fail503") // Retried on app2, which says 503 too
+	_, r := openSubscription(t, client, "http://"+s.HTTPAddr()+"/mytopic/json")
+	_ = r
+	require.NoError(t, s.balancer.DrainUpstream("app1", 0))
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 0
+	})
+	s.balancer.Drain(time.Hour)
+	get(t, client, "http://"+s.HTTPAddr()+"/mytopic/json") // Refused while draining
 	code, body := adminDo(t, s, http.MethodGet, "/metrics", "")
 	require.Equal(t, http.StatusOK, code)
-	require.Contains(t, body, "ntfy_lb_ready 1\n")
-	require.Contains(t, body, `ntfy_lb_upstream_healthy{upstream="app1"} 1`)
-	require.Contains(t, body, `ntfy_lb_upstream_requests_total{upstream="app1"} 1`)
+	for _, want := range []string{
+		"ntfy_lb_ready 0\n",
+		"ntfy_lb_draining 1\n",
+		`ntfy_lb_upstream_healthy{upstream="app1"} 1`,
+		`ntfy_lb_upstream_draining{upstream="app1"} 1`,
+		`ntfy_lb_upstream_streams{upstream="app2"} 0`,
+		`ntfy_lb_requests_total{code="200",kind="request",upstream="app1"} 1`,
+		`ntfy_lb_requests_total{code="503",kind="request",upstream="app2"} 1`,
+		`ntfy_lb_requests_total{code="200",kind="stream",upstream="app1"} 1`,
+		`ntfy_lb_requests_total{code="503",kind="stream",upstream=""} 1`,
+		`ntfy_lb_retries_total{reason="503"} 1`,
+		`ntfy_lb_refused_total 1`,
+		`ntfy_lb_streams_closed_total{reason="drained"} 1`,
+		`ntfy_lb_streams{protocol="http1"} 0`,
+		`ntfy_lb_request_duration_seconds_count{kind="request"} 2`,
+		`ntfy_lb_stream_duration_seconds_count 1`,
+		"go_goroutines ",
+		"process_resident_memory_bytes ",
+	} {
+		require.Contains(t, body, want)
+	}
+}
+
+func TestAdmin_MetricsStreamsByProtocol(t *testing.T) {
+	app1 := newTestUpstream(t, "app1")
+	s := newTLSTestServer(t, "", app1)
+	h2 := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+			ForceAttemptHTTP2: true,
+		},
+	}
+	openSubscription(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
+	openSubscription(t, h2, "https://"+s.HTTPSAddr()+"/mytopic/json")
+	_, body := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, body, `ntfy_lb_streams{protocol="http1"} 1`)
+	require.Contains(t, body, `ntfy_lb_streams{protocol="http2"} 1`)
 }

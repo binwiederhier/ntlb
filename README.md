@@ -5,6 +5,11 @@ load balancer instance agrees on, active health checks, long-lived streams (JSON
 HTTP/2), streaming bodies, and **paced** draining, so that taking a node or a load balancer out of
 service never makes tens of thousands of clients reconnect at the same second.
 
+It is built for ntfy, but nothing in it is ntfy-only: which requests are long-lived streams
+(`streams` in the config; default: ntfy's subscriptions), the health check path and the client
+key (`hash`) are configurable, so it fits any HTTP backend with long-lived streams (SSE, long
+polling, WebSockets).
+
 It is meant to replace the nginx + lbagent pair on the ntfy.sh load balancers (see
 `ntfy/ansible/roles/nginx` and `roles/lbagent`). What it does and does not take over from that
 setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md](docs/design.md).
@@ -17,15 +22,18 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
   in-memory rate limits in one place. Removing a node moves only its clients; adding one only takes
   its share. (nginx ignores `consistent` for upstreams that resolve by DNS, as on ntfy.sh, so
   there every node change reshuffled most clients.)
-- **Active health checks** (`GET /v1/ready` every 5s by default) with hysteresis: out after 3 failed
-  probes in a row, back after 2 good ones. A new upstream is probed before it gets traffic. If no
-  upstream is healthy, it fails open and uses all of them.
+- **Active health checks** (`GET /v1/ready` every 5s by default, on every address of every
+  upstream) with hysteresis: out after 3 failed probes in a row, back after 2 good ones. An
+  upstream is up if any of its addresses is; a dead address is skipped. A new upstream, or one
+  whose addresses changed, is probed before it gets traffic. If no upstream is healthy, it fails
+  open and uses all of them.
 - **Retries like nginx's `proxy_next_upstream error timeout http_503`**: a connection failure goes
   to the next upstream for any request (it never reached a node); other errors only for idempotent
   methods; a 503 (a draining ntfy node) only if no body byte was sent. A body that was partly sent
-  is never resent.
-- **Long-lived streams**: no write timeout, flushes every write, an upstream idle timeout (3m,
-  `proxy_read_timeout`), WebSocket upgrades, HTTP/2 on the TLS listener. Subscriptions take a
+  is never resent. A node's other addresses are tried before the next node.
+- **Long-lived streams**: flushes every write, an upstream idle timeout (3m,
+  `proxy_read_timeout`) that also bounds stalled uploads and clients that stop reading, WebSocket
+  upgrades, HTTP/2 on the TLS listener. Subscriptions take a
   lean path (raw upstream connection, no buffer held while idle, hijacked HTTP/1.1 connections):
   ~11 KiB per stream over HTTP/1.1, ~32 KiB with TLS, ~37 KiB over HTTP/2.
 - **Streaming bodies** in both directions (`proxy_buffering off`, `proxy_request_buffering off`,
@@ -34,20 +42,38 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
 - **Several addresses per upstream** (e.g. one node's ports), each good for ~63k connections from
   one source IP; new streams go to the address with the fewest.
 - **Reload without cutting streams** (`SIGHUP`, `systemctl reload`, `ntfy-lb reload`): upstreams,
-  health checks, timeouts, drain durations, the TLS certificate and the access log. Streams to
-  upstreams that stay are untouched.
+  health checks, timeouts, drain durations, streams, hashing, the TLS certificate and the access
+  log (path, on/off). Streams to upstreams that stay are untouched. Listener addresses and client
+  keepalives need a restart; a reload says so. A broken config (or certificate, or log path) is
+  rejected as a whole.
 - **Paced draining**: an upstream removed from the config, an upstream drained by command, and the
   load balancer itself (by command or on `SIGTERM`) close their streams oldest first, evenly spread
   over a duration. A draining load balancer turns away new *subscriptions* (so clients back off or
   go to another load balancer instead of coming back to be drained again) but keeps serving
   publishes.
-- **`/v1/health` and `/v1/ready`** like ntfy's, plus a status API, Prometheus metrics, pprof, and a
-  CLI on top.
+- **`/v1/health` and `/v1/ready`** like ntfy's, plus a status API, Prometheus metrics (requests by
+  upstream/code/kind, durations, streams by protocol, retries, drains, Go and process metrics),
+  pprof, and a CLI on top.
 
 ## Status and results
 
 Prototype, written and lab-tested on 2026-11-04. Not deployed anywhere. All tests pass with the
 race detector (`make race`); `make lint` is clean apart from errcheck.
+
+### Soak test
+
+Three hours, 20,000 streams with the production protocol mix against three real ntfy nodes and
+two load balancers, through drains, reloads, a load balancer restart and a `kill -9` of a node:
+0 messages lost in steady state, delivery p99 ~2ms, no LB panics, memory flat. Details in
+[docs/design.md](docs/design.md#soak-test-2026-11-05).
+
+### Compared to nginx
+
+Same load against both (40,000 streams, 150 publishes/s, 430 polls/s, production protocol mix,
+nginx with the production LB config): both delivered every message with no errors. Memory is
+about even (1.99 vs 2.04 GiB; nginx has ~630 MiB fixed, ntfy-lb more per stream). ntfy-lb uses
+~2x the CPU (0.75 vs 0.35 cores) and has a higher p99 (6-8 ms vs ~4 ms), with p50 equal at
+~1 ms. Details in [docs/design.md](docs/design.md#nginx-comparison-2026-11-05).
 
 ### Lab results
 
@@ -143,7 +169,18 @@ upstreams:
     addresses: ["10.108.0.13:2586", "10.108.0.13:2587"]
 ```
 
-A reload applies everything except `listen-*` and `client-keepalive`, which need a restart.
+A reload applies everything except `listen-*` and `client-keepalive`, which need a restart
+(`ntfy-lb reload` lists them if they changed). Unknown keys are an error.
+
+For a backend other than ntfy, set which requests are long-lived streams, and the health path:
+
+```yaml
+streams:
+  path: '^/events(/.*)?$'     # GET requests whose path matches are streams
+  exclude-params: [once]      # ...unless ?once=1 (or header "Once: 1")
+health-check:
+  path: /healthz
+```
 
 ## CLI
 
@@ -182,10 +219,10 @@ On `listen-admin` only (the public listeners proxy everything, including ntfy's 
 | `GET /v1/health` | `{"healthy":true}`; 200 if at least one upstream in rotation is healthy, else 503 |
 | `GET /v1/ready` | `{"ready":true,"draining":false}`; 200 if healthy and not draining, else 503 |
 | `GET /v1/status` | full status (JSON), what `ntfy-lb status` shows |
-| `POST /v1/reload` | re-read the config; 400 with `{"error":...}` if it is invalid (nothing changes) |
+| `POST /v1/reload` | re-read the config; 400 with `{"error":...}` if it is invalid (nothing changes); `restart_required` lists changed settings that need a restart |
 | `POST /v1/drain`, `DELETE /v1/drain` | drain / undrain the load balancer; optional body `{"duration":"10m"}` |
 | `POST /v1/upstreams/{name}/drain`, `DELETE ...` | drain / undrain one upstream; same body |
-| `GET /metrics` | Prometheus: `ntfy_lb_ready`, `ntfy_lb_streams`, `ntfy_lb_upstream_{healthy,draining,streams,requests_total,failures_total}` |
+| `GET /metrics` | Prometheus, see [docs/design.md](docs/design.md#metrics-servermetricsgo) |
 | `GET /debug/pprof/` | Go profiles |
 
 ## Operating it

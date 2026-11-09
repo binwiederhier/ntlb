@@ -6,8 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,8 +49,21 @@ var hopHeaders = []string{
 	"Upgrade",
 }
 
+// forwardedHeaders are dropped from client requests, like httputil.ReverseProxy's Rewrite does:
+// only the load balancer says who the client is (X-Forwarded-For)
+var forwardedHeaders = []string{
+	"Forwarded",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+}
+
 const (
-	streamHeaderBufferSize = 1024 // Reads the upstream's response headers; dropped after
+	streamHeaderBufferSize = 1024      // Reads the upstream's response headers; dropped after
+	maxUpstreamHeaderBytes = 64 * 1024 // Like the server's limit for client request headers
+)
+
+var (
+	errUpstreamHeadersTooLarge = errors.New("upstream response headers too large")
 )
 
 // serveStream proxies a subscription on the stream path. pr.session is open; the request context
@@ -54,78 +71,109 @@ const (
 // by a new goroutine while the handler returns, so that the server's per-connection state (its
 // bufio buffers, the parsed request) is freed rather than held for the life of the stream.
 func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, pr *proxyRequest) {
-	upstream, resp, buffered, err := p.connectStream(r, pr)
+	us, err := p.connectStream(r, pr)
 	if err != nil {
 		p.handleError(w, r, err)
 		return
 	}
 	stop := context.AfterFunc(r.Context(), func() {
-		upstream.Close() // Drained, read timeout, or an HTTP/2 client went away
+		safely("stream cancel", func() {
+			us.conn.Close() // Drained, read timeout, or an HTTP/2 client went away
+		})
 	})
 	pr.onFinish(func() {
 		stop()
-		upstream.Close()
+		us.conn.Close()
 	})
-	pr.status = resp.StatusCode
-	timeout := time.Duration(p.readTimeout.Load())
+	pr.status = us.resp.StatusCode
 	if r.ProtoMajor == 1 {
-		head := responseHead(resp)
+		head := responseHead(us.resp)
 		client, _, err := http.NewResponseController(w).Hijack()
 		if err == nil {
 			pr.detached = true
-			go copyStreamHTTP1(client, upstream, head, buffered, timeout, pr)
+			stopClient := context.AfterFunc(r.Context(), func() {
+				safely("stream cancel", func() {
+					client.Close() // A drain must not wait for a blocked write to the client
+				})
+			})
+			go safely("stream copy", func() {
+				defer stopClient()
+				copyStreamHTTP1(client, us, head, pr)
+			})
 			return
 		}
 	}
-	p.copyStreamHTTP2(w, upstream, resp, buffered, timeout, pr)
+	if err := copyStreamHTTP2(w, us, pr); err != nil {
+		panic(http.ErrAbortHandler) // Resets the stream: a cut must not look like a complete response
+	}
+}
+
+// upstreamStream is an upstream connection on the stream path, after the response headers
+type upstreamStream struct {
+	conn     net.Conn
+	resp     *http.Response
+	raw      bool   // Close-delimited body: copy conn's bytes as they are (buffered first)
+	buffered []byte // Body bytes read along with the headers, if raw
 }
 
 // connectStream sends the request to the best upstream for the client, with the same retries as
-// the proxy's RoundTrip (no body, so any error before the response is safe to retry). It returns
-// the connection, the response headers and the body bytes read along with them.
-func (p *proxy) connectStream(r *http.Request, pr *proxyRequest) (net.Conn, *http.Response, []byte, error) {
+// the proxy's RoundTrip (no body, so any error before the response is safe to retry), trying the
+// other addresses of an upstream first if one does not accept the connection
+func (p *proxy) connectStream(r *http.Request, pr *proxyRequest) (*upstreamStream, error) {
 	candidates := p.balancer.Pick(pr.key)
 	if len(candidates) == 0 {
-		return nil, nil, nil, errNoUpstream
+		return nil, errNoUpstream
 	}
 	for i, u := range candidates {
 		last := i == len(candidates)-1
-		addr := u.NextAddress()
-		conn, resp, buffered, err := p.roundTripStream(r, addr)
-		if err != nil {
-			if r.Context().Err() != nil {
-				return nil, nil, nil, err
+		for try := 0; ; try++ {
+			addr := p.balancer.Reserve(pr.session, u)
+			us, err := p.roundTripStream(r, addr)
+			if err != nil {
+				if r.Context().Err() != nil {
+					return nil, err
+				}
+				p.balancer.RecordAddressFailure(u, addr)
+				if isDialError(err) && try+1 < u.AddressCount() {
+					p.metrics.retries.WithLabelValues(retryConnect).Inc()
+					continue
+				}
+				if !last {
+					p.metrics.retries.WithLabelValues(retryReason(err)).Inc()
+					break
+				}
+				return nil, err
 			}
-			p.balancer.RecordFailure(u)
-			if !last {
-				continue
+			if us.resp.StatusCode == http.StatusServiceUnavailable && !last {
+				us.conn.Close()
+				p.metrics.retries.WithLabelValues(retry503).Inc()
+				break
 			}
-			return nil, nil, nil, err
+			p.balancer.Attach(pr.session, u, addr)
+			pr.upstream, pr.upstreamStatus = u.Name(), us.resp.StatusCode
+			return us, nil
 		}
-		if resp.StatusCode == http.StatusServiceUnavailable && !last {
-			conn.Close()
-			continue
-		}
-		p.balancer.Attach(pr.session, u, addr)
-		pr.upstream, pr.upstreamStatus = u.Name(), resp.StatusCode
-		return conn, resp, buffered, nil
 	}
-	return nil, nil, nil, errNoUpstream // Not reached: the last candidate always returns
+	return nil, errNoUpstream // Not reached: the last candidate always returns
 }
 
-// roundTripStream dials addr, writes the request as HTTP/1.0 and reads the response headers
-func (p *proxy) roundTripStream(r *http.Request, addr string) (net.Conn, *http.Response, []byte, error) {
+// roundTripStream dials addr, writes the request as HTTP/1.0 and reads the response headers,
+// skipping informational (1xx) responses and reading at most maxUpstreamHeaderBytes of headers
+func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, error) {
 	conn, err := p.dialer.Load().DialContext(r.Context(), "tcp", addr)
 	if err != nil {
-		return nil, nil, nil, &dialError{err: err}
+		return nil, &dialError{err: err}
 	}
 	stop := context.AfterFunc(r.Context(), func() {
 		conn.Close()
 	})
 	defer stop()
-	conn.SetDeadline(time.Now().Add(time.Duration(p.readTimeout.Load()))) // Like the transport's ResponseHeaderTimeout
+	conn.SetDeadline(time.Now().Add(proxyRequestFromContext(r.Context()).readTimeout)) // Like the transport's ResponseHeaderTimeout
 	header := r.Header.Clone()
 	removeHopHeaders(header)
+	for _, name := range forwardedHeaders {
+		header.Del(name)
+	}
 	header.Set("X-Forwarded-For", forwardedFor(r))
 	bw := bufio.NewWriterSize(conn, streamHeaderBufferSize)
 	fmt.Fprintf(bw, "GET %s HTTP/1.0\r\nHost: %s\r\n", r.URL.RequestURI(), r.Host)
@@ -133,17 +181,33 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (net.Conn, *http.R
 	bw.WriteString("\r\n")
 	if err := bw.Flush(); err != nil {
 		conn.Close()
-		return nil, nil, nil, err
+		return nil, err
 	}
-	br := bufio.NewReaderSize(conn, streamHeaderBufferSize)
-	resp, err := http.ReadResponse(br, r)
-	if err != nil {
-		conn.Close()
-		return nil, nil, nil, err
+	limited := &limitedReader{r: conn, n: maxUpstreamHeaderBytes}
+	br := bufio.NewReaderSize(limited, streamHeaderBufferSize)
+	var resp *http.Response
+	for {
+		resp, err = http.ReadResponse(br, r)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if resp.StatusCode >= 200 || resp.StatusCode == http.StatusSwitchingProtocols {
+			break
+		}
 	}
-	buffered, _ := br.Peek(br.Buffered())
+	limited.n = math.MaxInt64 // Headers done; the body is not limited
 	conn.SetDeadline(time.Time{})
-	return conn, resp, append([]byte(nil), buffered...), nil
+	us := &upstreamStream{
+		conn: conn,
+		resp: resp,
+		raw:  resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 && resp.Body != http.NoBody,
+	}
+	if us.raw {
+		buffered, _ := br.Peek(br.Buffered())
+		us.buffered = append([]byte(nil), buffered...)
+	}
+	return us, nil
 }
 
 // responseHead renders the response line and headers for a hijacked HTTP/1.1 client. The body
@@ -151,6 +215,9 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (net.Conn, *http.R
 func responseHead(resp *http.Response) []byte {
 	header := resp.Header.Clone()
 	removeHopHeaders(header)
+	if resp.ContentLength >= 0 && len(resp.TransferEncoding) == 0 {
+		header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	}
 	head := &bytes.Buffer{}
 	fmt.Fprintf(head, "HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
 	header.Write(head)
@@ -160,38 +227,38 @@ func responseHead(resp *http.Response) []byte {
 
 // copyStreamHTTP1 writes the response to a hijacked client connection and copies the body until
 // either side is done, then finishes the request
-func copyStreamHTTP1(client net.Conn, upstream net.Conn, head, buffered []byte, timeout time.Duration, pr *proxyRequest) {
+func copyStreamHTTP1(client net.Conn, us *upstreamStream, head []byte, pr *proxyRequest) {
 	defer pr.finish()
 	defer client.Close()
 	client.SetDeadline(time.Time{})
 	write := func(b []byte) error {
-		client.SetWriteDeadline(time.Now().Add(timeout)) // A client that takes nothing for this long is gone
+		client.SetWriteDeadline(time.Now().Add(pr.readTimeout)) // A client that takes nothing for this long is gone
 		n, err := client.Write(b)
 		pr.bytes += int64(n)
 		return err
 	}
+	client.SetWriteDeadline(time.Now().Add(pr.readTimeout))
 	if _, err := client.Write(head); err != nil {
 		return
 	}
-	if len(buffered) > 0 {
-		if err := write(buffered); err != nil {
-			return
-		}
-	}
-	copyStream(upstream, timeout, write)
+	copyBody(us, pr.readTimeout, write)
 }
 
-// copyStreamHTTP2 writes the response through the ResponseWriter, flushing every write
-func (p *proxy) copyStreamHTTP2(w http.ResponseWriter, upstream net.Conn, resp *http.Response, buffered []byte, timeout time.Duration, pr *proxyRequest) {
+// copyStreamHTTP2 writes the response through the ResponseWriter, flushing every write. It
+// returns an error if the stream did not end cleanly (upstream cut, read timeout, drain).
+func copyStreamHTTP2(w http.ResponseWriter, us *upstreamStream, pr *proxyRequest) error {
 	rc := http.NewResponseController(w)
-	header := resp.Header.Clone()
+	header := us.resp.Header.Clone()
 	removeHopHeaders(header)
 	for k, v := range header {
 		w.Header()[k] = v
 	}
-	w.WriteHeader(resp.StatusCode)
+	w.WriteHeader(us.resp.StatusCode)
+	if err := rc.Flush(); err != nil { // Send the headers right away: the stream is open
+		return err
+	}
 	write := func(b []byte) error {
-		rc.SetWriteDeadline(time.Now().Add(timeout))
+		rc.SetWriteDeadline(time.Now().Add(pr.readTimeout))
 		n, err := w.Write(b)
 		pr.bytes += int64(n)
 		if err != nil {
@@ -199,57 +266,114 @@ func (p *proxy) copyStreamHTTP2(w http.ResponseWriter, upstream net.Conn, resp *
 		}
 		return rc.Flush()
 	}
-	if len(buffered) > 0 {
-		if err := write(buffered); err != nil {
-			return
+	return copyBody(us, pr.readTimeout, write)
+}
+
+// copyBody copies the upstream body to write: a close-delimited body byte for byte (see
+// copyStream), any other by its framing (chunked, Content-Length), as such bodies are short.
+// It returns nil only if the body ended cleanly.
+func copyBody(us *upstreamStream, timeout time.Duration, write func([]byte) error) error {
+	if !us.raw {
+		buf := streamBufferPool.Get()
+		defer streamBufferPool.Put(buf)
+		us.conn.SetReadDeadline(time.Now().Add(timeout))
+		for {
+			n, err := us.resp.Body.Read(buf)
+			if n > 0 {
+				if werr := write(buf[:n]); werr != nil {
+					return werr
+				}
+				us.conn.SetReadDeadline(time.Now().Add(timeout))
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			} else if err != nil {
+				return err
+			}
 		}
-	} else if err := rc.Flush(); err != nil { // Send the headers right away: the stream is open
-		return
 	}
-	copyStream(upstream, timeout, write)
+	if len(us.buffered) > 0 {
+		if err := write(us.buffered); err != nil {
+			return err
+		}
+		us.buffered = nil
+	}
+	return copyStream(us.conn, timeout, write)
 }
 
 // copyStream copies upstream to write until either fails. It waits for upstream data without a
 // buffer and takes one from the pool only to read and write. timeout bounds each wait, like
-// nginx's proxy_read_timeout.
-func copyStream(upstream net.Conn, timeout time.Duration, write func([]byte) error) {
+// nginx's proxy_read_timeout. It returns nil if the upstream closed the stream cleanly (EOF).
+func copyStream(upstream net.Conn, timeout time.Duration, write func([]byte) error) error {
 	sc, ok := upstream.(syscall.Conn)
 	if !ok {
-		return
+		return errors.New("upstream connection has no file descriptor")
 	}
 	raw, err := sc.SyscallConn()
 	if err != nil {
-		return
+		return err
 	}
 	for {
 		upstream.SetReadDeadline(time.Now().Add(timeout))
 		if err := waitReadable(raw); err != nil {
-			return
+			return err
 		}
 		buf := streamBufferPool.Get()
 		n, err := upstream.Read(buf)
 		if n > 0 {
 			if werr := write(buf[:n]); werr != nil {
 				streamBufferPool.Put(buf)
-				return
+				return werr
 			}
 		}
 		streamBufferPool.Put(buf)
-		if err != nil {
-			return
+		if errors.Is(err, io.EOF) {
+			return nil
+		} else if err != nil {
+			return err
 		}
 	}
 }
 
+// limitedReader reads at most n bytes from r, then fails; n can be raised as it goes
+type limitedReader struct {
+	r io.Reader
+	n int64
+}
+
+func (l *limitedReader) Read(p []byte) (int, error) {
+	if l.n <= 0 {
+		return 0, errUpstreamHeadersTooLarge
+	}
+	if int64(len(p)) > l.n {
+		p = p[:l.n]
+	}
+	n, err := l.r.Read(p)
+	l.n -= int64(n)
+	return n, err
+}
+
 // waitReadable blocks until the connection has data, EOF or an error, honoring its read
 // deadline. It peeks one byte: the netpoller is edge-triggered, so it may only wait after the
-// socket reported EAGAIN, or it could sleep on data that is already there.
+// socket reported EAGAIN, or it could sleep on data that is already there. A socket error (e.g.
+// a reset) is returned here: the peek consumes it, so the next read would only see EOF.
 func waitReadable(raw syscall.RawConn) error {
 	var peek [1]byte
-	return raw.Read(func(fd uintptr) bool {
+	var sockErr error
+	if err := raw.Read(func(fd uintptr) bool {
 		_, _, err := syscall.Recvfrom(int(fd), peek[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
-		return !errors.Is(err, syscall.EAGAIN)
-	})
+		if errors.Is(err, syscall.EAGAIN) {
+			return false
+		}
+		sockErr = err
+		return true
+	}); err != nil {
+		return err
+	}
+	if sockErr != nil {
+		return os.NewSyscallError("recvfrom", sockErr)
+	}
+	return nil
 }
 
 func removeHopHeaders(h http.Header) {
@@ -261,12 +385,6 @@ func removeHopHeaders(h http.Header) {
 	for _, name := range hopHeaders {
 		h.Del(name)
 	}
-}
-
-// isStream returns true for requests that take the stream path: subscriptions, but not
-// WebSockets, which the reverse proxy upgrades
-func isStream(r *http.Request) bool {
-	return isSubscription(r) && r.Header.Get("Upgrade") == ""
 }
 
 var (

@@ -46,9 +46,14 @@ func (c *Client) Status(ctx context.Context) (*balancer.Status, error) {
 	return status, nil
 }
 
-// Reload makes the load balancer re-read its config file
-func (c *Client) Reload(ctx context.Context) error {
-	return c.do(ctx, http.MethodPost, "/v1/reload", nil, nil)
+// Reload makes the load balancer re-read its config file. It returns the changed settings that
+// only a restart applies.
+func (c *Client) Reload(ctx context.Context) ([]string, error) {
+	resp := &server.ReloadResponse{}
+	if err := c.do(ctx, http.MethodPost, "/v1/reload", nil, resp); err != nil {
+		return nil, err
+	}
+	return resp.RestartRequired, nil
 }
 
 // Drain drains the load balancer over duration, or the config's drain-duration if empty

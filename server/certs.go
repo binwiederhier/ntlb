@@ -13,12 +13,20 @@ type certStore struct {
 }
 
 func (c *certStore) load(certFile, keyFile string) error {
+	cert, err := loadCert(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	c.cert.Store(cert)
+	return nil
+}
+
+func loadCert(certFile, keyFile string) (*tls.Certificate, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		return fmt.Errorf("cannot load certificate: %w", err)
+		return nil, fmt.Errorf("cannot load certificate: %w", err)
 	}
-	c.cert.Store(&cert)
-	return nil
+	return &cert, nil
 }
 
 func (c *certStore) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {

@@ -12,13 +12,15 @@ import (
 	"heckel.io/ntfy-lb/balancer"
 )
 
-var cmdStatus = &cli.Command{
-	Name:  "status",
-	Usage: "Show the load balancer's and the upstreams' status",
-	Flags: []cli.Flag{
-		&cli.BoolFlag{Name: flagJSON, Aliases: []string{"j"}, Usage: "print the raw JSON"},
-	},
-	Action: execStatus,
+func newStatusCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "status",
+		Usage: "Show the load balancer's and the upstreams' status",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: flagJSON, Aliases: []string{"j"}, Usage: "print the raw JSON"},
+		},
+		Action: execStatus,
+	}
 }
 
 func execStatus(ctx context.Context, cmd *cli.Command) error {

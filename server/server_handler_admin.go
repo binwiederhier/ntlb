@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"heckel.io/ntfy-lb/balancer"
 )
 
@@ -40,6 +41,13 @@ const (
 // HealthResponse is the response to /v1/health
 type HealthResponse struct {
 	Healthy bool `json:"healthy"`
+}
+
+// ReloadResponse is the response to POST /v1/reload: the settings that changed but only apply
+// after a restart, if any
+type ReloadResponse struct {
+	Success         bool     `json:"success"`
+	RestartRequired []string `json:"restart_required,omitempty"`
 }
 
 // ReadyResponse is the response to /v1/ready
@@ -83,7 +91,7 @@ func (s *Server) adminHandler() http.Handler {
 	mux.HandleFunc("DELETE "+apiDrainPath, s.handleAdmin(s.handleUndrain))
 	mux.HandleFunc("POST "+apiUpstreamDrainPath, s.handleAdmin(s.handleUpstreamDrain))
 	mux.HandleFunc("DELETE "+apiUpstreamDrainPath, s.handleAdmin(s.handleUpstreamUndrain))
-	mux.HandleFunc("GET "+apiMetricsPath, s.handleMetrics)
+	mux.Handle("GET "+apiMetricsPath, promhttp.HandlerFor(s.metrics.registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("GET "+apiPprofPath, pprof.Index)
 	mux.HandleFunc("GET "+apiPprofPath+"profile", pprof.Profile)
 	return mux
@@ -118,10 +126,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) error {
 }
 
 func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) error {
-	if err := s.Reload(); err != nil {
+	restart, err := s.Reload()
+	if err != nil {
 		return &adminError{status: http.StatusBadRequest, err: err}
 	}
-	return writeJSON(w, http.StatusOK, &SuccessResponse{Success: true})
+	return writeJSON(w, http.StatusOK, &ReloadResponse{Success: true, RestartRequired: restart})
 }
 
 func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) error {
@@ -154,44 +163,6 @@ func (s *Server) handleUpstreamUndrain(w http.ResponseWriter, r *http.Request) e
 		return upstreamError(err)
 	}
 	return writeJSON(w, http.StatusOK, &SuccessResponse{Success: true})
-}
-
-// handleMetrics writes the status as Prometheus metrics, in the text format
-func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	status := s.balancer.Status()
-	var b strings.Builder
-	metric := func(name, help, kind string) {
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
-	}
-	metric("ntfy_lb_ready", "Whether the load balancer is ready (healthy, not draining)", "gauge")
-	fmt.Fprintf(&b, "ntfy_lb_ready %d\n", boolInt(status.Ready))
-	metric("ntfy_lb_draining", "Whether the load balancer is draining", "gauge")
-	fmt.Fprintf(&b, "ntfy_lb_draining %d\n", boolInt(status.Draining))
-	metric("ntfy_lb_streams", "Open proxied requests", "gauge")
-	fmt.Fprintf(&b, "ntfy_lb_streams %d\n", status.Streams)
-	upstreamMetric := func(name, help, kind string, value func(u *balancer.UpstreamStatus) any) {
-		metric(name, help, kind)
-		for _, u := range status.Upstreams {
-			fmt.Fprintf(&b, "%s{upstream=%q} %v\n", name, u.Name, value(u))
-		}
-	}
-	upstreamMetric("ntfy_lb_upstream_healthy", "Whether the upstream passes its health checks", "gauge", func(u *balancer.UpstreamStatus) any {
-		return boolInt(u.Healthy)
-	})
-	upstreamMetric("ntfy_lb_upstream_draining", "Whether the upstream is draining or drained", "gauge", func(u *balancer.UpstreamStatus) any {
-		return boolInt(u.State == balancer.StateDraining || u.State == balancer.StateDrained)
-	})
-	upstreamMetric("ntfy_lb_upstream_streams", "Open proxied requests per upstream", "gauge", func(u *balancer.UpstreamStatus) any {
-		return u.Streams
-	})
-	upstreamMetric("ntfy_lb_upstream_requests_total", "Requests the upstream answered", "counter", func(u *balancer.UpstreamStatus) any {
-		return u.Requests
-	})
-	upstreamMetric("ntfy_lb_upstream_failures_total", "Requests the upstream failed (connection errors, timeouts)", "counter", func(u *balancer.UpstreamStatus) any {
-		return u.Failures
-	})
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	io.WriteString(w, b.String())
 }
 
 func (s *Server) readDrainDuration(r *http.Request) (time.Duration, error) {
@@ -233,11 +204,4 @@ func statusFor(ok bool) int {
 		return http.StatusOK
 	}
 	return http.StatusServiceUnavailable
-}
-
-func boolInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
