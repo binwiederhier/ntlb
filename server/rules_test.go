@@ -250,7 +250,7 @@ listen-admin: '127.0.0.1:0'
 bans: {file: %s, threshold: 100}
 rules: [{name: abuse, match: 'path startsWith "/nz_"', action: block, strike: 101}]
 sites:
-  - {name: s, listen-http: '127.0.0.1:0', bans: {file: %s, threshold: 1}, `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: s, listen-http: '127.0.0.1:0', bans: {file: %s, threshold: 1}, `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
 `, globalLog, siteLog, app1.addr())), 0600))
 	s := startTestServer(t, filename)
 	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/nz_x")

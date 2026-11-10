@@ -125,7 +125,7 @@ type upstreamStream struct {
 // other addresses of an upstream first if one does not accept the connection
 func (p *proxy) connectStream(r *http.Request, pr *proxyRequest) (*upstreamStream, error) {
 	candidates := p.balancer.Pick(pr.site, pr.key)
-	if len(candidates) == 0 {
+	if len(candidates) == 0 || pr.conns == nil {
 		return nil, errNoUpstream
 	}
 	for i, u := range candidates {
@@ -164,7 +164,8 @@ func (p *proxy) connectStream(r *http.Request, pr *proxyRequest) (*upstreamStrea
 // roundTripStream dials addr, writes the request as HTTP/1.0 and reads the response headers,
 // skipping informational (1xx) responses and reading at most maxUpstreamHeaderBytes of headers
 func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, error) {
-	conn, err := p.dialer.Load().DialContext(r.Context(), "tcp", addr)
+	pr := proxyRequestFromContext(r.Context())
+	conn, err := pr.conns.dialer.DialContext(r.Context(), "tcp", addr)
 	if err != nil {
 		return nil, &dialError{err: err}
 	}
@@ -172,7 +173,7 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, 
 		conn.Close()
 	})
 	defer stop()
-	conn.SetDeadline(time.Now().Add(proxyRequestFromContext(r.Context()).readTimeout)) // Like the transport's ResponseHeaderTimeout
+	conn.SetDeadline(time.Now().Add(pr.readTimeout)) // Like the transport's ResponseHeaderTimeout
 	header := r.Header.Clone()
 	removeHopHeaders(header)
 	for _, name := range forwardedHeaders {

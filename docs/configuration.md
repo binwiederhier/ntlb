@@ -9,7 +9,7 @@ ntfy.sh setup). How it works inside is in [architecture.md](architecture.md) and
 - [Config files](#config-files)
 - [Global settings](#global-settings)
 - [Sites](#sites)
-- [Upstreams and balancing](#upstreams-and-balancing)
+- [Upstream: servers, balancing and timeouts](#upstream-servers-balancing-and-timeouts)
 - [Health checks, and what happens when one goes bad](#health-checks-and-what-happens-when-one-goes-bad)
 - [Streams](#streams)
 - [Access logs](#access-logs)
@@ -48,12 +48,12 @@ flowchart LR
 - **Validation**: unknown keys, bad expressions, duplicate names and the like are errors, with the
   YAML line or the rule and the position in its expression. `ntlb check-config` checks a file without touching the running server.
 - **Reload**: `systemctl reload ntlb` (SIGHUP) or `ntlb reload` re-reads all files. Everything
-  applies without cutting a stream (sites, upstreams, rules, certificates, logs, listen addresses)
+  applies without cutting a stream (sites, servers, rules, certificates, logs, listen addresses)
   except `listen-admin`, `listen-metrics`, `listen-profiler` and `client-keepalive`, and an address
   that switches between `listen-http` and `listen-https`: those need a restart, and `ntlb reload`
   lists them if they changed.
 - **Durations** are Go durations: `500ms`, `45s`, `5m`, `1h30m`. They must be positive.
-- **Names** of sites, upstreams and rules are 1-64 of `a-z A-Z 0-9 - _ .`.
+- **Names** of sites, servers and rules are 1-64 of `a-z A-Z 0-9 - _ .`.
 
 ## Global settings
 
@@ -64,10 +64,7 @@ flowchart LR
 | `listen-profiler` | off | Only `/debug/pprof/`, to profile under load without exposing the admin API. |
 | `access-logs` | none | Access logs for sites without their own, and for requests no site serves. See [Access logs](#access-logs). |
 | `client-keepalive` | `{idle: 1m, interval: 15s, count: 4}` | TCP keepalive towards clients; a dead peer is noticed after `idle + interval * count`. `{disable: true}` turns it off. |
-| `upstream-keepalive` | `{idle: 1m, interval: 15s, count: 4}` | The same towards upstreams. |
-| `upstream-connect-timeout` | `5s` | An address that does not accept within this is down for this request; the next one is tried. |
-| `upstream-read-timeout` | `60s` | Cut a response (or a WebSocket) after this long without a byte. Streams need their upstream to send keepalives within it. |
-| `drain-duration` | `5m` | Default for `drain` commands, and for upstreams removed from the config. |
+| `drain-duration` | `5m` | Default for `drain` commands, and for servers removed from the config. |
 | `shutdown-drain-duration` | `2m` | On SIGTERM: not ready right away, streams closed over this long, then exit. |
 | `client-key` | `{ipv4-prefix-bits: 32, ipv6-prefix-bits: 64}` | What identifies a client for `balance: hash`, limits and bans: its IP, shortened to a prefix. |
 | `bans` | off | Strike counting and the ban file. See [Bans](#bans). |
@@ -82,11 +79,12 @@ A minimal config, one site in front of two app servers:
 sites:
   - name: app
     listen-http: ":80"
-    upstreams:
-      - name: app1
-        addresses: ["10.0.0.11:8080"]
-      - name: app2
-        addresses: ["10.0.0.12:8080"]
+    upstream:
+      servers:
+        - name: app1
+          addresses: ["10.0.0.11:8080"]
+        - name: app2
+          addresses: ["10.0.0.12:8080"]
 ```
 
 That balances round-robin, probes `GET /` on every address every 5s, proxies WebSockets and
@@ -94,8 +92,8 @@ HTTP/1.1 and keeps everything else at its default.
 
 ## Sites
 
-A site is a set of listen addresses and host names, with its own certificate, upstreams, health
-check, streams, rules and (optionally) logs, bans and gzip settings.
+A site is a set of listen addresses and host names, with its own certificate, upstream (servers,
+balancing, timeouts, health checks), streams, rules and (optionally) logs, bans and gzip settings.
 
 | Setting | Default | |
 |---|---|---|
@@ -104,9 +102,7 @@ check, streams, rules and (optionally) logs, bans and gzip settings.
 | `listen-https` | | The same, for TLS (HTTP/2 and HTTP/1.1). Needs `cert-file` and `key-file`. |
 | `hosts` | all | Host names this site serves: exact (`example.com`) or wildcard (`"*.example.com"`: any subdomain). Leave out to take every host no other site on these addresses serves. |
 | `cert-file`, `key-file` | | PEM certificate (full chain) and key, re-read on every reload. |
-| `upstreams` | required | See [Upstreams and balancing](#upstreams-and-balancing). |
-| `balance` | `round-robin` | `round-robin`, `least-conn`, `random-two` or `hash`. |
-| `health-check` | `{path: /, interval: 5s, timeout: 3s, fails: 3, passes: 2}` | See [Health checks](#health-checks-and-what-happens-when-one-goes-bad). |
+| `upstream` | required | The servers and how requests reach them: `balance`, `timeouts`, `keepalive`, `health-check`, `servers`. See [Upstream](#upstream-servers-balancing-and-timeouts). |
 | `streams` | none | Which requests are long-lived streams. See [Streams](#streams). |
 | `rules` | none | Checked after the global rules; named `<site>/<name>` in logs and metrics. |
 | `access-logs`, `bans`, `gzip` | the global ones | Replace the global setting for this site's requests. |
@@ -137,62 +133,87 @@ sites:
     hosts: [example.com, www.example.com]
     cert-file: /etc/ntlb/certs/example.com/fullchain.pem
     key-file: /etc/ntlb/certs/example.com/privkey.pem
-    upstreams:
-      - {name: web1, addresses: ["10.0.0.21:3000"]}
+    upstream:
+      servers: [{name: web1, addresses: ["10.0.0.21:3000"]}]
   - name: api
     listen-http: ":80"
     listen-https: ":443"
     hosts: ["*.api.example.com", api.example.com]
     cert-file: /etc/ntlb/certs/api.example.com/fullchain.pem
     key-file: /etc/ntlb/certs/api.example.com/privkey.pem
-    balance: least-conn
-    upstreams:
-      - {name: api1, addresses: ["10.0.0.31:8080"]}
-      - {name: api2, addresses: ["10.0.0.32:8080"]}
+    upstream:
+      balance: least-conn
+      servers:
+        - {name: api1, addresses: ["10.0.0.31:8080"]}
+        - {name: api2, addresses: ["10.0.0.32:8080"]}
   - name: default                     # every other host on :80 and :443
     listen-http: ":80"
     listen-https: ":443"
     cert-file: /etc/ntlb/certs/example.com/fullchain.pem
     key-file: /etc/ntlb/certs/example.com/privkey.pem
-    upstreams:
-      - {name: web1, addresses: ["10.0.0.21:3000"]}   # names are per site
+    upstream:
+      servers: [{name: web1, addresses: ["10.0.0.21:3000"]}]   # names are per site
     rules:
       - name: unknown-host
         action: block                 # no match: every request
         status: 404
 ```
 
-## Upstreams and balancing
+## Upstream: servers, balancing and timeouts
 
-An upstream is one backend node with one or more addresses. An address may be a port range,
-`"10.0.0.11:25010-25017"`, which is one address per port (each address holds ~63k connections from
-one source IP, so a node with many long-lived clients listens on several ports).
+A site's `upstream` block holds everything about its backend servers, like nginx's `upstream {}`
+block plus its `proxy_*_timeout` settings:
 
 ```yaml
-upstreams:
-  - name: app1
-    addresses: ["10.0.0.11:8080"]
-  - name: app2
-    addresses: ["10.0.0.12:8080", "10.0.0.12:8081"]
-  - name: app3
-    addresses: ["10.0.0.13:25010-25017"]   # 8 addresses
+upstream:
+  balance: hash                 # default round-robin
+  timeouts:
+    connect: 5s                 # default 5s
+    read: 3m                    # default 60s
+  keepalive: {idle: 1m, interval: 15s, count: 4}
+  health-check: {path: /healthz}
+  servers:
+    - name: app1
+      addresses: ["10.0.0.11:8080"]
+    - name: app2
+      addresses: ["10.0.0.12:8080", "10.0.0.12:8081"]
+    - name: app3
+      addresses: ["10.0.0.13:25010-25017"]   # 8 addresses
 ```
 
-Within an upstream, a request goes to the address with the fewest open requests that is neither
+| Setting | Default | |
+|---|---|---|
+| `balance` | `round-robin` | Which server a request goes to, see below. |
+| `timeouts.connect` | `5s` | A server address that does not accept within this is down for the request; the next one is tried. |
+| `timeouts.read` | `60s` | Cut a response (or a WebSocket) after this long without a byte. Streams need their server to send keepalives within it. Also bounds a client that stops reading; a stalled upload is cut after 60s, or this if shorter. |
+| `keepalive` | `{idle: 1m, interval: 15s, count: 4}` | TCP keepalive towards the servers; a dead peer is noticed after `idle + interval * count`. `{disable: true}` turns it off. |
+| `health-check` | `{path: /, interval: 5s, timeout: 3s, fails: 3, passes: 2}` | See [Health checks](#health-checks-and-what-happens-when-one-goes-bad). |
+| `servers` | required | The backend nodes: a `name` and one or more `addresses`. Names are per site. |
+
+Each site has its own connections to its servers, so sites can differ: ntfy's 3m read timeout next
+to a site with the default. A reload keeps a site's idle connections unless its `timeouts` or
+`keepalive` changed.
+
+An address may be a port range, `"10.0.0.11:25010-25017"`, which is one address per port (each
+address holds ~63k connections from one source IP, so a node with many long-lived clients listens
+on several ports). In `ntlb status`, the CLI (`ntlb upstream drain app1`) and the metrics
+(`upstream="app1"`), a server is called an upstream, like nginx's `$upstream_addr`.
+
+Within a server, a request goes to the address with the fewest open requests that is neither
 failing its health checks nor backing off after a failure.
 
-`balance` decides which upstream:
+`balance` decides which server:
 
 | `balance` | Picks | Like nginx | Use it for |
 |---|---|---|---|
 | `round-robin` (default) | the next one in turn | (default) | similar nodes, short requests |
 | `least-conn` | the fewest open requests on this load balancer, in turn among equals | `least_conn` | long or uneven requests with one load balancer |
 | `random-two` | the less busy of two random ones | `random two least_conn` | uneven requests with several load balancers, which each see only their own load |
-| `hash` | the same upstream for the same client, by `client-key` | `hash $remote_addr consistent` | per-client state on the node: rate limits, sessions, a pub/sub node per client |
+| `hash` | the same server for the same client, by `client-key` | `hash $remote_addr consistent` | per-client state on the node: rate limits, sessions, a pub/sub node per client |
 
 ```mermaid
 flowchart LR
-    req["request from<br>203.0.113.9"] --> pick["Pick: the site's upstreams,<br>not draining"]
+    req["request from<br>203.0.113.9"] --> pick["Pick: the site's servers,<br>not draining"]
     pick --> healthy{"any healthy?"}
     healthy -- yes --> h["only the healthy ones"]
     healthy -- no --> all["all of them<br>(fail open)"]
@@ -201,7 +222,7 @@ flowchart LR
     order --> list["app2, app3, app1<br>first = the choice,<br>the rest = retries"]
 ```
 
-`hash` is rendezvous hashing over the upstream **names** (not the addresses): every load
+`hash` is rendezvous hashing over the server **names** (not the addresses): every load
 balancer with the same names sends a client to the same node, and adding or removing a node only
 moves the clients that ranked it first. Keep the names equal on all load balancers; renaming a
 node moves its clients.
@@ -222,33 +243,35 @@ flowchart LR
 ```
 
 **Retries**, like nginx's `proxy_next_upstream error timeout http_503`: a request moves on to the
-next address of the same node if it could not connect, then to the next upstream in the list:
+next address of the same node if it could not connect, then to the next server in the list:
 
 - if it never reached the node (connect error): any request;
 - on another error: only `GET`, `HEAD` and `OPTIONS`;
 - on a 503 (e.g. a node that is shutting down): any request whose body was not sent yet.
 
-A request whose body was partly sent is never resent (there is no copy). The last upstream's
+A request whose body was partly sent is never resent (there is no copy). The last server's
 answer or error goes to the client: `502` for an error, `504` for a timeout, `503` if every
-upstream is draining.
+server is draining.
 
 ## Health checks, and what happens when one goes bad
 
-Every address of every upstream is probed every `interval`: `GET http://<address><path>` on a new
-connection. Any `2xx` or `3xx` within `timeout` passes (redirects are not followed). An upstream
+Every address of every server is probed every `interval`: `GET http://<address><path>` on a new
+connection. Any `2xx` or `3xx` within `timeout` passes (redirects are not followed). A server
 passes a round if **any** of its addresses passed; the addresses that failed are skipped while
 others are up.
 
 ```yaml
-health-check:
-  path: /healthz    # default /
-  interval: 5s
-  timeout: 3s
-  fails: 3          # failed rounds in a row before the upstream leaves the rotation
-  passes: 2         # good rounds in a row before it comes back
+upstream:
+  health-check:
+    path: /healthz    # default /
+    interval: 5s
+    timeout: 3s
+    fails: 3          # failed rounds in a row before the server leaves the rotation
+    passes: 2         # good rounds in a row before it comes back
+  servers: [...]
 ```
 
-The very first probe (at start, or when a reload adds an upstream or changes its addresses)
+The very first probe (at start, or when a reload adds a server or changes its addresses)
 decides right away, so a node that is down then never gets traffic. After that, `fails` and
 `passes` keep a slow probe or two from flapping it:
 
@@ -301,13 +324,13 @@ In detail:
 
 | | While the node is still "healthy" (the first 10-15s) | Once it is unhealthy |
 |---|---|---|
-| New requests | Tried on it first; a connect error moves the request to its other addresses, then to the next upstream, so clients rarely notice. Each failed address backs off (1s, doubling to 30s). | Not sent to it. `hash` clients go to their second choice, `round-robin` and the others spread over the rest. |
-| A node that accepts but hangs | Requests wait for `upstream-read-timeout`, then `504`. | Not sent to it. |
+| New requests | Tried on it first; a connect error moves the request to its other addresses, then to the next server, so clients rarely notice. Each failed address backs off (1s, doubling to 30s). | Not sent to it. `hash` clients go to their second choice, `round-robin` and the others spread over the rest. |
+| A node that accepts but hangs | Requests wait for `timeouts.read`, then `504`. | Not sent to it. |
 | Open streams and WebSockets on it | Stay open as long as their connection does. | Stay open: health never moves an open connection, only drains do. A dead node's connections end with a reset, or after the keepalive (`idle + interval * count`, 2m by default); the clients reconnect and land on a healthy node. |
 | `ntlb status` | `healthy`, the last error in `NOTE` | `unhealthy`, with the probe error |
 | Metrics, logs | `ntlb_retries_total` goes up | `ntlb_upstream_healthy` = 0, a warning log line |
 
-When **every** upstream of a site is unhealthy, ntlb fails open: it tries all of them (minus the
+When **every** server of a site is unhealthy, ntlb fails open: it tries all of them (minus the
 draining ones), in balance order, because a problem they share (say, their database) is no reason
 to turn every client away. The admin `/v1/health` and `/v1/ready` then answer 503, so a cloud load
 balancer or monitor in front sees it.
@@ -315,12 +338,12 @@ balancer or monitor in front sees it.
 ```mermaid
 flowchart TD
     probe["probe round"] --> any{"any address<br>passed?"}
-    any -- yes --> pass["the upstream passes,<br>failed addresses are skipped<br>while others are up"]
-    any -- no --> fail["the upstream fails the round"]
+    any -- yes --> pass["the server passes,<br>failed addresses are skipped<br>while others are up"]
+    any -- no --> fail["the server fails the round"]
     fail --> count{"failed rounds<br>in a row >= fails?"}
     count -- no --> stay["still in rotation"]
     count -- yes --> out["out of rotation"]
-    out --> allout{"every upstream<br>of the site out?"}
+    out --> allout{"every server<br>of the site out?"}
     allout -- no --> rest["traffic goes to the others"]
     allout -- yes --> open["fail open: try all of them,<br>/v1/health and /v1/ready say 503"]
 ```
@@ -357,7 +380,7 @@ sequenceDiagram
     U-->>LB: 200, then events as they happen
     LB-->>C: 200, events copied as they come
     Note over LB: the client connection is not read<br>until the stream ends
-    U-->>LB: keepalive every 45s (within upstream-read-timeout)
+    U-->>LB: keepalive every 45s (within timeouts.read)
     LB-->>C: keepalive
     Note over LB: drain: this stream gets its slot in the drain duration
     LB--xC: closed, client reconnects elsewhere
@@ -795,13 +818,15 @@ sites:
     hosts: [app.example.com]
     cert-file: /etc/ntlb/certs/app.example.com/fullchain.pem
     key-file: /etc/ntlb/certs/app.example.com/privkey.pem
-    balance: least-conn
-    health-check: {path: /api/health}
     streams:
       match: method == "GET" && path == "/api/events"
-    upstreams:
-      - {name: api1, addresses: ["10.0.0.31:8080"]}
-      - {name: api2, addresses: ["10.0.0.32:8080"]}
+    upstream:
+      balance: least-conn
+      timeouts: {read: 5m}             # the event stream sends a keepalive every minute
+      health-check: {path: /api/health}
+      servers:
+        - {name: api1, addresses: ["10.0.0.31:8080"]}
+        - {name: api2, addresses: ["10.0.0.32:8080"]}
     rules:
       - name: spa
         match: method in ["GET", "HEAD"] && !(path startsWith "/api/")
@@ -832,10 +857,11 @@ client-key:
   ipv6-prefix-bits: 56
 sites:
   - name: chat
-    balance: hash                       # same names on every load balancer -> same node
-    upstreams:
-      - {name: chat-a, addresses: ["10.0.0.41:9000"]}
-      - {name: chat-b, addresses: ["10.0.0.42:9000"]}
+    upstream:
+      balance: hash                     # same names on every load balancer -> same node
+      servers:
+        - {name: chat-a, addresses: ["10.0.0.41:9000"]}
+        - {name: chat-b, addresses: ["10.0.0.42:9000"]}
     # ...
 ```
 

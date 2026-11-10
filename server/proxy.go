@@ -56,7 +56,7 @@ const (
 
 var (
 	// clientBodyTimeout bounds how long a request body may stall, like nginx's client_body_timeout
-	// (a variable for the tests); upstream-read-timeout bounds it too, if shorter
+	// (a variable for the tests); upstream.timeouts.read bounds it too, if shorter
 	clientBodyTimeout = 60 * time.Second
 )
 
@@ -73,14 +73,22 @@ type proxyContextKey struct{}
 // proxy forwards requests to the upstream the balancer picks, streaming both bodies, like
 // nginx with proxy_buffering and proxy_request_buffering off
 type proxy struct {
-	balancer  *balancer.Balancer
-	metrics   *metrics
-	reverse   *httputil.ReverseProxy
-	transport atomic.Pointer[http.Transport]
-	dialer    atomic.Pointer[net.Dialer]
-	config    atomic.Pointer[config.Config]
-	active    map[*proxyRequest]struct{}
-	mu        sync.Mutex // Protects active
+	balancer *balancer.Balancer
+	metrics  *metrics
+	reverse  *httputil.ReverseProxy
+	conns    atomic.Pointer[map[string]*upstreamConns] // Per site
+	config   atomic.Pointer[config.Config]
+	active   map[*proxyRequest]struct{}
+	mu       sync.Mutex // Protects active
+}
+
+// upstreamConns are a site's connections to its servers, set up by its upstream timeouts and
+// keepalive
+type upstreamConns struct {
+	transport *http.Transport
+	dialer    *net.Dialer
+	timeouts  config.Timeouts
+	keepalive config.Keepalive
 }
 
 // proxyRequest is the per-request state shared between ServeHTTP, the transport, the stream path
@@ -90,6 +98,7 @@ type proxyRequest struct {
 	key            []byte
 	kind           string // kindRequest, kindStream or kindWebSocket
 	session        *balancer.Session
+	conns          *upstreamConns // The site's, nil if a reload removed the site meanwhile
 	cancel         context.CancelCauseFunc
 	env            *match.Env   // The request as expressions see it, if Server.observe made one
 	site           string       // The site serving the request, "" if none does
@@ -162,7 +171,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancelCause(parent)
 	pr.key, pr.cancel = clientKey(r.RemoteAddr, conf.ClientKey), cancel
-	pr.readTimeout = conf.UpstreamReadTimeout
+	pr.readTimeout = site.Upstream.Timeouts.Read
+	pr.conns = (*p.conns.Load())[site.Name]
 	pr.session = p.balancer.NewSession(cancel)
 	if subscription {
 		gauge := p.metrics.streams.WithLabelValues(streamProtocol(pr.kind, r.ProtoMajor))
@@ -197,7 +207,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = &clientBody{
 			rc:      r.Body,
 			conn:    cc,
-			timeout: min(clientBodyTimeout, conf.UpstreamReadTimeout),
+			timeout: min(clientBodyTimeout, pr.readTimeout),
 		}
 	}
 	stop := context.AfterFunc(ctx, func() {
@@ -207,7 +217,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.reverse.ServeHTTP(&deadlineWriter{
 		ResponseWriter: w,
 		conn:           cc,
-		timeout:        conf.UpstreamReadTimeout,
+		timeout:        pr.readTimeout,
 	}, r)
 }
 
@@ -219,14 +229,14 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	pr := proxyRequestFromContext(req.Context())
 	candidates := p.balancer.Pick(pr.site, pr.key)
-	if len(candidates) == 0 {
+	if len(candidates) == 0 || pr.conns == nil {
 		return nil, errNoUpstream
 	}
 	var body *trackingBody
 	if req.Body != nil && req.Body != http.NoBody {
 		body = &trackingBody{rc: req.Body}
 	}
-	transport := p.transport.Load()
+	transport := pr.conns.transport
 	for i, u := range candidates {
 		last := i == len(candidates)-1
 		for try := 0; ; try++ {
@@ -326,34 +336,57 @@ func (p *proxy) closeAll(ctx context.Context) error {
 	}
 }
 
-// update applies a (re)loaded config to the upstream connections. Open connections keep running
-// on the old transport; its idle ones are closed.
+// update applies a (re)loaded config to the upstream connections: a site whose upstream timeouts
+// and keepalive did not change keeps its connections; otherwise open connections keep running on
+// the old transport, and its idle ones are closed.
 func (p *proxy) update(conf *config.Config) {
-	ka := conf.UpstreamKeepalive.KeepAliveConfig()
+	var old map[string]*upstreamConns
+	if prev := p.conns.Load(); prev != nil {
+		old = *prev
+	}
+	conns := make(map[string]*upstreamConns, len(conf.Sites))
+	for _, site := range conf.Sites {
+		if c, ok := old[site.Name]; ok && c.timeouts == *site.Upstream.Timeouts && c.keepalive == *site.Upstream.Keepalive {
+			conns[site.Name] = c
+		} else {
+			conns[site.Name] = newUpstreamConns(site.Upstream)
+		}
+	}
+	p.config.Store(conf)
+	p.conns.Store(&conns)
+	for name, c := range old {
+		if conns[name] != c {
+			c.transport.CloseIdleConnections()
+		}
+	}
+}
+
+func newUpstreamConns(u *config.Upstream) *upstreamConns {
+	ka := u.Keepalive.KeepAliveConfig()
 	dialer := &net.Dialer{
-		Timeout:         conf.UpstreamConnectTimeout,
+		Timeout:         u.Timeouts.Connect,
 		KeepAliveConfig: ka,
 	}
 	if !ka.Enable {
 		dialer.KeepAlive = -1
 	}
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, &dialError{err: err}
-			}
-			return conn, nil
+	return &upstreamConns{
+		transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dialer.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, &dialError{err: err}
+				}
+				return conn, nil
+			},
+			MaxIdleConnsPerHost:   upstreamMaxIdleConnsPerHost,
+			IdleConnTimeout:       upstreamIdleConnTimeout,
+			ResponseHeaderTimeout: u.Timeouts.Read,
+			DisableCompression:    true, // Pass encodings through as they are
 		},
-		MaxIdleConnsPerHost:   upstreamMaxIdleConnsPerHost,
-		IdleConnTimeout:       upstreamIdleConnTimeout,
-		ResponseHeaderTimeout: conf.UpstreamReadTimeout,
-		DisableCompression:    true, // Pass encodings through as they are
-	}
-	p.config.Store(conf)
-	p.dialer.Store(dialer)
-	if old := p.transport.Swap(transport); old != nil {
-		old.CloseIdleConnections()
+		dialer:    dialer,
+		timeouts:  *u.Timeouts,
+		keepalive: *u.Keepalive,
 	}
 }
 

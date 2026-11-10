@@ -31,7 +31,7 @@ func writeTestConfig(t *testing.T, extra string, handler http.Handler, names ...
 	var b strings.Builder
 	b.WriteString("listen-admin: '127.0.0.1:0'\n")
 	b.WriteString(extra)
-	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    upstream:\n      health-check: {interval: 1h, timeout: 1s}\n      servers:\n")
 	for _, name := range names {
 		upstream := httptest.NewServer(handler)
 		t.Cleanup(upstream.Close)

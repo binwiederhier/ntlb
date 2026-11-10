@@ -57,26 +57,35 @@ var (
 	nameRegex      = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`)      // Names of sites, upstreams and rules
 	mediaTypeRegex = regexp.MustCompile(`^[-+.a-z0-9]+/[-+.a-z0-9]+$`) // gzip.types
 	balances       = []string{BalanceRoundRobin, BalanceLeastConn, BalanceRandomTwo, BalanceHash}
+
+	// movedKeys are the keys that moved into a site's upstream block, and where to: an old config
+	// gets told instead of only "field not found"
+	movedKeys = map[string]string{
+		"upstream-connect-timeout": "sites[].upstream.timeouts.connect",
+		"upstream-read-timeout":    "sites[].upstream.timeouts.read",
+		"upstream-keepalive":       "sites[].upstream.keepalive",
+		"balance":                  "sites[].upstream.balance",
+		"health-check":             "sites[].upstream.health-check",
+		"upstreams":                "sites[].upstream.servers",
+	}
+	unknownFieldRegex = regexp.MustCompile(`field (\S+) not found in type config\.(Config|Site)$`)
 )
 
 // Config is the ntlb config file. Field names follow ntfy's server.yml (kebab-case).
 type Config struct {
-	ListenAdmin            string        `yaml:"listen-admin"`    // Admin API, status, metrics, pprof; no auth
-	ListenMetrics          string        `yaml:"listen-metrics"`  // Only /metrics, e.g. for Prometheus on a private network
-	ListenProfiler         string        `yaml:"listen-profiler"` // Only /debug/pprof/, e.g. on a private network
-	AccessLogs             []*AccessLog  `yaml:"access-logs"`     // For sites without their own, and requests no site serves
-	ClientKeepalive        *Keepalive    `yaml:"client-keepalive"`
-	UpstreamKeepalive      *Keepalive    `yaml:"upstream-keepalive"`
-	UpstreamConnectTimeout time.Duration `yaml:"upstream-connect-timeout"`
-	UpstreamReadTimeout    time.Duration `yaml:"upstream-read-timeout"`
-	DrainDuration          time.Duration `yaml:"drain-duration"`
-	ShutdownDrainDuration  time.Duration `yaml:"shutdown-drain-duration"`
-	ClientKey              *ClientKey    `yaml:"client-key"`
-	Bans                   *Bans         `yaml:"bans"`
-	Gzip                   *Gzip         `yaml:"gzip"`    // For sites without their own
-	Rules                  []*Rule       `yaml:"rules"`   // Checked for every request, before its site's rules
-	Include                []string      `yaml:"include"` // Globs of files merged into this one, relative to its directory
-	Sites                  []*Site       `yaml:"sites"`
+	ListenAdmin           string        `yaml:"listen-admin"`    // Admin API, status, metrics, pprof; no auth
+	ListenMetrics         string        `yaml:"listen-metrics"`  // Only /metrics, e.g. for Prometheus on a private network
+	ListenProfiler        string        `yaml:"listen-profiler"` // Only /debug/pprof/, e.g. on a private network
+	AccessLogs            []*AccessLog  `yaml:"access-logs"`     // For sites without their own, and requests no site serves
+	ClientKeepalive       *Keepalive    `yaml:"client-keepalive"`
+	DrainDuration         time.Duration `yaml:"drain-duration"`
+	ShutdownDrainDuration time.Duration `yaml:"shutdown-drain-duration"`
+	ClientKey             *ClientKey    `yaml:"client-key"`
+	Bans                  *Bans         `yaml:"bans"`
+	Gzip                  *Gzip         `yaml:"gzip"`    // For sites without their own
+	Rules                 []*Rule       `yaml:"rules"`   // Checked for every request, before its site's rules
+	Include               []string      `yaml:"include"` // Globs of files merged into this one, relative to its directory
+	Sites                 []*Site       `yaml:"sites"`
 
 	Listeners []*Listener `yaml:"-"` // The sites' listen addresses, in order of first use
 }
@@ -135,10 +144,26 @@ type Gzip struct {
 	Types []string `yaml:"types"` // Media types without parameters, e.g. text/html
 }
 
-// Upstream is one backend node. The name, not the address, is what clients are hashed to, so every
+// Upstream is a site's backend servers and how requests reach them, like nginx's upstream block
+// and its proxy_*_timeout settings
+type Upstream struct {
+	Balance     string       `yaml:"balance"`      // round-robin (default), least-conn, random-two or hash
+	Timeouts    *Timeouts    `yaml:"timeouts"`     //
+	Keepalive   *Keepalive   `yaml:"keepalive"`    // TCP keepalive towards the servers
+	HealthCheck *HealthCheck `yaml:"health-check"` // Active health checks against every server
+	Servers     []*Server    `yaml:"servers"`      // Server names are per site
+}
+
+// Timeouts bound the connections to a site's servers
+type Timeouts struct {
+	Connect time.Duration `yaml:"connect"` // An address that does not accept within this is down for the request
+	Read    time.Duration `yaml:"read"`    // Cut a response (or a WebSocket) after this long without a byte
+}
+
+// Server is one backend node. The name, not the address, is what clients are hashed to, so every
 // load balancer must use the same names for the same nodes to route a client the same way. An
 // address may be a port range ("10.0.0.1:2586-2589"), one address per port.
-type Upstream struct {
+type Server struct {
 	Name      string   `yaml:"name"`
 	Addresses []string `yaml:"addresses"`
 }
@@ -211,20 +236,28 @@ func decode(b []byte, v any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
 	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
-		return err
+		return withMovedKeys(err)
 	}
 	return nil
+}
+
+// withMovedKeys adds where a key went to the unknown field errors of keys that moved
+func withMovedKeys(err error) error {
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) {
+		return err
+	}
+	for i, msg := range typeErr.Errors {
+		if m := unknownFieldRegex.FindStringSubmatch(msg); m != nil && movedKeys[m[1]] != "" {
+			typeErr.Errors[i] = msg + " (moved to " + movedKeys[m[1]] + ")"
+		}
+	}
+	return typeErr
 }
 
 func (c *Config) applyDefaults() {
 	if c.ListenAdmin == "" {
 		c.ListenAdmin = DefaultListenAdmin
-	}
-	if c.UpstreamConnectTimeout == 0 {
-		c.UpstreamConnectTimeout = DefaultUpstreamConnectTimeout
-	}
-	if c.UpstreamReadTimeout == 0 {
-		c.UpstreamReadTimeout = DefaultUpstreamReadTimeout
 	}
 	if c.DrainDuration == 0 {
 		c.DrainDuration = DefaultDrainDuration
@@ -235,11 +268,7 @@ func (c *Config) applyDefaults() {
 	if c.ClientKeepalive == nil {
 		c.ClientKeepalive = &Keepalive{}
 	}
-	if c.UpstreamKeepalive == nil {
-		c.UpstreamKeepalive = &Keepalive{}
-	}
 	c.ClientKeepalive.applyDefaults()
-	c.UpstreamKeepalive.applyDefaults()
 	if c.ClientKey == nil {
 		c.ClientKey = &ClientKey{}
 	}
@@ -259,14 +288,7 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	if c.UpstreamConnectTimeout <= 0 {
-		return errors.New("upstream-connect-timeout must be positive")
-	} else if c.UpstreamReadTimeout <= 0 {
-		return errors.New("upstream-read-timeout must be positive")
-	}
 	if err := c.ClientKeepalive.validate("client-keepalive"); err != nil {
-		return err
-	} else if err := c.UpstreamKeepalive.validate("upstream-keepalive"); err != nil {
 		return err
 	}
 	if c.DrainDuration < 0 || c.ShutdownDrainDuration < 0 {
@@ -450,15 +472,15 @@ func (h *HealthCheck) applyDefaults() {
 // validate checks the values after defaulting. A non-positive interval would probe in a tight loop.
 func (h *HealthCheck) validate() error {
 	if h.Interval <= 0 {
-		return errors.New("health-check.interval must be positive")
+		return errors.New("upstream.health-check.interval must be positive")
 	} else if h.Timeout <= 0 {
-		return errors.New("health-check.timeout must be positive")
+		return errors.New("upstream.health-check.timeout must be positive")
 	} else if h.Timeout >= h.Interval {
-		return errors.New("health-check.timeout must be shorter than health-check.interval")
+		return errors.New("upstream.health-check.timeout must be shorter than its interval")
 	} else if h.Fails <= 0 {
-		return errors.New("health-check.fails must be positive")
+		return errors.New("upstream.health-check.fails must be positive")
 	} else if h.Passes <= 0 {
-		return errors.New("health-check.passes must be positive")
+		return errors.New("upstream.health-check.passes must be positive")
 	}
 	return nil
 }

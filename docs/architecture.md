@@ -415,7 +415,7 @@ sequenceDiagram
 ```
 
 **The node hangs** (accepts, never answers). Nothing fails fast, so requests wait for
-`upstream-read-timeout` and get 504; they are not retried, since the node may have acted on them.
+`upstream.timeouts.read` and get 504; they are not retried, since the node may have acted on them.
 The probes time out too, and after `fails` rounds the node is out and new requests skip it.
 
 ```mermaid
@@ -431,7 +431,7 @@ sequenceDiagram
     H->>A: probe (times out)
     H->>A: probe (times out)
     Note over H: app1 out of rotation
-    LB--xA: upstream-read-timeout
+    LB--xA: upstream.timeouts.read
     LB-->>C: 504
     C->>LB: GET /x (retry by the client)
     LB->>LB: Pick skips app1

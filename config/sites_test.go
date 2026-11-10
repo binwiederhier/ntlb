@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,7 +12,7 @@ import (
 )
 
 const (
-	testUp = "upstreams: [{name: x, addresses: ['1.2.3.4:80']}]"
+	testUp = "upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}"
 )
 
 func TestParse_Sites(t *testing.T) {
@@ -20,28 +21,27 @@ sites:
   - name: ntfy
     listen-http: ":80"
     hosts: [ntfy.sh, "*.ntfy.sh"]
-    upstreams: [{name: app1, addresses: ['10.0.0.1:2586']}]
+    upstream: {servers: [{name: app1, addresses: ['10.0.0.1:2586']}]}
     rules: [{name: limit, action: limit, rate: 1/s}]
   - name: other
     listen-http: [":80", ":8080"]
     hosts: [Example.COM., "*.eu.ntfy.sh"]
-    health-check: {path: /healthz, interval: 10s}
     streams: {match: 'false'}
-    upstreams: [{name: app1, addresses: ['10.0.0.2:80']}]
+    upstream: {health-check: {path: /healthz, interval: 10s}, servers: [{name: app1, addresses: ['10.0.0.2:80']}]}
   - name: fallback
     listen-http: ":80"
-    upstreams: [{name: web, addresses: ['10.0.0.3:80']}]
+    upstream: {servers: [{name: web, addresses: ['10.0.0.3:80']}]}
 `))
 	require.NoError(t, err)
 	require.Len(t, c.Sites, 3)
 
 	// Defaults are per site
 	ntfy, other := c.Sites[0], c.Sites[1]
-	require.Equal(t, DefaultHealthPath, ntfy.HealthCheck.Path)
+	require.Equal(t, DefaultHealthPath, ntfy.Upstream.HealthCheck.Path)
 	require.Equal(t, DefaultStreamsMatch, ntfy.Streams.Match)
-	require.Equal(t, "/healthz", other.HealthCheck.Path)
-	require.Equal(t, 10*time.Second, other.HealthCheck.Interval)
-	require.Equal(t, DefaultHealthFails, other.HealthCheck.Fails)
+	require.Equal(t, "/healthz", other.Upstream.HealthCheck.Path)
+	require.Equal(t, 10*time.Second, other.Upstream.HealthCheck.Interval)
+	require.Equal(t, DefaultHealthFails, other.Upstream.HealthCheck.Fails)
 	require.Equal(t, []string{"example.com", "*.eu.ntfy.sh"}, other.Hosts) // Normalized
 	require.Equal(t, ListenAddrs{":80"}, ntfy.ListenHTTP)                  // A single address or a list
 	require.Equal(t, ListenAddrs{":80", ":8080"}, other.ListenHTTP)
@@ -119,7 +119,7 @@ rules: [{name: limit, action: limit, rate: 1/s, strike: 1}]
 sites:
   - name: a
     listen-http: ':80'
-    upstreams: [{name: x, addresses: ['1.2.3.4:80']}]
+    upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}
     rules: [{name: limit, action: limit, rate: 2/s, strike: 1}, {name: site, match: 'site == "a"', action: block}]
 `))
 	require.NoError(t, err)
@@ -164,7 +164,7 @@ func TestParse_SitesInvalid(t *testing.T) {
 		"overlapping listeners":    "sites: [{name: a, listen-http: ':80', " + testUp + "}, {name: b, listen-http: '0.0.0.0:80', hosts: [b.com], " + testUp + "}]",
 		"overlapping ipv6":         "sites: [{name: a, listen-http: '[::]:80', " + testUp + "}, {name: b, listen-http: '10.0.0.1:80', hosts: [b.com], " + testUp + "}]",
 		"same address respelled":   "sites: [{name: a, listen-http: '127.0.0.1:80', " + testUp + "}, {name: b, listen-http: '[::ffff:127.0.0.1]:80', hosts: [b.com], " + testUp + "}]",
-		"duplicate upstream":       "sites: [{name: a, listen-http: ':80', upstreams: [{name: x, addresses: ['1.2.3.4:80']}, {name: x, addresses: ['1.2.3.5:80']}]}]",
+		"duplicate upstream":       "sites: [{name: a, listen-http: ':80', upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}, {name: x, addresses: ['1.2.3.5:80']}]}}]",
 		"two defaults":             "sites: [{name: a, " + up + "}, {name: b, " + up + "}]",
 		"duplicate host":           "sites: [{name: a, hosts: [a.com], " + up + "}, {name: b, hosts: [A.com], " + up + "}]",
 		"duplicate wildcard":       "sites: [{name: a, hosts: ['*.a.com'], " + up + "}, {name: b, hosts: ['*.a.com'], " + up + "}]",
@@ -178,7 +178,7 @@ func TestParse_SitesInvalid(t *testing.T) {
 		"bad site rule":            "sites: [{name: a, rules: [{name: r}], " + up + "}]",
 		"duplicate site rule":      "sites: [{name: a, rules: [{name: r, action: block}, {name: r, action: block}], " + up + "}]",
 		"site rule strike no bans": "sites: [{name: a, rules: [{name: r, action: block, strike: 1}], " + up + "}]",
-		"top-level upstreams gone": "upstreams: [{name: x, addresses: ['1.2.3.4:80']}]",
+		"top-level upstreams gone": "upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}",
 		"top-level listen gone":    "listen-http: ':80'\nsites: [{name: a, " + up + "}]",
 		"unknown site field":       "sites: [{name: a, path: /x, " + up + "}]",
 	}
@@ -239,7 +239,7 @@ sites: [{name: a, listen-http: ':80', hosts: [a.com], `+testUp+`}]
 	require.ErrorContains(t, err, "c.yml")
 	writeFile(t, filepath.Join(dir, "conf.d", "c.yml"), "sites: [{name: c, listen-http: ':80', hosts: [c.com]}]\n")
 	_, err = Load(filepath.Join(dir, "config.yml"))
-	require.ErrorContains(t, err, "site c ("+filepath.Join(dir, "conf.d", "c.yml")+"): at least one upstream")
+	require.ErrorContains(t, err, "site c ("+filepath.Join(dir, "conf.d", "c.yml")+"): upstream is required")
 
 	// A site name taken twice, across files
 	writeFile(t, filepath.Join(dir, "conf.d", "c.yml"), "sites: [{name: main, listen-http: ':80', hosts: [c.com], "+testUp+"}]\n")
@@ -357,10 +357,70 @@ sites:
 
 func TestParse_Balance(t *testing.T) {
 	for _, balance := range []string{BalanceRoundRobin, BalanceLeastConn, BalanceRandomTwo, BalanceHash} {
-		c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', balance: " + balance + ", upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+		c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {balance: " + balance + ", servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 		require.NoError(t, err, balance)
-		require.Equal(t, balance, c.Sites[0].Balance)
+		require.Equal(t, balance, c.Sites[0].Upstream.Balance)
 	}
-	_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', balance: ip-hash, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
-	require.ErrorContains(t, err, "site s: invalid balance \"ip-hash\"")
+	_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {balance: ip-hash, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
+	require.ErrorContains(t, err, "site s: invalid upstream.balance \"ip-hash\"")
+}
+
+func TestParse_Upstream(t *testing.T) {
+	// Everything about a site's servers is in its upstream block, also the timeouts and keepalive,
+	// so sites can differ (ntfy's 3m read timeout next to a site with the default)
+	c, err := Parse([]byte(`
+sites:
+  - name: a
+    listen-http: ':80'
+    upstream:
+      balance: least-conn
+      timeouts: {connect: 2s, read: 3m}
+      keepalive: {idle: 30s}
+      health-check: {path: /ready}
+      servers:
+        - name: app1
+          addresses: ['10.0.0.1:1-2']
+  - name: b
+    listen-http: ':81'
+    upstream:
+      servers: [{name: app1, addresses: ['10.0.0.2:1']}]
+`))
+	require.NoError(t, err)
+	a, b := c.Sites[0].Upstream, c.Sites[1].Upstream
+	require.Equal(t, BalanceLeastConn, a.Balance)
+	require.Equal(t, &Timeouts{Connect: 2 * time.Second, Read: 3 * time.Minute}, a.Timeouts)
+	require.Equal(t, 30*time.Second, a.Keepalive.Idle)
+	require.Equal(t, DefaultKeepaliveInterval, a.Keepalive.Interval)
+	require.Equal(t, "/ready", a.HealthCheck.Path)
+	require.Equal(t, DefaultHealthInterval, a.HealthCheck.Interval)
+	require.Equal(t, []string{"10.0.0.1:1", "10.0.0.1:2"}, a.Servers[0].Addresses)
+
+	// Defaults
+	require.Equal(t, DefaultBalance, b.Balance)
+	require.Equal(t, &Timeouts{Connect: DefaultUpstreamConnectTimeout, Read: DefaultUpstreamReadTimeout}, b.Timeouts)
+	require.Equal(t, &Keepalive{Idle: DefaultKeepaliveIdle, Interval: DefaultKeepaliveInterval, Count: DefaultKeepaliveCount}, b.Keepalive)
+	require.Equal(t, DefaultHealthPath, b.HealthCheck.Path)
+}
+
+func TestParse_UpstreamRequired(t *testing.T) {
+	_, err := Parse([]byte("sites: [{name: a, listen-http: ':80'}]"))
+	require.ErrorContains(t, err, "site a: upstream is required")
+	_, err = Parse([]byte("sites: [{name: a, listen-http: ':80', upstream: {balance: hash}}]"))
+	require.ErrorContains(t, err, "site a: at least one server is required (upstream.servers)")
+}
+
+func TestParse_UpstreamMovedKeys(t *testing.T) {
+	// The keys that moved into the upstream block say where they are now
+	site := "sites: [{name: a, listen-http: ':80', %s" + testUp + "}]"
+	for config, moved := range map[string]string{
+		"upstream-connect-timeout: 5s\n" + fmt.Sprintf(site, ""):   "sites[].upstream.timeouts.connect",
+		"upstream-read-timeout: 3m\n" + fmt.Sprintf(site, ""):      "sites[].upstream.timeouts.read",
+		"upstream-keepalive: {idle: 1m}\n" + fmt.Sprintf(site, ""): "sites[].upstream.keepalive",
+		fmt.Sprintf(site, "balance: hash, "):                       "sites[].upstream.balance",
+		fmt.Sprintf(site, "health-check: {path: /x}, "):            "sites[].upstream.health-check",
+		"sites: [{name: a, listen-http: ':80', upstreams: []}]":    "sites[].upstream.servers",
+	} {
+		_, err := Parse([]byte(config))
+		require.ErrorContains(t, err, "moved to "+moved, config)
+	}
 }

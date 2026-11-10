@@ -230,17 +230,24 @@ func (u *testUpstream) addr() string {
 const (
 	testStreamsMatch = `method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")`
 	testHealthPath   = "/v1/ready" // ntfy's readiness, which the test upstreams answer
-	testNtfySite     = "health-check: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}, balance: hash, streams: {match: '" + testStreamsMatch + "'}"
+	testNtfySite     = "streams: {match: '" + testStreamsMatch + "'}"
+	testNtfyUpstream = "balance: hash, health-check: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}"
 )
 
-// siteKeys are the settings writeConfig moves from extra into the site
+// siteKeys are the settings writeConfig moves from extra into the site, upstreamKeys those it
+// moves into the site's upstream block
 var (
-	siteKeys = []string{"streams:", "cert-file:", "key-file:", "listen-https:"}
+	siteKeys     = []string{"streams:", "cert-file:", "key-file:", "listen-https:"}
+	upstreamKeys = []string{"timeouts:", "keepalive:"}
 )
 
 func isSiteSetting(line string) bool {
-	for _, key := range siteKeys {
-		if strings.HasPrefix(line, key) {
+	return hasAnyPrefix(line, siteKeys) || hasAnyPrefix(line, upstreamKeys)
+}
+
+func hasAnyPrefix(line string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(line, prefix) {
 			return true
 		}
 	}
@@ -256,16 +263,25 @@ func upstreamsYAML(upstreams ...*testUpstream) string {
 // (readiness path, hashing, its subscriptions as streams, unless the settings have streams)
 func siteYAML(settings []string, upstreams ...*testUpstream) string {
 	var b strings.Builder
-	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    health-check: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}\n    balance: hash\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n")
+	var upstream []string
 	streams := false
 	for _, setting := range settings {
+		if hasAnyPrefix(setting, upstreamKeys) {
+			upstream = append(upstream, setting)
+			continue
+		}
 		b.WriteString("    " + setting + "\n")
 		streams = streams || strings.HasPrefix(setting, "streams:")
 	}
 	if !streams {
 		b.WriteString("    streams: {match: '" + testStreamsMatch + "'}\n")
 	}
-	b.WriteString("    upstreams:\n")
+	b.WriteString("    upstream:\n      balance: hash\n      health-check: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}\n")
+	for _, setting := range upstream {
+		b.WriteString("      " + setting + "\n")
+	}
+	b.WriteString("      servers:\n")
 	for _, u := range upstreams {
 		fmt.Fprintf(&b, "      - name: %s\n        addresses: [%q]\n", u.name, u.addr())
 	}
@@ -440,7 +456,7 @@ func TestServer_ReloadRemovesAndAddsUpstreams(t *testing.T) {
 	})
 
 	// A broken config is rejected and changes nothing
-	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstreams: []}]"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstream: {servers: []}}]"), 0600))
 	_, err := s.Reload()
 	require.Error(t, err)
 	require.Len(t, s.balancer.Status().Upstreams, 2)
@@ -563,8 +579,8 @@ func TestServer_ReloadOpensAndClosesListeners(t *testing.T) {
 	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
 	dir := t.TempDir()
 	filename := filepath.Join(dir, "config.yml")
-	siteA := fmt.Sprintf("  - {name: a, listen-http: '127.0.0.1:0', "+testNtfySite+", upstreams: [{name: app1, addresses: [%q]}]}\n", a1.addr())
-	siteB := fmt.Sprintf("  - {name: b, listen-http: '127.0.0.2:0', "+testNtfySite+", upstreams: [{name: app1, addresses: [%q]}]}\n", b1.addr())
+	siteA := fmt.Sprintf("  - {name: a, listen-http: '127.0.0.1:0', "+testNtfySite+", upstream: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}\n", a1.addr())
+	siteB := fmt.Sprintf("  - {name: b, listen-http: '127.0.0.2:0', "+testNtfySite+", upstream: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}\n", b1.addr())
 	write := func(sites string) {
 		require.NoError(t, os.WriteFile(filename, []byte("listen-admin: '127.0.0.1:0'\nsites:\n"+sites), 0600))
 	}
@@ -625,12 +641,12 @@ func TestServer_ReloadOpensAndClosesListeners(t *testing.T) {
 
 	// An address cannot switch between HTTP and HTTPS without a restart
 	writeTestCert(t, filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), "a.com")
-	write(fmt.Sprintf("  - {name: a, listen-https: '127.0.0.1:0', cert-file: %s, key-file: %s, upstreams: [{name: app1, addresses: [%q]}]}\n", filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), a1.addr()))
+	write(fmt.Sprintf("  - {name: a, listen-https: '127.0.0.1:0', cert-file: %s, key-file: %s, upstream: {servers: [{name: app1, addresses: [%q]}]}}\n", filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), a1.addr()))
 	_, err = s.Reload()
 	require.ErrorContains(t, err, "restart")
 
 	// A new address that cannot be bound rejects the reload
-	write(siteA + "  - {name: c, listen-http: '192.0.2.1:80', upstreams: [{name: x, addresses: ['127.0.0.1:1']}]}\n")
+	write(siteA + "  - {name: c, listen-http: '192.0.2.1:80', upstream: {servers: [{name: x, addresses: ['127.0.0.1:1']}]}}\n")
 	_, err = s.Reload()
 	require.Error(t, err)
 	require.Len(t, s.config.Load().Sites, 1)
@@ -760,7 +776,7 @@ func TestServer_ReloadAddsSiteFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 include: [sites.d/*.yml]
-sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}]
+sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}]
 `, a1.addr())), 0600))
 	s := startTestServer(t, filename)
 	getHost := func(host string) {
@@ -776,7 +792,7 @@ sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: [{nam
 	getHost("b.com")
 	require.Equal(t, int64(1), a1.hits.Load())
 
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], "+testNtfySite+", upstreams: [{name: app1, addresses: [%q]}]}]\n", b1.addr())), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], "+testNtfySite+", upstream: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}]\n", b1.addr())), 0600))
 	requireReload(t, s)
 	getHost("b.com")
 	require.Equal(t, int64(1), b1.hits.Load())

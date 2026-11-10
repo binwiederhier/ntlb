@@ -10,7 +10,7 @@ import (
 
 // sortFor sorts a site's healthy upstreams (in config order) by the site's balance, best first
 func (b *Balancer) sortFor(site *config.Site, key []byte, healthy []*Upstream) {
-	switch site.Balance {
+	switch site.Upstream.Balance {
 	case config.BalanceHash:
 		byName := make(map[string]*Upstream, len(healthy))
 		names := make([]string, len(healthy))

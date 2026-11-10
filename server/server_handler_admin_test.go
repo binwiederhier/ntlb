@@ -101,8 +101,8 @@ func TestAdmin_DrainUpstreamAmbiguous(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}
-  - {name: b, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: b, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
 `, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
 	code, body := adminDo(t, s, http.MethodPost, "/v1/upstreams/app1/drain", "")

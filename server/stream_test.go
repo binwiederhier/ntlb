@@ -166,7 +166,7 @@ func TestStream_ForwardsErrorStatus(t *testing.T) {
 
 func TestStream_UpstreamReadTimeout(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 300ms", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 300ms}", app1)
 	resp, err := http.Get("http://" + s.HTTPAddr() + "/silent/json")
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -342,10 +342,10 @@ func TestStream_UpstreamDiesMidStream(t *testing.T) {
 }
 
 func TestStream_SlowClientIsCut(t *testing.T) {
-	// A client that stops reading is cut once a write blocks for upstream-read-timeout, instead
+	// A client that stops reading is cut once a write blocks for upstream.timeouts.read, instead
 	// of holding the stream (and the upstream) forever
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 500ms", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 500ms}", app1)
 	chunk := strings.Repeat("y", 64*1024)
 	app1.on("/flood/json", func(w http.ResponseWriter, r *http.Request) {
 		for r.Context().Err() == nil {
@@ -453,7 +453,7 @@ func TestStream_OneGoroutinePerHTTP1Stream(t *testing.T) {
 func TestStream_NoGoroutineLeak(t *testing.T) {
 	// Streams that end in every possible way leave no goroutine behind
 	app1 := newTestUpstream(t, "app1")
-	s := newTLSTestServer(t, "upstream-read-timeout: 300ms", app1)
+	s := newTLSTestServer(t, "timeouts: {read: 300ms}", app1)
 	h2 := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
@@ -513,7 +513,7 @@ func newTLSTestServer(t *testing.T, extra string, upstreams ...*testUpstream) *S
 func TestStream_DrainCutsNonReadingClient(t *testing.T) {
 	// A drain closes the client connection too, even if a write to it is blocked
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 1h", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 1h}", app1)
 	chunk := strings.Repeat("y", 64*1024)
 	app1.on("/flood/json", func(w http.ResponseWriter, r *http.Request) {
 		for r.Context().Err() == nil {

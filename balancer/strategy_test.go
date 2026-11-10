@@ -102,7 +102,7 @@ func TestStrategy_TurnsOfRemovedSitesForgotten(t *testing.T) {
 	b.Pick("s", nil)
 	_, ok := b.turns.Load("s")
 	require.True(t, ok)
-	conf := mustParse(t, "sites: [{name: other, listen-http: ':0', balance: round-robin, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: ['"+app1.addr()+"']}]}]")
+	conf := mustParse(t, "sites: [{name: other, listen-http: ':0', upstream: {balance: round-robin, health-check: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: ['"+app1.addr()+"']}]}}]")
 	b.Update(conf)
 	_, ok = b.turns.Load("s")
 	require.False(t, ok)

@@ -19,19 +19,21 @@ func TestParse_Defaults(t *testing.T) {
 sites:
   - name: s
     listen-http: ":80"
-    upstreams:
+    upstream:
+      servers:
       - name: app1
         addresses: ["10.0.0.1:2586", "10.0.0.1:2587"]
 `))
 	require.NoError(t, err)
 	require.Equal(t, DefaultListenAdmin, c.ListenAdmin)
-	require.Equal(t, DefaultHealthPath, c.Sites[0].HealthCheck.Path)
-	require.Equal(t, DefaultHealthFails, c.Sites[0].HealthCheck.Fails)
-	require.Equal(t, DefaultUpstreamReadTimeout, c.UpstreamReadTimeout)
+	up := c.Sites[0].Upstream
+	require.Equal(t, DefaultHealthPath, up.HealthCheck.Path)
+	require.Equal(t, DefaultHealthFails, up.HealthCheck.Fails)
+	require.Equal(t, DefaultUpstreamReadTimeout, up.Timeouts.Read)
 	require.Equal(t, DefaultKeepaliveIdle, c.ClientKeepalive.Idle)
-	require.Equal(t, DefaultKeepaliveCount, c.UpstreamKeepalive.Count)
-	require.Len(t, c.Sites[0].Upstreams, 1)
-	require.Equal(t, []string{"10.0.0.1:2586", "10.0.0.1:2587"}, c.Sites[0].Upstreams[0].Addresses)
+	require.Equal(t, DefaultKeepaliveCount, up.Keepalive.Count)
+	require.Len(t, up.Servers, 1)
+	require.Equal(t, []string{"10.0.0.1:2586", "10.0.0.1:2587"}, up.Servers[0].Addresses)
 }
 
 func TestParse_Overrides(t *testing.T) {
@@ -41,15 +43,15 @@ client-keepalive:
   idle: 3m
   interval: 30s
   count: 5
-upstream-keepalive:
-  disable: true
 sites:
   - name: s
     listen-https: ":443"
     cert-file: /tmp/cert.pem
     key-file: /tmp/key.pem
-    health-check: {path: /v1/health, interval: 2s, timeout: 1s}
-    upstreams:
+    upstream:
+      keepalive: {disable: true}
+      health-check: {path: /v1/health, interval: 2s, timeout: 1s}
+      servers:
       - name: app1
         addresses: ["10.0.0.1:2586"]
 `))
@@ -57,9 +59,9 @@ sites:
 	require.Equal(t, 10*time.Minute, c.DrainDuration)
 	require.Equal(t, 3*time.Minute, c.ClientKeepalive.KeepAliveConfig().Idle)
 	require.Equal(t, 5, c.ClientKeepalive.KeepAliveConfig().Count)
-	require.False(t, c.UpstreamKeepalive.KeepAliveConfig().Enable)
-	require.Equal(t, "/v1/health", c.Sites[0].HealthCheck.Path)
-	require.Equal(t, 2*time.Second, c.Sites[0].HealthCheck.Interval)
+	require.False(t, c.Sites[0].Upstream.Keepalive.KeepAliveConfig().Enable)
+	require.Equal(t, "/v1/health", c.Sites[0].Upstream.HealthCheck.Path)
+	require.Equal(t, 2*time.Second, c.Sites[0].Upstream.HealthCheck.Interval)
 }
 
 func TestParse_Invalid(t *testing.T) {
@@ -70,12 +72,12 @@ func TestParse_Invalid(t *testing.T) {
 	}{
 		{
 			name:   "no listener",
-			config: "sites: [{name: s, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "sites: [{name: s, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "listen-http or listen-https",
 		},
 		{
 			name:   "https without cert",
-			config: "sites: [{name: s, listen-https: ':443', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "sites: [{name: s, listen-https: ':443', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "cert-file",
 		},
 		{
@@ -85,47 +87,47 @@ func TestParse_Invalid(t *testing.T) {
 		},
 		{
 			name:   "duplicate name",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}, {name: a, addresses: ['1.2.3.5:80']}]}]",
-			errMsg: "duplicate upstream name",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}, {name: a, addresses: ['1.2.3.5:80']}]}}]",
+			errMsg: "duplicate server name",
 		},
 		{
 			name:   "bad name",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: [{name: 'a b', addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "invalid upstream name",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: 'a b', addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "invalid server name",
 		},
 		{
 			name:   "no addresses",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: [{name: a}]}]",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a}]}}]",
 			errMsg: "no addresses",
 		},
 		{
 			name:   "bad address",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4']}]}]",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4']}]}}]",
 			errMsg: "invalid address",
 		},
 		{
 			name:   "timeout not below interval",
-			config: "sites: [{name: s, listen-http: ':80', health-check: {interval: 1s, timeout: 1s}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {health-check: {interval: 1s, timeout: 1s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "health-check.timeout",
 		},
 		{
 			name:   "bad streams expression",
-			config: "sites: [{name: s, listen-http: ':80', streams: {match: 'path =='}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "sites: [{name: s, listen-http: ':80', streams: {match: 'path =='}, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "streams.match",
 		},
 		{
 			name:   "ipv4 prefix too long",
-			config: "client-key: {ipv4-prefix-bits: 33}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "client-key: {ipv4-prefix-bits: 33}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "client-key.ipv4-prefix-bits",
 		},
 		{
 			name:   "ipv6 prefix negative",
-			config: "client-key: {ipv6-prefix-bits: -1}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "client-key: {ipv6-prefix-bits: -1}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "client-key.ipv6-prefix-bits",
 		},
 		{
 			name:   "negative drain",
-			config: "drain-duration: -1s\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "drain-duration: -1s\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "negative",
 		},
 		{
@@ -135,127 +137,127 @@ func TestParse_Invalid(t *testing.T) {
 		},
 		{
 			name:   "negative shutdown drain",
-			config: "shutdown-drain-duration: -1s\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "shutdown-drain-duration: -1s\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "drain durations must not be negative",
 		},
 		{
 			name:   "https without key",
-			config: "sites: [{name: s, listen-https: ':443', cert-file: c, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "sites: [{name: s, listen-https: ':443', cert-file: c, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "cert-file and key-file go together",
 		},
 		{
 			name:   "ipv4 prefix negative",
-			config: "client-key: {ipv4-prefix-bits: -1}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "client-key: {ipv4-prefix-bits: -1}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "client-key.ipv4-prefix-bits",
 		},
 		{
 			name:   "ipv6 prefix too long",
-			config: "client-key: {ipv6-prefix-bits: 129}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "client-key: {ipv6-prefix-bits: 129}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "client-key.ipv6-prefix-bits",
 		},
 		{
 			name:   "name too long",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: [{name: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "invalid upstream name",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "invalid server name",
 		},
 		{
 			name:   "empty address",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['']}]}]",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['']}]}}]",
 			errMsg: "invalid address",
 		},
 		{
 			name:   "empty upstreams list",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: []}]",
-			errMsg: "at least one upstream",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: []}}]",
+			errMsg: "at least one server",
 		},
 		{
 			name:   "null upstream",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: [null]}]",
-			errMsg: "upstreams[0] is empty",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: [null]}}]",
+			errMsg: "upstream.servers[0] is empty",
 		},
 		{
 			name:   "empty upstream list item",
-			config: "sites:\n  - name: s\n    listen-http: ':80'\n    upstreams:\n      - name: a\n        addresses: ['1.2.3.4:80']\n      -\n",
-			errMsg: "upstreams[1] is empty",
+			config: "sites:\n  - name: s\n    listen-http: ':80'\n    upstream:\n      servers:\n      - name: a\n        addresses: ['1.2.3.4:80']\n      -\n",
+			errMsg: "upstream.servers[1] is empty",
 		},
 		{
 			name:   "negative connect timeout",
-			config: "upstream-connect-timeout: -1s\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "upstream-connect-timeout must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {timeouts: {connect: -1s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.timeouts.connect must be positive",
 		},
 		{
 			name:   "negative read timeout",
-			config: "upstream-read-timeout: -1s\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "upstream-read-timeout must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {timeouts: {read: -1s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.timeouts.read must be positive",
 		},
 		{
 			name:   "negative health check interval and timeout",
-			config: "sites: [{name: s, listen-http: ':80', health-check: {interval: -1s, timeout: -2s}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "health-check.interval must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {health-check: {interval: -1s, timeout: -2s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.health-check.interval must be positive",
 		},
 		{
 			name:   "negative health check timeout",
-			config: "sites: [{name: s, listen-http: ':80', health-check: {timeout: -2s}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "health-check.timeout must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {health-check: {timeout: -2s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.health-check.timeout must be positive",
 		},
 		{
 			name:   "negative health check fails",
-			config: "sites: [{name: s, listen-http: ':80', health-check: {fails: -1}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "health-check.fails must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {health-check: {fails: -1}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.health-check.fails must be positive",
 		},
 		{
 			name:   "negative health check passes",
-			config: "sites: [{name: s, listen-http: ':80', health-check: {passes: -1}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "health-check.passes must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {health-check: {passes: -1}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.health-check.passes must be positive",
 		},
 		{
 			name:   "negative client keepalive idle",
-			config: "client-keepalive: {idle: -1s}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "client-keepalive: {idle: -1s}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "client-keepalive.idle must be positive",
 		},
 		{
 			name:   "negative client keepalive interval",
-			config: "client-keepalive: {interval: -1s}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "client-keepalive: {interval: -1s}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "client-keepalive.interval must be positive",
 		},
 		{
 			name:   "negative client keepalive count",
-			config: "client-keepalive: {count: -1}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "client-keepalive: {count: -1}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "client-keepalive.count must be positive",
 		},
 		{
 			name:   "negative upstream keepalive idle",
-			config: "upstream-keepalive: {idle: -1s}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "upstream-keepalive.idle must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {keepalive: {idle: -1s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.keepalive.idle must be positive",
 		},
 		{
 			name:   "negative upstream keepalive interval",
-			config: "upstream-keepalive: {interval: -1s}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "upstream-keepalive.interval must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {keepalive: {interval: -1s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.keepalive.interval must be positive",
 		},
 		{
 			name:   "negative upstream keepalive count",
-			config: "upstream-keepalive: {count: -1}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
-			errMsg: "upstream-keepalive.count must be positive",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {keepalive: {count: -1}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
+			errMsg: "upstream.keepalive.count must be positive",
 		},
 		{
 			name:   "unknown field",
-			config: "drain-duraton: 1m\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "drain-duraton: 1m\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "field drain-duraton not found",
 		},
 		{
 			name:   "unknown nested field",
-			config: "sites: [{name: s, listen-http: ':80', health-check: {intervall: 1s}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {health-check: {intervall: 1s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "field intervall not found",
 		},
 		{
 			name:   "unknown upstream field",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, address: ['1.2.3.4:80']}]}]",
+			config: "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, address: ['1.2.3.4:80']}]}}]",
 			errMsg: "field address not found",
 		},
 		{
 			name:   "bad duration",
-			config: "drain-duration: soon\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]",
+			config: "drain-duration: soon\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]",
 			errMsg: "invalid config",
 		},
 		{
@@ -280,7 +282,7 @@ func TestParse_Invalid(t *testing.T) {
 
 func TestParse_NoStreamsByDefault(t *testing.T) {
 	// Which requests are long-lived streams is up to the site; the ntfy site's are in packaging
-	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
 	for _, target := range []string{"/mytopic/json", "/t/sse", "/events"} {
 		require.False(t, isStream(c, "GET", target), target)
@@ -294,7 +296,7 @@ sites:
     listen-http: ":80"
     streams:
       match: method == "GET" && path matches "^/events(/.*)?$" && !flag("once")
-    upstreams: [{name: a, addresses: ['1.2.3.4:80']}]
+    upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}
 `))
 	require.NoError(t, err)
 	require.True(t, isStream(c, "GET", "/events/foo"))
@@ -303,7 +305,7 @@ sites:
 }
 
 func TestParse_StreamsOff(t *testing.T) {
-	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'false'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'false'}, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
 	require.False(t, isStream(c, "GET", "/mytopic/json"))
 }
@@ -313,28 +315,28 @@ func isStream(c *Config, method, target string) bool {
 }
 
 func TestParse_ClientKeyDefaultsAndOverrides(t *testing.T) {
-	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
 	require.Equal(t, DefaultClientKeyIPv4PrefixBits, c.ClientKey.IPv4PrefixBits)
 	require.Equal(t, DefaultClientKeyIPv6PrefixBits, c.ClientKey.IPv6PrefixBits)
-	c, err = Parse([]byte("client-key: {ipv4-prefix-bits: 24, ipv6-prefix-bits: 128}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	c, err = Parse([]byte("client-key: {ipv4-prefix-bits: 24, ipv6-prefix-bits: 128}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
 	require.Equal(t, 24, c.ClientKey.IPv4PrefixBits)
 	require.Equal(t, 128, c.ClientKey.IPv6PrefixBits)
 }
 
 func TestParse_PortRanges(t *testing.T) {
-	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['10.0.0.1:2586-2588', '[fd00::1]:9000-9001', 'node:80']}]}]"))
+	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['10.0.0.1:2586-2588', '[fd00::1]:9000-9001', 'node:80']}]}}]"))
 	require.NoError(t, err)
-	require.Equal(t, []string{"10.0.0.1:2586", "10.0.0.1:2587", "10.0.0.1:2588", "[fd00::1]:9000", "[fd00::1]:9001", "node:80"}, c.Sites[0].Upstreams[0].Addresses)
+	require.Equal(t, []string{"10.0.0.1:2586", "10.0.0.1:2587", "10.0.0.1:2588", "[fd00::1]:9000", "[fd00::1]:9001", "node:80"}, c.Sites[0].Upstream.Servers[0].Addresses)
 	for _, bad := range []string{"10.0.0.1:2588-2586", "10.0.0.1:1-x", "10.0.0.1:x-5", "10.0.0.1:0-5", "10.0.0.1:65535-65536", "10.0.0.1:1000-3000"} {
-		_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['" + bad + "']}]}]"))
+		_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['" + bad + "']}]}}]"))
 		require.ErrorContains(t, err, "invalid address", bad)
 	}
 }
 
 func TestParse_DuplicateAddress(t *testing.T) {
-	_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['10.0.0.1:2586-2587', '10.0.0.1:2587']}]}]"))
+	_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['10.0.0.1:2586-2587', '10.0.0.1:2587']}]}}]"))
 	require.ErrorContains(t, err, "duplicate address")
 }
 
@@ -343,7 +345,7 @@ func TestParse_AccessLogs(t *testing.T) {
 access-logs:
   - {file: /var/log/nginx/access.log, match: status < 400}
   - {file: /var/log/nginx/access_error.log}
-sites: [{name: s, listen-http: ":80", upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]
+sites: [{name: s, listen-http: ":80", upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]
 `))
 	require.NoError(t, err)
 	require.Len(t, c.AccessLogs, 2)
@@ -355,13 +357,13 @@ sites: [{name: s, listen-http: ":80", upstreams: [{name: a, addresses: ['1.2.3.4
 		"request-only name": "access-logs: [{file: /x, match: 'header(\"X\") == \"\"'}]",
 		"not boolean":       "access-logs: [{file: /x, match: status}]",
 	} {
-		_, err := Parse([]byte(logs + "\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+		_, err := Parse([]byte(logs + "\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 		require.ErrorContains(t, err, "access-logs", name)
 	}
 }
 
 func TestParse_Bans(t *testing.T) {
-	c, err := Parse([]byte("bans: {file: /var/log/ntlb/ban.log, threshold: 100}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	c, err := Parse([]byte("bans: {file: /var/log/ntlb/ban.log, threshold: 100}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
 	require.Equal(t, DefaultBansWindow, c.Bans.Window)
 	require.Equal(t, 100.0, c.Bans.Threshold)
@@ -371,14 +373,14 @@ func TestParse_Bans(t *testing.T) {
 		"negative threshold": "bans: {file: /x, threshold: -1}",
 		"negative window":    "bans: {file: /x, threshold: 1, window: -1m}",
 	} {
-		_, err := Parse([]byte(bans + "\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+		_, err := Parse([]byte(bans + "\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 		require.ErrorContains(t, err, "bans", name)
 	}
 }
 
 func TestRestartRequired(t *testing.T) {
 	site := func(listen string) string {
-		return "sites: [{name: s, " + listen + ", cert-file: c, key-file: k, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
+		return "sites: [{name: s, " + listen + ", cert-file: c, key-file: k, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]\n"
 	}
 	a, err := Parse([]byte(site("listen-http: ':80'")))
 	require.NoError(t, err)
@@ -396,11 +398,11 @@ func TestRestartRequired(t *testing.T) {
 
 func TestLoad(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"), 0600))
 	c, err := Load(filename)
 	require.NoError(t, err)
 	require.Equal(t, ListenAddrs{":80"}, c.Sites[0].ListenHTTP)
-	require.Equal(t, "a", c.Sites[0].Upstreams[0].Name)
+	require.Equal(t, "a", c.Sites[0].Upstream.Servers[0].Name)
 }
 
 func TestLoad_Missing(t *testing.T) {
@@ -430,13 +432,13 @@ func TestLoad_PackagingExample(t *testing.T) {
 	require.Equal(t, DefaultListenAdmin, c.ListenAdmin)
 	require.Equal(t, DefaultShutdownDrainDuration, c.ShutdownDrainDuration)
 	require.Len(t, c.Sites, 1)
-	require.Len(t, c.Sites[0].Upstreams, 3)
+	require.Len(t, c.Sites[0].Upstream.Servers, 3)
 
 	// The ntfy site: hashed, ntfy's readiness endpoint, its subscriptions as streams
 	ntfy := c.Sites[0]
-	require.Equal(t, BalanceHash, ntfy.Balance)
-	require.Equal(t, "/v1/ready", ntfy.HealthCheck.Path)
-	require.Equal(t, 3*time.Minute, c.UpstreamReadTimeout)
+	require.Equal(t, BalanceHash, ntfy.Upstream.Balance)
+	require.Equal(t, "/v1/ready", ntfy.Upstream.HealthCheck.Path)
+	require.Equal(t, 3*time.Minute, ntfy.Upstream.Timeouts.Read)
 	for _, target := range []string{"/mytopic/json", "/a,b_c-d/sse", "/t/raw", "/t/ws", "/t/json?since=10m"} {
 		require.True(t, isStream(c, "GET", target), target)
 	}
@@ -451,27 +453,28 @@ func TestLoad_PackagingExample(t *testing.T) {
 func TestParse_NullSections(t *testing.T) {
 	c, err := Parse([]byte(`
 client-keepalive: ~
-upstream-keepalive: null
 client-key: ~
-sites: [{name: s, listen-http: ":80", health-check: null, streams: null, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]
+sites: [{name: s, listen-http: ":80", streams: null, upstream: {timeouts: null, keepalive: null, health-check: null, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]
 `))
 	require.NoError(t, err)
 	require.Equal(t, DefaultKeepaliveIdle, c.ClientKeepalive.Idle)
-	require.Equal(t, DefaultKeepaliveCount, c.UpstreamKeepalive.Count)
-	require.Equal(t, DefaultHealthPath, c.Sites[0].HealthCheck.Path)
+	require.Equal(t, DefaultKeepaliveCount, c.Sites[0].Upstream.Keepalive.Count)
+	require.Equal(t, DefaultUpstreamReadTimeout, c.Sites[0].Upstream.Timeouts.Read)
+	require.Equal(t, DefaultHealthPath, c.Sites[0].Upstream.HealthCheck.Path)
 	require.Equal(t, DefaultStreamsMatch, c.Sites[0].Streams.Match)
 	require.NotNil(t, c.Sites[0].Streams.Program)
-	require.Equal(t, DefaultBalance, c.Sites[0].Balance)
+	require.Equal(t, DefaultBalance, c.Sites[0].Upstream.Balance)
 	require.Equal(t, DefaultClientKeyIPv6PrefixBits, c.ClientKey.IPv6PrefixBits)
 }
 
 func TestParse_AllDefaults(t *testing.T) {
-	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
-	require.Equal(t, DefaultUpstreamConnectTimeout, c.UpstreamConnectTimeout)
-	require.Equal(t, time.Minute, c.UpstreamReadTimeout) // nginx's proxy_read_timeout
-	require.Equal(t, BalanceRoundRobin, c.Sites[0].Balance)
-	require.Equal(t, "/", c.Sites[0].HealthCheck.Path)
+	up := c.Sites[0].Upstream
+	require.Equal(t, 5*time.Second, up.Timeouts.Connect)
+	require.Equal(t, time.Minute, up.Timeouts.Read) // nginx's proxy_read_timeout
+	require.Equal(t, BalanceRoundRobin, up.Balance)
+	require.Equal(t, "/", c.Sites[0].Upstream.HealthCheck.Path)
 	require.Equal(t, DefaultDrainDuration, c.DrainDuration)
 	require.Equal(t, DefaultShutdownDrainDuration, c.ShutdownDrainDuration)
 	require.Equal(t, &HealthCheck{
@@ -480,14 +483,14 @@ func TestParse_AllDefaults(t *testing.T) {
 		Timeout:  DefaultHealthTimeout,
 		Fails:    DefaultHealthFails,
 		Passes:   DefaultHealthPasses,
-	}, c.Sites[0].HealthCheck)
+	}, c.Sites[0].Upstream.HealthCheck)
 	defaultKeepalive := &Keepalive{
 		Idle:     DefaultKeepaliveIdle,
 		Interval: DefaultKeepaliveInterval,
 		Count:    DefaultKeepaliveCount,
 	}
 	require.Equal(t, defaultKeepalive, c.ClientKeepalive)
-	require.Equal(t, defaultKeepalive, c.UpstreamKeepalive)
+	require.Equal(t, defaultKeepalive, c.Sites[0].Upstream.Keepalive)
 	require.Empty(t, c.AccessLogs)
 	require.Empty(t, c.ListenMetrics)
 	require.Nil(t, c.Bans)
@@ -497,7 +500,7 @@ func TestParse_AllDefaults(t *testing.T) {
 // Keepalives
 
 func TestKeepAliveConfig(t *testing.T) {
-	c, err := Parse([]byte("upstream-keepalive: {interval: 20s}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {keepalive: {interval: 20s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
 	require.Equal(t, net.KeepAliveConfig{
 		Enable:   true,
@@ -510,20 +513,20 @@ func TestKeepAliveConfig(t *testing.T) {
 		Idle:     DefaultKeepaliveIdle,
 		Interval: 20 * time.Second,
 		Count:    DefaultKeepaliveCount,
-	}, c.UpstreamKeepalive.KeepAliveConfig())
+	}, c.Sites[0].Upstream.Keepalive.KeepAliveConfig())
 }
 
 func TestKeepAliveConfig_Disable(t *testing.T) {
-	c, err := Parse([]byte("client-keepalive: {disable: true, idle: 2m}\nsites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	c, err := Parse([]byte("client-keepalive: {disable: true, idle: 2m}\nsites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
 	require.Equal(t, net.KeepAliveConfig{Enable: false}, c.ClientKeepalive.KeepAliveConfig())
-	require.True(t, c.UpstreamKeepalive.KeepAliveConfig().Enable)
+	require.True(t, c.Sites[0].Upstream.Keepalive.KeepAliveConfig().Enable)
 }
 
 // Settings a reload cannot apply
 
 func TestRestartRequired_Each(t *testing.T) {
-	base := "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
+	base := "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]\n"
 	a, err := Parse([]byte(base))
 	require.NoError(t, err)
 	tests := []struct {
@@ -558,7 +561,7 @@ func TestRestartRequired_Each(t *testing.T) {
 		},
 		{
 			name:   "reloadable settings only",
-			config: "upstream-keepalive: {disable: true}\nclient-key: {ipv4-prefix-bits: 24}\nupstream-read-timeout: 1m\naccess-logs: [{file: /tmp/x}]\n",
+			config: "client-key: {ipv4-prefix-bits: 24}\naccess-logs: [{file: /tmp/x}]\n",
 		},
 		{
 			name:   "same keepalive written out",

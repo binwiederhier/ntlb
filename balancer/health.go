@@ -59,7 +59,7 @@ func (b *Balancer) shortestHealthInterval() time.Duration {
 	defer b.mu.RUnlock()
 	shortest := time.Duration(maxDuration)
 	for _, site := range b.config.Sites {
-		shortest = min(shortest, site.HealthCheck.Interval)
+		shortest = min(shortest, site.Upstream.HealthCheck.Interval)
 	}
 	return shortest
 }

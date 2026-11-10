@@ -37,23 +37,14 @@ access-logs:
     match: status < 400
   - file: /var/log/ntlb/access_error.log
 
-# TCP keepalive probes towards the clients and towards the upstreams. Dead peers are detected
-# after idle + interval*count. Set "disable: true" to turn them off.
+# TCP keepalive probes towards the clients. Dead peers are detected after idle + interval*count.
+# Set "disable: true" to turn them off. (Towards the servers: a site's upstream.keepalive.)
 client-keepalive:
   idle: 1m
   interval: 15s
   count: 4
-upstream-keepalive:
-  idle: 1m
-  interval: 15s
-  count: 4
 
-upstream-connect-timeout: 5s # A node that does not accept within this is down, try the next
-upstream-read-timeout: 3m    # Default 60s. Cut a stream after this long without a byte (ntfy sends keepalives every 45s);
-                             # also bounds a client that stops reading; a stalled upload is cut after
-                             # 60s (like nginx's client_body_timeout), or this if shorter
-
-drain-duration: 5m           # Default for "drain" commands and for upstreams removed from this file
+drain-duration: 5m           # Default for "drain" commands and for servers removed from this file
 shutdown-drain-duration: 2m  # SIGTERM: not ready right away, streams closed over this long
 
 # What identifies a client for sticky routing, rate limits and bans: its IP, shortened to a prefix
@@ -127,8 +118,8 @@ rules:
 include: [sites.d/*.yml]
 
 # Sites: each has the addresses it listens on (listen-http, listen-https: one or a list; sites can
-# share them), the hosts it serves there, its certificate, health checks, streams, upstreams,
-# rules and optionally its own access logs. On each listener, a request goes to the site whose
+# share them), the hosts it serves there, its certificate, streams, its upstream (the servers and
+# how to reach them), rules and optionally its own access logs. On each listener, a request goes to the site whose
 # hosts match its Host header (exact names, then the longest "*.name" wildcard), else to the one
 # site there without hosts; with none, it gets a 404. HTTPS serves HTTP/2 and HTTP/1.1, with the
 # certificate of the listener's site that matches the client's SNI (else its first site's).

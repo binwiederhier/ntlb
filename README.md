@@ -8,7 +8,7 @@ service never makes tens of thousands of clients reconnect at the same second.
 
 It is built for ntfy, but nothing in it is ntfy-only, and its defaults are those of a generic load
 balancer (nginx's where it has one): which requests are long-lived streams (`streams`; default:
-none), the balancing (`balance`; default: round-robin), the health check path (default `/`) and
+none), the balancing (`upstream.balance`; default: round-robin), the health check path (default `/`) and
 the client key (`client-key`) are configurable, so it fits any HTTP backend, also with long-lived
 streams (SSE, long polling, WebSockets). The ntfy site in
 [packaging/sites.d/ntfy.yml](packaging/sites.d/ntfy.yml) sets ntfy's. One instance can serve several **sites** (virtual hosts), each with its own
@@ -66,8 +66,8 @@ sequenceDiagram
 
 ## Features
 
-- **Balancing per site** (`balance`): `round-robin` (default, like nginx), `least-conn` (fewest
-  open requests on this load balancer), `random-two` (the less busy of two random upstreams, like
+- **Balancing per site** (`upstream.balance`): `round-robin` (default, like nginx), `least-conn` (fewest
+  open requests on this load balancer), `random-two` (the less busy of two random servers, like
   nginx's `random two least_conn`, which stays balanced with several load balancers), or `hash`:
   sticky, consistent routing by rendezvous (highest random weight) hashing of the client IP (IPv4,
   or the IPv6 /64, like ntfy's `visitor-prefix-bits-ipv6`) over the upstream *names*. With `hash`,
@@ -84,7 +84,7 @@ sequenceDiagram
   to the next upstream for any request (it never reached a node); other errors only for idempotent
   methods; a 503 (a draining ntfy node) only if no body byte was sent. A body that was partly sent
   is never resent. A node's other addresses are tried before the next node.
-- **Long-lived streams**: flushes every write, an upstream idle timeout (`upstream-read-timeout`,
+- **Long-lived streams**: flushes every write, an upstream idle timeout (`upstream.timeouts.read`,
   60s like nginx's `proxy_read_timeout`; 3m in the ntfy config) that also bounds clients that stop reading, a 60s bound on a stalled upload
   (nginx's `client_body_timeout`), WebSocket
   upgrades, HTTP/2 on the TLS listener. Subscriptions (`streams.match`) take a
@@ -221,7 +221,7 @@ cannot be hijacked.
   web app's credentials), which nginx logged verbatim.
 - HTTP/2 `:path` and `:authority` are checked like Go's HTTP/1 parser does it (400 otherwise).
 - An upgraded connection (WebSocket) ends when the upstream ends it or after
-  `upstream-read-timeout` without traffic either way; drains close it without a close frame (the
+  `upstream.timeouts.read` without traffic either way; drains close it without a close frame (the
   ntfy clients do not reconnect after one).
 - TLS 1.2 offers only AEAD suites (Mozilla intermediate, as in the nginx config). `action: static`
   serves only clean paths (no `.`, `..` or empty segments, no dotfiles) and no symlink out of root.
@@ -256,7 +256,7 @@ documents everything**:
 - [Config files](docs/configuration.md#config-files)
 - [Global settings](docs/configuration.md#global-settings)
 - [Sites](docs/configuration.md#sites)
-- [Upstreams and balancing](docs/configuration.md#upstreams-and-balancing)
+- [Upstream: servers, balancing and timeouts](docs/configuration.md#upstream-servers-balancing-and-timeouts)
 - [Health checks, and what happens when one goes bad](docs/configuration.md#health-checks-and-what-happens-when-one-goes-bad)
 - [Streams](docs/configuration.md#streams)
 - [Access logs](docs/configuration.md#access-logs)
@@ -275,7 +275,6 @@ The ntfy.sh setup, shortened ([packaging/config.yml](packaging/config.yml) and
 listen-admin: "127.0.0.1:2590"        # admin API: no auth, keep it local
 listen-metrics: "10.108.0.2:25031"    # only /metrics, for Prometheus
 listen-profiler: "127.0.0.1:6060"     # only /debug/pprof/
-upstream-read-timeout: 3m             # default 60s; ntfy sends a keepalive every 45s
 access-logs:                          # for sites without their own, and requests no site serves
   - {file: /var/log/nginx/access.log, match: status < 400}
   - {file: /var/log/nginx/access_error.log}
@@ -303,15 +302,17 @@ sites:
     cert-file: /etc/ntlb/certs/fullchain.pem   # copied by the certbot hook
     key-file: /etc/ntlb/certs/privkey.pem
     # access-logs: [{file: /var/log/ntlb/ntfy.log}]   # instead of the global ones
-    balance: hash                     # default round-robin; also least-conn, random-two
-    health-check: {path: /v1/ready}   # default /
     streams:                          # default none; ntfy's subscriptions, minus polls
       match: method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")
-    upstreams:
-      - name: app1                    # the NAME is what clients hash to: keep names equal on all LBs
-        addresses: ["10.108.0.11:25010-25017"]
-      - name: app3
-        addresses: ["10.108.0.13:25010-25017"]
+    upstream:                         # the servers, and how requests reach them
+      balance: hash                   # default round-robin; also least-conn, random-two
+      timeouts: {read: 3m}            # default 60s; ntfy sends a keepalive every 45s
+      health-check: {path: /v1/ready} # default /
+      servers:
+        - name: app1                  # the NAME is what clients hash to: keep names equal on all LBs
+          addresses: ["10.108.0.11:25010-25017"]
+        - name: app3
+          addresses: ["10.108.0.13:25010-25017"]
     rules:                            # after the global rules; logged as "ntfy/<name>"
       - name: https-redirect
         match: scheme == "http" && method == "GET" && path == "/"

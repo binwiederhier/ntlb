@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	rulesTestBase = "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
+	rulesTestBase = "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]\n"
 	rulesTestBans = "bans: {file: /tmp/ban.log, threshold: 10}\n"
 )
 

@@ -83,7 +83,7 @@ func New(conf *config.Config) *Balancer {
 		},
 	}
 	for _, site := range conf.Sites {
-		for _, uc := range site.Upstreams {
+		for _, uc := range site.Upstream.Servers {
 			u := newUpstream(site, uc)
 			b.upstreams[u.id] = u
 			b.order = append(b.order, u.id)
@@ -237,7 +237,7 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	addedIDs := make(map[string]bool)
 	changedByID := make(map[string]*Upstream)
 	for _, site := range conf.Sites {
-		for _, uc := range site.Upstreams {
+		for _, uc := range site.Upstream.Servers {
 			id := upstreamID(site.Name, uc.Name)
 			if u, ok := b.upstreams[id]; !ok {
 				added = append(added, newUpstream(site, uc))
@@ -256,7 +256,7 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, site := range conf.Sites {
-		for _, uc := range site.Upstreams {
+		for _, uc := range site.Upstream.Servers {
 			id := upstreamID(site.Name, uc.Name)
 			u, ok := b.upstreams[id]
 			if !ok && !addedIDs[id] {
@@ -270,7 +270,7 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	wanted := make(map[string]bool)
 	order := make([]string, 0, conf.UpstreamCount())
 	for _, site := range conf.Sites {
-		for _, uc := range site.Upstreams {
+		for _, uc := range site.Upstream.Servers {
 			id := upstreamID(site.Name, uc.Name)
 			wanted[id] = true
 			order = append(order, id)
@@ -310,7 +310,7 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 
 // updateNoLock applies an upstream's reloaded config: back from removal, the site's health check, and
 // the addresses and first-probe health of probed, if they changed. The caller must hold Balancer.mu.
-func (u *Upstream) updateNoLock(site *config.Site, uc *config.Upstream, probed *Upstream) {
+func (u *Upstream) updateNoLock(site *config.Site, uc *config.Server, probed *Upstream) {
 	if u.removed {
 		slog.Info("Upstream re-added", "site", u.site, "upstream", u.name)
 		u.removed = false
@@ -324,7 +324,7 @@ func (u *Upstream) updateNoLock(site *config.Site, uc *config.Upstream, probed *
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.health = site.HealthCheck
+	u.health = site.Upstream.HealthCheck
 }
 
 // DrainUpstream takes an upstream ("site/name", or the name if only one site has it) out of
@@ -443,12 +443,12 @@ func (u *Upstream) AddressCount() int {
 	return len(u.addresses)
 }
 
-func newUpstream(site *config.Site, uc *config.Upstream) *Upstream {
+func newUpstream(site *config.Site, uc *config.Server) *Upstream {
 	return &Upstream{
 		id:          upstreamID(site.Name, uc.Name),
 		site:        site.Name,
 		name:        uc.Name,
-		health:      site.HealthCheck,
+		health:      site.Upstream.HealthCheck,
 		addresses:   slices.Clone(uc.Addresses),
 		addrStreams: make(map[string]int),
 		addrPending: make(map[string]int),

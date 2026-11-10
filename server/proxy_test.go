@@ -115,7 +115,7 @@ func TestProxy_RetryOn503(t *testing.T) {
 
 func TestProxy_UpstreamReadTimeout(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 300ms", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 300ms}", app1)
 	resp, err := http.Get("http://" + s.HTTPAddr() + "/silent")
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -202,11 +202,11 @@ func TestProxy_DrainingRefusesNewSubscriptions(t *testing.T) {
 }
 
 func TestIsSubscription(t *testing.T) {
-	ntfy, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: '" + testStreamsMatch + "'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	ntfy, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: '" + testStreamsMatch + "'}, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
-	custom, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	custom, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
-	disabled, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'false'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	disabled, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'false'}, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
 	require.NoError(t, err)
 	tests := []struct {
 		name    string
@@ -322,9 +322,9 @@ func TestProxy_NoUpstreamInRotation(t *testing.T) {
 }
 
 func TestProxy_ResponseHeaderTimeout(t *testing.T) {
-	// An upstream that does not answer within upstream-read-timeout is a 504, on both paths
+	// An upstream that does not answer within upstream.timeouts.read is a 504, on both paths
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 200ms", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 200ms}", app1)
 	slow := func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
@@ -339,6 +339,35 @@ func TestProxy_ResponseHeaderTimeout(t *testing.T) {
 	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/slow/json")
 	require.Equal(t, http.StatusGatewayTimeout, status)
 	require.Less(t, time.Since(start), 3*time.Second)
+}
+
+func TestProxy_ReadTimeoutPerSite(t *testing.T) {
+	// Each site has its own upstream timeouts: a slow answer is a 504 on the site with a short read
+	// timeout, and fine on the one with the default
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/slow", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		w.Write([]byte("slow"))
+	})
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
+listen-admin: '127.0.0.1:0'
+sites:
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], upstream: {timeouts: {read: 200ms}, `+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+`, app1.addr(), app1.addr())), 0600))
+	s := startTestServer(t, filename)
+	getHost := func(host string) int {
+		req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+"/slow", nil)
+		require.NoError(t, err)
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	require.Equal(t, http.StatusGatewayTimeout, getHost("a.com"))
+	require.Equal(t, http.StatusOK, getHost("b.com"))
 }
 
 func TestProxy_ConnectionResetRetriedOnlyIfIdempotent(t *testing.T) {
@@ -589,7 +618,7 @@ func TestProxy_ReloadUnderLoad(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 20; i++ {
-		writeConfig(t, filename, fmt.Sprintf("upstream-read-timeout: %dm\nstreams: {match: %q}", i+1, streamsToggle(i)), app1, app2)
+		writeConfig(t, filename, fmt.Sprintf("timeouts: {read: %dm}\nstreams: {match: %q}", i+1, streamsToggle(i)), app1, app2)
 		requireReload(t, s)
 	}
 	close(stop)
@@ -616,9 +645,9 @@ func clientForRank(t *testing.T, s *Server, names ...string) *http.Client {
 
 func TestProxy_StalledUploadTimesOut(t *testing.T) {
 	// A client that sends headers and part of a body, then nothing, is cut after
-	// upstream-read-timeout instead of holding a handler and an upstream connection forever
+	// upstream.timeouts.read instead of holding a handler and an upstream connection forever
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 300ms", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 300ms}", app1)
 	conn, err := net.Dial("tcp", s.HTTPAddr())
 	require.NoError(t, err)
 	defer conn.Close()
@@ -635,13 +664,13 @@ func TestProxy_StalledUploadTimesOut(t *testing.T) {
 
 func TestProxy_StalledUploadClientBodyTimeout(t *testing.T) {
 	// Like nginx's client_body_timeout (60s): a body that stalls is cut after that, even with a
-	// longer upstream-read-timeout
+	// longer upstream.timeouts.read
 	defer func(old time.Duration) {
 		clientBodyTimeout = old
 	}(clientBodyTimeout)
 	clientBodyTimeout = 300 * time.Millisecond
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 1h", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 1h}", app1)
 	conn, err := net.Dial("tcp", s.HTTPAddr())
 	require.NoError(t, err)
 	defer conn.Close()
@@ -658,7 +687,7 @@ func TestProxy_StalledUploadClientBodyTimeout(t *testing.T) {
 
 func TestProxy_DrainInterruptsStalledUpload(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 1h", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 1h}", app1)
 	conn, err := net.Dial("tcp", s.HTTPAddr())
 	require.NoError(t, err)
 	defer conn.Close()
@@ -674,9 +703,9 @@ func TestProxy_DrainInterruptsStalledUpload(t *testing.T) {
 
 func TestProxy_NonReadingDownloadIsCut(t *testing.T) {
 	// On the reverse proxy path too, a client that stops reading is cut once a write blocks for
-	// upstream-read-timeout, and a drain cuts it right away
+	// upstream.timeouts.read, and a drain cuts it right away
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "upstream-read-timeout: 500ms", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 500ms}", app1)
 	chunk := strings.Repeat("y", 64*1024)
 	app1.on("/flood", func(w http.ResponseWriter, r *http.Request) {
 		for r.Context().Err() == nil {
@@ -725,7 +754,7 @@ func TestProxy_DeadAddressTriesSameUpstreamFirst(t *testing.T) {
 	deadAddr := dead.Addr().String()
 	dead.Close()
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	conf := fmt.Sprintf("listen-admin: '127.0.0.1:0'\nsites:\n  - {name: s, listen-http: '127.0.0.1:0', "+testNtfySite+", upstreams: [{name: app1, addresses: [%q, %q]}, {name: app2, addresses: [%q]}]}\n", app1.addr(), deadAddr, app2.addr())
+	conf := fmt.Sprintf("listen-admin: '127.0.0.1:0'\nsites:\n  - {name: s, listen-http: '127.0.0.1:0', "+testNtfySite+", upstream: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q, %q]}, {name: app2, addresses: [%q]}]}}\n", app1.addr(), deadAddr, app2.addr())
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	s := startTestServer(t, filename) // Health checks probe the first address, which is alive
 	client := clientForRank(t, s, "app1", "app2")
@@ -831,17 +860,13 @@ sites:
   - name: a
     listen-http: '127.0.0.1:0'
     hosts: [a.com]
-    health-check: {path: /v1/ready, interval: 1h, timeout: 1s}
-    balance: hash
     streams: {match: '`+testStreamsMatch+`'}
-    upstreams: [{name: app1, addresses: [%q]}]
+    upstream: {balance: hash, health-check: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}
   - name: b
     listen-http: '127.0.0.1:0'
     hosts: ["*.b.com"]
-    health-check: {path: /v1/ready, interval: 1h, timeout: 1s}
-    balance: hash
     streams: {match: '`+testStreamsMatch+`'}
-    upstreams: [{name: app1, addresses: [%q]}]
+    upstream: {balance: hash, health-check: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}
     rules: [{name: blocked, match: 'query == "blocked"', action: block, status: 451}]
 `, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
@@ -890,8 +915,8 @@ func TestProxy_SiteStreams(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}
-  - {name: b, listen-http: '127.0.0.1:0', streams: {match: 'false'}, health-check: {path: /v1/ready, interval: 1h, timeout: 1s}, balance: hash, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: b, listen-http: '127.0.0.1:0', streams: {match: 'false'}, upstream: {balance: hash, health-check: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}
 `, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
 	for _, host := range []string{"a.com", "other.com"} {
@@ -915,8 +940,8 @@ func TestProxy_SitesPerListener(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}
-  - {name: b, listen-http: '127.0.0.2:0', hosts: [b.com], `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: b, listen-http: '127.0.0.2:0', hosts: [b.com], `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
 `, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
 	getHost := func(addr, host string) int {
@@ -991,7 +1016,7 @@ func echoServer(t *testing.T, e *echoUpstream) *Server {
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
-sites: [{name: s, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: [{name: e, addresses: [%q]}]}]
+sites: [{name: s, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: e, addresses: [%q]}]}}]
 `, strings.TrimPrefix(e.srv.URL, "http://"))), 0600))
 	return startTestServer(t, filename)
 }
@@ -1304,7 +1329,7 @@ func TestProxy_WebSocketIdleTimeout(t *testing.T) {
 	app1.on("/silent/ws", upgradeThen(func(conn net.Conn) {
 		io.Copy(io.Discard, conn) // Reads until the load balancer closes it
 	}))
-	s, _ := newTestServer(t, "upstream-read-timeout: 300ms", app1)
+	s, _ := newTestServer(t, "timeouts: {read: 300ms}", app1)
 	conn, r := openUpgrade(t, s.HTTPAddr(), "/silent/ws")
 	start := time.Now()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -1349,4 +1374,26 @@ func TestProxy_WebSocketSmallCopyBuffers(t *testing.T) {
 	line, err := r.ReadString('\n')
 	require.NoError(t, err)
 	require.Equal(t, message, line)
+}
+
+func TestProxy_UpdateKeepsUnchangedConns(t *testing.T) {
+	// A reload keeps a site's upstream connections unless its timeouts or keepalive changed, so a
+	// reload (e.g. a certificate renewal) does not drop the idle connections to the servers
+	parse := func(read string) *config.Config {
+		conf, err := config.Parse([]byte("sites:\n  - {name: a, listen-http: ':0', upstream: {timeouts: {read: " + read + "}, servers: [{name: x, addresses: ['127.0.0.1:1']}]}}\n  - {name: b, listen-http: ':1', upstream: {servers: [{name: x, addresses: ['127.0.0.1:1']}]}}"))
+		require.NoError(t, err)
+		return conf
+	}
+	conf := parse("1m")
+	p := newProxy(balancer.New(conf), newMetrics(nil), conf)
+	before := *p.conns.Load()
+	p.update(parse("1m"))
+	same := *p.conns.Load()
+	require.Same(t, before["a"], same["a"])
+	require.Same(t, before["b"], same["b"])
+	p.update(parse("2m"))
+	changed := *p.conns.Load()
+	require.NotSame(t, before["a"], changed["a"])
+	require.Equal(t, 2*time.Minute, changed["a"].transport.ResponseHeaderTimeout)
+	require.Same(t, before["b"], changed["b"])
 }

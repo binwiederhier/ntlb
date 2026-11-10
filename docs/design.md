@@ -17,7 +17,7 @@ docs are in the [README](../README.md).
 
 `Balancer.Pick(site, key)` collects the site's upstreams that are in the config and not draining,
 in config order, keeps the healthy ones (all of them if none is: fail open, like lbagent), and
-orders them by the site's `balance`; the first is the choice, the rest are the retries. Only if
+orders them by the site's `upstream.balance`; the first is the choice, the rest are the retries. Only if
 every upstream is draining does it return nothing (-> 503).
 
 - `round-robin`: rotated by a per-site turn (`Balancer.turns`, a `sync.Map` of `atomic.Uint64`),
@@ -101,6 +101,11 @@ every second (2% of the CPU, 5% of the allocations in the 2026-11-10 lab), with 
 
 ## Proxy (`server/proxy.go`)
 
+Each site has its own `http.Transport` and dialer (`upstreamConns`), built from its
+`upstream.timeouts` and `upstream.keepalive`; `ServeHTTP` takes the site's at the start of a
+request (`proxyRequest.conns`), so a reload mid-request does not mix two sites' settings. A reload
+keeps a site's conns, and so its idle connections, unless those settings changed.
+
 `httputil.ReverseProxy` with `proxy` as its `RoundTripper`. `RoundTrip` walks `Pick`'s candidates:
 
 - request body wrapped in `trackingBody` (records whether any byte was read, ignores `Close`: the
@@ -115,11 +120,11 @@ every second (2% of the CPU, 5% of the allocations in the 2026-11-10 lab), with 
   node" is detectable and retried for any method
 - other errors are retried for GET/HEAD/OPTIONS with an untouched body; a 503 with an untouched
   body is retried unless it is the last candidate (then it is passed on)
-- the response body is wrapped in `idleTimeoutBody` (cancel after `upstream-read-timeout` without
+- the response body is wrapped in `idleTimeoutBody` (cancel after `upstream.timeouts.read` without
   a byte); not for 101 responses, whose body must stay an `io.ReadWriteCloser`
 
 `FlushInterval: -1` flushes every write. Reads from the client body and writes to the client have
-an inactivity deadline of `upstream-read-timeout` (`clientBody`, `deadlineWriter`), and canceling
+an inactivity deadline of `upstream.timeouts.read` (`clientBody`, `deadlineWriter`), and canceling
 the request (drain) sets both deadlines to now, so a stalled upload or a client that stops reading
 neither holds a handler forever nor survives a drain. `BufferPool` hands out 4 KiB copy buffers: a stream holds
 its buffer while it waits, and the default 32 KiB was half of a stream's heap. The transport is
@@ -163,7 +168,7 @@ not WebSocket upgrades) bypass
 - **Waiting**: `waitReadable` parks in the netpoller via `RawConn.Read` holding no buffer, then a
   pooled 4 KiB buffer is used for one read+write. It peeks a byte with `MSG_PEEK|MSG_DONTWAIT`
   first: the netpoller is edge-triggered, so it may only wait after seeing `EAGAIN`, or it could
-  sleep on data that is already buffered. The read deadline (`upstream-read-timeout`) bounds the
+  sleep on data that is already buffered. The read deadline (`upstream.timeouts.read`) bounds the
   wait. A socket error seen by the peek (e.g. a reset) is returned there, since the peek consumes
   it and the next read would only see EOF; that made a reset look like a clean end until the tests
   caught it.
@@ -174,7 +179,7 @@ not WebSocket upgrades) bypass
   latest ntfy's 45s keepalive message, or by TCP keepalive. `ServeHTTP` uses
   `context.WithoutCancel` for these, since the server cancels the request context when the handler
   returns. Canceling the request (drain) closes the client connection too, so a blocked write
-  cannot outlive a drain; every write has a deadline of `upstream-read-timeout`.
+  cannot outlive a drain; every write has a deadline of `upstream.timeouts.read`.
 - **HTTP/2 clients**: cannot be hijacked; written through the `ResponseWriter`. A client going away
   resets the stream, which cancels the context and closes the upstream connection. An upstream
   that breaks mid-stream (reset, read timeout, drain) resets the HTTP/2 stream
