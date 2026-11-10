@@ -56,13 +56,14 @@ type Upstream struct {
 	addrDown    map[string]bool      // Failed its last health check: skipped while others are up
 	health      *config.HealthCheck  // The site's health check
 	lastProbe   time.Time            // Start of the last probe round that included the upstream
+	probing     bool                 // A probe round is running
 	healthy     bool
 	probed      bool
 	fails       int
 	passes      int
 	lastCheck   time.Time
 	lastError   string
-	mu          sync.Mutex // Protects addresses, generation, addrStreams, addrPending, addrFails, addrRetry, addrDown, health, lastProbe, healthy, probed, fails, passes, lastCheck, lastError
+	mu          sync.Mutex // Protects addresses, generation, addrStreams, addrPending, addrFails, addrRetry, addrDown, health, lastProbe, probing, healthy, probed, fails, passes, lastCheck, lastError
 }
 
 // New creates a balancer for the upstreams in the config. Call Start to run the health checks.
@@ -189,19 +190,14 @@ func (b *Balancer) Close(s *Session) {
 	}
 }
 
-// RecordFailure counts a request that an upstream failed (connection error, timeout)
-func (b *Balancer) RecordFailure(u *Upstream) {
-	u.failures.Add(1)
-}
-
-// RecordAddressFailure counts a request that failed on an upstream address (see RecordFailure),
-// and skips that address for new attempts for a while, longer with each failure in a row, since
+// RecordAddressFailure counts a request that an upstream failed on an address (connection error,
+// timeout), and skips that address for new attempts for a while, longer with each failure in a row, since
 // the health check only probes an upstream's first address
 func (b *Balancer) RecordAddressFailure(u *Upstream, addr string) {
-	b.RecordFailure(u)
+	u.failures.Add(1)
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.recordAddressFailure(addr, time.Now())
+	u.recordAddressFailureNoLock(addr, time.Now())
 }
 
 // Update applies a reloaded config. New upstreams are probed before they take traffic. Upstreams
@@ -263,7 +259,7 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 			wanted[id] = true
 			order = append(order, id)
 			if u, ok := b.upstreams[id]; ok {
-				u.update(site, uc, changedByID[id])
+				u.updateNoLock(site, uc, changedByID[id])
 			}
 		}
 	}
@@ -290,9 +286,9 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	return true
 }
 
-// update applies an upstream's reloaded config: back from removal, the site's health check, and
+// updateNoLock applies an upstream's reloaded config: back from removal, the site's health check, and
 // the addresses and first-probe health of probed, if they changed. The caller must hold Balancer.mu.
-func (u *Upstream) update(site *config.Site, uc *config.Upstream, probed *Upstream) {
+func (u *Upstream) updateNoLock(site *config.Site, uc *config.Upstream, probed *Upstream) {
 	if u.removed {
 		slog.Info("Upstream re-added", "site", u.site, "upstream", u.name)
 		u.removed = false
@@ -302,7 +298,7 @@ func (u *Upstream) update(site *config.Site, uc *config.Upstream, probed *Upstre
 	}
 	if probed != nil && !u.hasAddresses(uc.Addresses) {
 		slog.Info("Upstream addresses changed", "site", u.site, "upstream", u.name, "addresses", uc.Addresses, "healthy", probed.isHealthy())
-		u.replaceAddresses(probed)
+		u.replaceAddressesNoLock(probed)
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -408,7 +404,7 @@ func (b *Balancer) Status() *Status {
 		status.DrainDeadline = &b.drain.deadline
 	}
 	for _, name := range b.order {
-		status.Upstreams = append(status.Upstreams, b.upstreams[name].status(now))
+		status.Upstreams = append(status.Upstreams, b.upstreams[name].statusNoLock(now))
 	}
 	return status
 }
@@ -418,24 +414,11 @@ func (u *Upstream) Name() string {
 	return u.name
 }
 
-// Site returns the name of the upstream's site
-func (u *Upstream) Site() string {
-	return u.site
-}
-
 // AddressCount returns how many addresses the upstream has
 func (u *Upstream) AddressCount() int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return len(u.addresses)
-}
-
-// NextAddress returns the upstream address with the fewest streams and reserved attempts,
-// skipping addresses that failed recently (unless all did). It reserves nothing, see Reserve.
-func (u *Upstream) NextAddress() string {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.nextAddressNoLock(time.Now())
 }
 
 func newUpstream(site *config.Site, uc *config.Upstream) *Upstream {
@@ -463,18 +446,6 @@ func (b *Balancer) healthyNoLock() bool {
 	return false
 }
 
-// upstream returns an upstream by ID or unique name (see findNoLock), removed or not, or nil
-func (b *Balancer) upstream(name string) *Upstream {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	for _, u := range b.upstreams {
-		if u.id == name || u.name == name {
-			return u
-		}
-	}
-	return nil
-}
-
 // findNoLock returns the upstream in the config with an ID, or with a name that only one site
 // has. The caller must hold b.mu.
 func (b *Balancer) findNoLock(name string) (*Upstream, error) {
@@ -500,8 +471,8 @@ func upstreamID(site, name string) string {
 	return site + "/" + name
 }
 
-// status returns the upstream's snapshot. The caller must hold Balancer.mu.
-func (u *Upstream) status(now time.Time) *UpstreamStatus {
+// statusNoLock returns the upstream's snapshot. The caller must hold Balancer.mu.
+func (u *Upstream) statusNoLock(now time.Time) *UpstreamStatus {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	s := &UpstreamStatus{
@@ -551,9 +522,9 @@ func (u *Upstream) nextAddressNoLock(now time.Time) string {
 	return best
 }
 
-// recordAddressFailure backs off an address: addressBackoffMin after the first failure in a
+// recordAddressFailureNoLock backs off an address: addressBackoffMin after the first failure in a
 // row, doubling up to addressBackoffMax. The caller must hold u.mu.
-func (u *Upstream) recordAddressFailure(addr string, now time.Time) {
+func (u *Upstream) recordAddressFailureNoLock(addr string, now time.Time) {
 	u.addrFails[addr]++
 	backoff := addressBackoffMax
 	if shift := u.addrFails[addr] - 1; shift < 16 {
@@ -574,10 +545,10 @@ func (u *Upstream) hasAddresses(addresses []string) bool {
 	return slices.Equal(u.addresses, addresses)
 }
 
-// replaceAddresses takes the addresses and the first-probe health of probed, a copy of u with
+// replaceAddressesNoLock takes the addresses and the first-probe health of probed, a copy of u with
 // the new addresses. The hysteresis starts over, and probes of the old addresses still in flight
 // are dropped. Streams and their per-address counts stay. The caller must hold Balancer.mu.
-func (u *Upstream) replaceAddresses(probed *Upstream) {
+func (u *Upstream) replaceAddressesNoLock(probed *Upstream) {
 	probed.mu.Lock()
 	defer probed.mu.Unlock()
 	u.mu.Lock()

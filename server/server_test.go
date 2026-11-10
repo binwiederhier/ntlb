@@ -100,7 +100,9 @@ func (u *testUpstream) on(path string, h http.HandlerFunc) {
 }
 
 // testStreamEnd sent to testUpstream.push ends the subscription from the upstream side
-const testStreamEnd = "!end"
+const (
+	testStreamEnd = "!end"
+)
 
 func newTestUpstream(t *testing.T, name string) *testUpstream {
 	u := &testUpstream{
@@ -224,7 +226,9 @@ func (u *testUpstream) addr() string {
 }
 
 // siteKeys are the settings writeConfig moves from extra into the site
-var siteKeys = []string{"streams:", "cert-file:", "key-file:", "listen-https:"}
+var (
+	siteKeys = []string{"streams:", "cert-file:", "key-file:", "listen-https:"}
+)
 
 func isSiteSetting(line string) bool {
 	for _, key := range siteKeys {
@@ -580,6 +584,24 @@ func TestServer_ReloadOpensAndClosesListeners(t *testing.T) {
 	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
 	require.Equal(t, http.StatusOK, status)
 
+	// A kept-alive connection to the removed address is sent away: 503, then closed
+	write(siteA + siteB)
+	requireReload(t, s)
+	addrB = s.ListenerAddr("127.0.0.2:0")
+	keepalive := &http.Client{Transport: &http.Transport{}}
+	resp, err := keepalive.Get("http://" + addrB + "/name")
+	require.NoError(t, err)
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	write(siteA)
+	requireReload(t, s)
+	resp, err = keepalive.Get("http://" + addrB + "/name")
+	require.NoError(t, err)
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.True(t, resp.Close)
+
 	// An address cannot switch between HTTP and HTTPS without a restart
 	writeTestCert(t, filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), "a.com")
 	write(fmt.Sprintf("  - {name: a, listen-https: '127.0.0.1:0', cert-file: %s, key-file: %s, upstreams: [{name: app1, addresses: [%q]}]}\n", filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), a1.addr()))
@@ -740,4 +762,53 @@ sites: [{name: a, listen-http: '127.0.0.1:0', health-check: {interval: 1h, timeo
 	getHost("a.com")
 	require.Equal(t, int64(2), a1.hits.Load())
 	require.Len(t, s.balancer.Status().Upstreams, 2)
+}
+
+func TestServer_NoReloadWhileShuttingDown(t *testing.T) {
+	// A reload during the shutdown drain is refused: it would open listeners and log files that
+	// the shutdown already passed over
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "", app1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Shutdown(500 * time.Millisecond)
+	}()
+	waitFor(t, func() bool {
+		return s.balancer.Draining()
+	})
+	_, err := s.Reload()
+	require.ErrorContains(t, err, "shutting down")
+	<-done
+}
+
+func TestServer_InvalidHostOrTargetRejected(t *testing.T) {
+	// HTTP/1.1 rejects these in Go's parser; HTTP/2 lets them through as :authority and :path, so
+	// the load balancer checks them itself: 400, like nginx, logged and struck as such
+	for name, mutate := range map[string]func(r *http.Request){
+		"space in path":     func(r *http.Request) { r.RequestURI = "/x?a b" },
+		"not origin-form":   func(r *http.Request) { r.RequestURI = "x/y" },
+		"slash in host":     func(r *http.Request) { r.Host = "evil.com/.ntfy.sh" },
+		"space in host":     func(r *http.Request) { r.Host = "a b" },
+		"quote in host":     func(r *http.Request) { r.Host = `a"b` },
+		"bad port":          func(r *http.Request) { r.Host = "ntfy.sh:x" },
+		"control character": func(r *http.Request) { r.RequestURI = "/x\x7f" },
+	} {
+		r := httptest.NewRequest("GET", "/x", nil)
+		mutate(r)
+		require.False(t, validRequest(r), name)
+	}
+	for name, mutate := range map[string]func(r *http.Request){
+		"plain":            func(r *http.Request) {},
+		"host with port":   func(r *http.Request) { r.Host = "ntfy.sh:443" },
+		"ipv6 host":        func(r *http.Request) { r.Host = "[2001:db8::1]:443" },
+		"no host":          func(r *http.Request) { r.Host = "" },
+		"escaped and utf8": func(r *http.Request) { r.RequestURI = "/a%20b/json?x=\xc3\xa4&y=%22" },
+		"raw quote":        func(r *http.Request) { r.RequestURI = `/mytopic?message="hi"` }, // Scripts do; ntfy takes it
+		"asterisk options": func(r *http.Request) { r.Method, r.RequestURI = "OPTIONS", "*" },
+	} {
+		r := httptest.NewRequest("GET", "/x", nil)
+		mutate(r)
+		require.True(t, validRequest(r), name)
+	}
 }

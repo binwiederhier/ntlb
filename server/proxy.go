@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -33,9 +34,24 @@ const (
 	statusClientClosedRequest = 499 // nginx's status for a request that ended before a response
 )
 
+// Headers the proxy sets or reads
+const (
+	headerConnection    = "Connection"
+	headerXForwardedFor = "X-Forwarded-For"
+	connectionClose     = "close"
+)
+
+var (
+	// clientBodyTimeout bounds how long a request body may stall, like nginx's client_body_timeout
+	// (a variable for the tests); upstream-read-timeout bounds it too, if shorter
+	clientBodyTimeout = 60 * time.Second
+)
+
 var (
 	errNoUpstream          = errors.New("no upstream available")
 	errUpstreamReadTimeout = errors.New("upstream read timeout")
+	errUpstreamClosed      = errors.New("upstream closed the connection")
+	errBodyRetired         = errors.New("request body handed to another attempt")
 )
 
 // proxyContextKey is the request context key for the *proxyRequest
@@ -76,226 +92,6 @@ type proxyRequest struct {
 	finishOnce     sync.Once
 }
 
-// onFinish registers f to run when the request ends; finishers run in reverse order
-func (pr *proxyRequest) onFinish(f func()) {
-	pr.finishers = append(pr.finishers, f)
-}
-
-// finish runs the finishers, once
-func (pr *proxyRequest) finish() {
-	pr.finishOnce.Do(func() {
-		for i := len(pr.finishers) - 1; i >= 0; i-- {
-			pr.finishers[i]()
-		}
-	})
-}
-
-// finishUnlessDetached is deferred by the handlers: it finishes the request unless the stream
-// path detached it
-func (pr *proxyRequest) finishUnlessDetached() {
-	if !pr.detached {
-		pr.finish()
-	}
-}
-
-// finalStatus is the status as the client saw it: 101 for an upgrade (written on the hijacked
-// connection), and 499 like nginx if the request ended before any response
-func (pr *proxyRequest) finalStatus() int {
-	switch {
-	case pr.status != 0:
-		return pr.status
-	case pr.upstreamStatus == http.StatusSwitchingProtocols:
-		return http.StatusSwitchingProtocols
-	default:
-		return statusClientClosedRequest
-	}
-}
-
-// dialError marks a failure to connect: the request never reached that upstream
-type dialError struct {
-	err error
-}
-
-func (e *dialError) Error() string {
-	return e.err.Error()
-}
-
-func (e *dialError) Unwrap() error {
-	return e.err
-}
-
-// trackingBody wraps a request body so a failed attempt neither closes it (the transport closes
-// a request body on error) nor hides whether any of it was sent, which decides a retry
-type trackingBody struct {
-	rc      io.ReadCloser
-	touched atomic.Bool
-}
-
-func (b *trackingBody) Read(p []byte) (int, error) {
-	b.touched.Store(true)
-	return b.rc.Read(p)
-}
-
-var errBodyRetired = errors.New("request body handed to another attempt")
-
-// attemptBody is one attempt's handle on the shared request body. The transport may still read
-// a failed attempt's body after RoundTrip returned (its writer runs on), so before the next
-// attempt the old handle is retired: it reads nothing more, and retire tells whether it read
-// anything, which rules out the retry.
-type attemptBody struct {
-	body    *trackingBody
-	retired bool
-	read    bool
-	mu      sync.Mutex // Protects retired and read
-}
-
-func (b *trackingBody) attempt() *attemptBody {
-	return &attemptBody{body: b}
-}
-
-func (a *attemptBody) Read(p []byte) (int, error) {
-	a.mu.Lock()
-	if a.retired {
-		a.mu.Unlock()
-		return 0, errBodyRetired
-	}
-	a.read = true
-	a.mu.Unlock()
-	return a.body.Read(p)
-}
-
-func (a *attemptBody) Close() error {
-	return nil // The server closes the real body when the handler returns
-}
-
-// retire stops the handle from reading and returns true if the body was touched by any attempt
-func (a *attemptBody) retire() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.retired = true
-	return a.read || a.body.touched.Load()
-}
-
-// clientBody is the request body as read from the client: each read must make progress within
-// the timeout (a client that stalls an upload is cut, like nginx's client_body_timeout), and a
-// drain interrupts a blocked read (see ServeHTTP)
-type clientBody struct {
-	rc      io.ReadCloser
-	conn    *clientConn
-	timeout time.Duration
-}
-
-func (b *clientBody) Read(p []byte) (int, error) {
-	b.conn.setReadDeadline(time.Now().Add(b.timeout))
-	return b.rc.Read(p)
-}
-
-func (b *clientBody) Close() error {
-	return b.rc.Close()
-}
-
-// clientConn sets deadlines on the client connection for as long as the handler runs. A drain
-// cancels requests from other goroutines, and the transport may read a request body after the
-// handler returned; after that, the ResponseWriter must not be touched (an HTTP/2 one panics),
-// so the handler's end and every deadline change are serialized.
-type clientConn struct {
-	ctrl *http.ResponseController
-	done bool
-	mu   sync.Mutex // Protects done, and serializes ctrl calls with the handler's end
-}
-
-func (c *clientConn) setReadDeadline(t time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.done {
-		c.ctrl.SetReadDeadline(t)
-	}
-}
-
-func (c *clientConn) setWriteDeadline(t time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.done {
-		c.ctrl.SetWriteDeadline(t)
-	}
-}
-
-// interrupt makes blocked reads and writes on the client connection fail right away
-func (c *clientConn) interrupt() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.done {
-		c.ctrl.SetReadDeadline(time.Now())
-		c.ctrl.SetWriteDeadline(time.Now())
-	}
-}
-
-// end is called when the handler returns; from then on, nothing touches the connection
-func (c *clientConn) end() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.done = true
-}
-
-// deadlineWriter bounds every write to the client by the timeout, so a client that stops reading
-// is cut instead of holding the handler (and the upstream) forever. Unwrap keeps Flush and
-// Hijack reachable for the reverse proxy.
-type deadlineWriter struct {
-	http.ResponseWriter
-	conn    *clientConn
-	timeout time.Duration
-}
-
-func (w *deadlineWriter) Write(p []byte) (int, error) {
-	w.conn.setWriteDeadline(time.Now().Add(w.timeout))
-	return w.ResponseWriter.Write(p)
-}
-
-func (w *deadlineWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
-
-func (b *trackingBody) Close() error {
-	return nil // The server closes the real body when the handler returns
-}
-
-// idleTimeoutBody cancels the request when the upstream sends nothing for the timeout, like
-// nginx's proxy_read_timeout
-type idleTimeoutBody struct {
-	rc      io.ReadCloser
-	timer   *time.Timer
-	timeout time.Duration
-}
-
-func (b *idleTimeoutBody) Read(p []byte) (int, error) {
-	n, err := b.rc.Read(p)
-	if n > 0 {
-		b.timer.Reset(b.timeout)
-	}
-	return n, err
-}
-
-func (b *idleTimeoutBody) Close() error {
-	b.timer.Stop()
-	return b.rc.Close()
-}
-
-// bufferPool hands out the reverse proxy's copy buffers
-type bufferPool struct {
-	pool sync.Pool
-}
-
-func (p *bufferPool) Get() []byte {
-	if b, ok := p.pool.Get().(*[]byte); ok {
-		return *b
-	}
-	return make([]byte, copyBufferSize)
-}
-
-func (p *bufferPool) Put(b []byte) {
-	p.pool.Put(&b)
-}
-
 func newProxy(b *balancer.Balancer, m *metrics, conf *config.Config) *proxy {
 	p := &proxy{
 		balancer: b,
@@ -320,15 +116,8 @@ func newProxy(b *balancer.Balancer, m *metrics, conf *config.Config) *proxy {
 // requests are still served until the drain is done, so no message is lost.
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conf := p.config.Load()
-	pr := proxyRequestFromContext(r.Context()) // Set (and finished) by Server.observe, if any
-	if pr == nil {
-		pr = &proxyRequest{}
-		defer pr.finishUnlessDetached()
-	}
+	pr := proxyRequestFromContext(r.Context()) // Set (and finished) by Server.observe
 	env := pr.env
-	if env == nil {
-		env = match.NewEnv(r)
-	}
 	site := pr.siteConf
 	pr.siteConf = nil // A detached stream must not keep an old config alive
 	if site == nil {
@@ -350,7 +139,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.balancer.Draining() && (p.balancer.Drained() || subscription) {
 		p.metrics.refused.Inc()
-		w.Header().Set("Connection", "close")
+		w.Header().Set(headerConnection, connectionClose)
 		http.Error(w, "load balancer is draining", http.StatusServiceUnavailable)
 		return
 	}
@@ -387,53 +176,26 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bound reads from and writes to the client, and let a drain interrupt both
-	cc := &clientConn{ctrl: http.NewResponseController(w)}
+	cc := &clientConn{
+		ctrl: http.NewResponseController(w),
+	}
 	defer cc.end() // Before the finishers cancel ctx: a finished request must not touch the connection
 	if r.Body != nil && r.Body != http.NoBody {
-		r.Body = &clientBody{rc: r.Body, conn: cc, timeout: conf.UpstreamReadTimeout}
+		r.Body = &clientBody{
+			rc:      r.Body,
+			conn:    cc,
+			timeout: min(clientBodyTimeout, conf.UpstreamReadTimeout),
+		}
 	}
 	stop := context.AfterFunc(ctx, func() {
 		safely("request cancel", cc.interrupt)
 	})
 	defer stop()
-	p.reverse.ServeHTTP(&deadlineWriter{ResponseWriter: w, conn: cc, timeout: conf.UpstreamReadTimeout}, r)
-}
-
-// track registers an open request, so Shutdown can end what the drain did not
-func (p *proxy) track(pr *proxyRequest) {
-	p.mu.Lock()
-	p.active[pr] = struct{}{}
-	p.mu.Unlock()
-	pr.onFinish(func() {
-		p.mu.Lock()
-		delete(p.active, pr)
-		p.mu.Unlock()
-	})
-}
-
-// closeAll cancels every open request (as drained) and waits until all of them finished, their
-// finishers (access log line, metrics) included, or ctx is done
-func (p *proxy) closeAll(ctx context.Context) error {
-	p.mu.Lock()
-	for pr := range p.active {
-		pr.cancel(balancer.ErrDrained)
-	}
-	p.mu.Unlock()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		p.mu.Lock()
-		n := len(p.active)
-		p.mu.Unlock()
-		if n == 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("%d request(s) still open: %w", n, ctx.Err())
-		case <-ticker.C:
-		}
-	}
+	p.reverse.ServeHTTP(&deadlineWriter{
+		ResponseWriter: w,
+		conn:           cc,
+		timeout:        conf.UpstreamReadTimeout,
+	}, r)
 }
 
 // RoundTrip sends the request to the best upstream for the client, and to the next ones as
@@ -490,20 +252,65 @@ func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			p.balancer.Attach(pr.session, u, addr)
 			pr.upstream, pr.upstreamStatus = u.Name(), resp.StatusCode
-			if resp.StatusCode != http.StatusSwitchingProtocols { // An upgraded body must stay an io.ReadWriteCloser
-				timeout := pr.readTimeout
+			timeout := pr.readTimeout
+			timer := time.AfterFunc(timeout, func() {
+				pr.cancel(errUpstreamReadTimeout)
+			})
+			if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
+				resp.Body = &upgradedBody{ // Must stay an io.ReadWriteCloser
+					rwc:     rwc,
+					timer:   timer,
+					timeout: timeout,
+					cancel:  pr.cancel,
+				}
+			} else {
 				resp.Body = &idleTimeoutBody{
 					rc:      resp.Body,
+					timer:   timer,
 					timeout: timeout,
-					timer: time.AfterFunc(timeout, func() {
-						pr.cancel(errUpstreamReadTimeout)
-					}),
 				}
 			}
 			return resp, nil
 		}
 	}
 	return nil, errNoUpstream // Not reached: the last candidate always returns
+}
+
+// track registers an open request, so Shutdown can end what the drain did not
+func (p *proxy) track(pr *proxyRequest) {
+	p.mu.Lock()
+	p.active[pr] = struct{}{}
+	p.mu.Unlock()
+	pr.onFinish(func() {
+		p.mu.Lock()
+		delete(p.active, pr)
+		p.mu.Unlock()
+	})
+}
+
+// closeAll cancels every open request (as drained) and waits until all of them finished, their
+// finishers (access log line, metrics) included, or ctx is done
+func (p *proxy) closeAll(ctx context.Context) error {
+	p.mu.Lock()
+	for pr := range p.active {
+		pr.cancel(balancer.ErrDrained)
+	}
+	p.mu.Unlock()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		p.mu.Lock()
+		n := len(p.active)
+		p.mu.Unlock()
+		if n == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%d request(s) still open: %w", n, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // update applies a (re)loaded config to the upstream connections. Open connections keep running
@@ -540,27 +347,14 @@ func (p *proxy) update(conf *config.Config) {
 // rewrite keeps the client's Host and appends the client IP to X-Forwarded-For
 func (p *proxy) rewrite(r *httputil.ProxyRequest) {
 	r.Out.Host = r.In.Host
-	r.Out.Header.Set("X-Forwarded-For", forwardedFor(r.In))
-}
-
-// forwardedFor returns the request's X-Forwarded-For with the client IP appended, like nginx's
-// $proxy_add_x_forwarded_for, which is what ntfy's behind-proxy expects
-func forwardedFor(r *http.Request) string {
-	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		clientIP = r.RemoteAddr
-	}
-	if prior := r.Header.Values("X-Forwarded-For"); len(prior) > 0 {
-		return strings.Join(prior, ", ") + ", " + clientIP
-	}
-	return clientIP
+	r.Out.Header.Set(headerXForwardedFor, forwardedFor(r.In))
 }
 
 func (p *proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	cause := context.Cause(r.Context())
 	switch {
 	case errors.Is(cause, balancer.ErrDrained):
-		w.Header().Set("Connection", "close")
+		w.Header().Set(headerConnection, connectionClose)
 		w.WriteHeader(http.StatusServiceUnavailable)
 	case errors.Is(cause, errUpstreamReadTimeout), isTimeout(err):
 		w.WriteHeader(http.StatusGatewayTimeout)
@@ -571,6 +365,285 @@ func (p *proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	default:
 		w.WriteHeader(http.StatusBadGateway)
 	}
+}
+
+// onFinish registers f to run when the request ends; finishers run in reverse order
+func (pr *proxyRequest) onFinish(f func()) {
+	pr.finishers = append(pr.finishers, f)
+}
+
+// finish runs the finishers, once
+func (pr *proxyRequest) finish() {
+	pr.finishOnce.Do(func() {
+		for i := len(pr.finishers) - 1; i >= 0; i-- {
+			pr.finishers[i]()
+		}
+	})
+}
+
+// finalStatus is the status as the client saw it: 101 for an upgrade (written on the hijacked
+// connection), and 499 like nginx if the request ended before any response
+func (pr *proxyRequest) finalStatus() int {
+	switch {
+	case pr.status != 0:
+		return pr.status
+	case pr.upstreamStatus == http.StatusSwitchingProtocols:
+		return http.StatusSwitchingProtocols
+	default:
+		return statusClientClosedRequest
+	}
+}
+
+// dialError marks a failure to connect: the request never reached that upstream
+type dialError struct {
+	err error
+}
+
+func (e *dialError) Error() string {
+	return e.err.Error()
+}
+
+func (e *dialError) Unwrap() error {
+	return e.err
+}
+
+// trackingBody wraps a request body so a failed attempt neither closes it (the transport closes
+// a request body on error) nor hides whether any of it was sent, which decides a retry
+type trackingBody struct {
+	rc      io.ReadCloser
+	touched atomic.Bool
+}
+
+func (b *trackingBody) Read(p []byte) (int, error) {
+	b.touched.Store(true)
+	return b.rc.Read(p)
+}
+
+func (b *trackingBody) attempt() *attemptBody {
+	return &attemptBody{body: b}
+}
+
+func (b *trackingBody) Close() error {
+	return nil // The server closes the real body when the handler returns
+}
+
+// attemptBody is one attempt's handle on the shared request body. The transport may still read
+// a failed attempt's body after RoundTrip returned (its writer runs on), so before the next
+// attempt the old handle is retired: it reads nothing more, and retire tells whether it read
+// anything, which rules out the retry.
+type attemptBody struct {
+	body    *trackingBody
+	retired bool
+	read    bool
+	mu      sync.Mutex // Protects retired and read
+}
+
+func (a *attemptBody) Read(p []byte) (int, error) {
+	a.mu.Lock()
+	if a.retired {
+		a.mu.Unlock()
+		return 0, errBodyRetired
+	}
+	a.read = true
+	a.mu.Unlock()
+	return a.body.Read(p)
+}
+
+func (a *attemptBody) Close() error {
+	return nil // The server closes the real body when the handler returns
+}
+
+// retire stops the handle from reading and returns true if the body was touched by any attempt
+func (a *attemptBody) retire() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.retired = true
+	return a.read || a.body.touched.Load()
+}
+
+// clientBody is the request body as read from the client: each read must make progress within
+// the timeout (a client that stalls an upload is cut, like nginx's client_body_timeout), and a
+// drain interrupts a blocked read (see ServeHTTP)
+type clientBody struct {
+	rc      io.ReadCloser
+	conn    *clientConn
+	timeout time.Duration
+}
+
+func (b *clientBody) Read(p []byte) (int, error) {
+	b.conn.setReadDeadline(time.Now().Add(b.timeout))
+	return b.rc.Read(p)
+}
+
+func (b *clientBody) Close() error {
+	return b.rc.Close()
+}
+
+// clientConn sets deadlines on the client connection for as long as the handler runs. A drain
+// cancels requests from other goroutines, and the transport may read a request body after the
+// handler returned; after that, the ResponseWriter must not be touched (an HTTP/2 one panics),
+// so the handler's end and every deadline change are serialized.
+type clientConn struct {
+	ctrl     *http.ResponseController
+	upgraded net.Conn // The hijacked connection of an upgrade (WebSocket), once there is one
+	done     bool
+	mu       sync.Mutex // Protects upgraded and done, and serializes ctrl calls with the handler's end
+}
+
+func (c *clientConn) setReadDeadline(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done {
+		c.ctrl.SetReadDeadline(t)
+	}
+}
+
+func (c *clientConn) setWriteDeadline(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done {
+		c.ctrl.SetWriteDeadline(t)
+	}
+}
+
+// interrupt makes blocked reads and writes on the client connection fail right away, also on a
+// hijacked one, which the upgrade copy then closes
+func (c *clientConn) interrupt() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.upgraded != nil {
+		c.upgraded.SetDeadline(time.Now())
+	} else if !c.done {
+		c.ctrl.SetReadDeadline(time.Now())
+		c.ctrl.SetWriteDeadline(time.Now())
+	}
+}
+
+// hijack takes over the connection for an upgrade, keeping it so interrupt can reach it
+func (c *clientConn) hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	conn, brw, err := c.ctrl.Hijack()
+	if err == nil {
+		c.upgraded = conn
+	}
+	return conn, brw, err
+}
+
+// end is called when the handler returns; from then on, nothing touches the connection
+func (c *clientConn) end() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.done = true
+}
+
+// deadlineWriter bounds every write to the client by the timeout, so a client that stops reading
+// is cut instead of holding the handler (and the upstream) forever. Unwrap keeps Flush and
+// Hijack reachable for the reverse proxy.
+type deadlineWriter struct {
+	http.ResponseWriter
+	conn    *clientConn
+	timeout time.Duration
+}
+
+func (w *deadlineWriter) Write(p []byte) (int, error) {
+	w.conn.setWriteDeadline(time.Now().Add(w.timeout))
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *deadlineWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// Hijack is what the reverse proxy takes over an upgraded connection with
+func (w *deadlineWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.conn.hijack()
+}
+
+// idleTimeoutBody cancels the request when the upstream sends nothing for the timeout, like
+// nginx's proxy_read_timeout
+type idleTimeoutBody struct {
+	rc      io.ReadCloser
+	timer   *time.Timer
+	timeout time.Duration
+}
+
+func (b *idleTimeoutBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if n > 0 {
+		b.timer.Reset(b.timeout)
+	}
+	return n, err
+}
+
+func (b *idleTimeoutBody) Close() error {
+	b.timer.Stop()
+	return b.rc.Close()
+}
+
+// upgradedBody is the upstream side of an upgraded connection (WebSocket). Traffic either way
+// keeps it open; nothing for the timeout cancels the request, like nginx's proxy_read_timeout. When
+// the upstream ends it (ntfy closes a WebSocket that stopped answering pings), the request is
+// canceled too: the upgrade copy would otherwise wait for the client side, which a vanished
+// client never ends.
+type upgradedBody struct {
+	rwc     io.ReadWriteCloser
+	timer   *time.Timer
+	timeout time.Duration
+	cancel  context.CancelCauseFunc
+}
+
+func (b *upgradedBody) Read(p []byte) (int, error) {
+	n, err := b.rwc.Read(p)
+	if n > 0 {
+		b.timer.Reset(b.timeout)
+	}
+	if err != nil {
+		b.cancel(errUpstreamClosed)
+	}
+	return n, err
+}
+
+func (b *upgradedBody) Write(p []byte) (int, error) {
+	n, err := b.rwc.Write(p)
+	if n > 0 {
+		b.timer.Reset(b.timeout)
+	}
+	return n, err
+}
+
+func (b *upgradedBody) Close() error {
+	b.timer.Stop()
+	return b.rwc.Close()
+}
+
+// bufferPool hands out the reverse proxy's copy buffers
+type bufferPool struct {
+	pool sync.Pool
+}
+
+func (p *bufferPool) Get() []byte {
+	if b, ok := p.pool.Get().(*[]byte); ok {
+		return *b
+	}
+	return make([]byte, copyBufferSize)
+}
+
+func (p *bufferPool) Put(b []byte) {
+	p.pool.Put(&b)
+}
+
+// forwardedFor returns the request's X-Forwarded-For with the client IP appended, like nginx's
+// $proxy_add_x_forwarded_for, which is what ntfy's behind-proxy expects
+func forwardedFor(r *http.Request) string {
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		clientIP = r.RemoteAddr
+	}
+	if prior := r.Header.Values(headerXForwardedFor); len(prior) > 0 {
+		return strings.Join(prior, ", ") + ", " + clientIP
+	}
+	return clientIP
 }
 
 func withProxyRequest(ctx context.Context, pr *proxyRequest) context.Context {
@@ -614,10 +687,6 @@ func retryReason(err error) string {
 		return retryConnect
 	}
 	return retryError
-}
-
-func touched(body *trackingBody) bool {
-	return body != nil && body.touched.Load()
 }
 
 func isTimeout(err error) bool {

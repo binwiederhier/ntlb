@@ -15,11 +15,14 @@ import (
 )
 
 // maxDuration is a slack that makes every upstream due
-const maxDuration = time.Duration(math.MaxInt64)
+const (
+	maxDuration = time.Duration(math.MaxInt64)
+)
 
 // healthLoop probes each upstream every health-check interval of its site. It wakes at the
-// shortest interval and probes the upstreams that are due, give or take half a round. The
-// intervals are read every round, so a reload changes them.
+// shortest interval and probes the upstreams that are due, give or take half a round, without
+// waiting for the round before: an upstream still being probed is not due. The intervals are
+// read every round, so a reload changes them.
 func (b *Balancer) healthLoop(ctx context.Context) {
 	for {
 		interval := b.shortestHealthInterval()
@@ -28,7 +31,7 @@ func (b *Balancer) healthLoop(ctx context.Context) {
 			return
 		case <-time.After(interval):
 		}
-		b.probe(ctx, b.dueUpstreams(time.Now(), interval/2))
+		go b.probe(ctx, b.dueUpstreams(time.Now(), interval/2)) // A slow site must not hold up the next round
 	}
 }
 
@@ -81,6 +84,7 @@ func (b *Balancer) probe(ctx context.Context, upstreams []*Upstream) {
 			}
 			addrWG.Wait()
 			u.applyProbes(hc, generation, addresses, results)
+			u.probeDone()
 		}()
 	}
 	wg.Wait()
@@ -114,16 +118,22 @@ func (u *Upstream) probeTargets() (uint64, *config.HealthCheck, []string) {
 	return u.generation, u.health, slices.Clone(u.addresses)
 }
 
-// dueForProbe reports whether the upstream's last probe round started its interval minus slack
-// ago, and if so, records now as the start of the next
+// dueForProbe reports whether the upstream is not being probed and its last probe round started
+// its interval minus slack ago; if so, it records now as the start of the next
 func (u *Upstream) dueForProbe(now time.Time, slack time.Duration) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if !u.lastProbe.IsZero() && now.Sub(u.lastProbe) < u.health.Interval-slack {
+	if u.probing || (!u.lastProbe.IsZero() && now.Sub(u.lastProbe) < u.health.Interval-slack) {
 		return false
 	}
-	u.lastProbe = now
+	u.lastProbe, u.probing = now, true
 	return true
+}
+
+func (u *Upstream) probeDone() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.probing = false
 }
 
 // applyProbes applies a probe round over all addresses: the upstream passes if any address

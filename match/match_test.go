@@ -101,6 +101,8 @@ func TestCompile_Invalid(t *testing.T) {
 		"ipIn bad network":       `ipIn(ip, "1.2.3.4/33")`,
 		"ipIn bad address":       `ipIn(ip, "1.2.3")`,
 		"ipIn not string":        `ipIn(ip, 5)`,
+		"ipIn 4in6 network":      `ipIn(ip, "::ffff:10.0.0.0/104")`,
+		"ipIn 4in6 address":      `ipIn(ip, "::ffff:10.0.0.1")`,
 		"header without name":    `header() == ""`,
 		"header wrong type":      `header(5) == ""`,
 		"empty":                  ``,

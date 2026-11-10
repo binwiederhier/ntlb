@@ -21,13 +21,17 @@ import (
 
 // ipInFunc is ipIn(ip, network...): whether ip is in any of the networks (CIDR prefixes or single
 // addresses). The networks must be string literals, so they are parsed once, at compile time.
-const ipInFunc = "ipIn"
+const (
+	ipInFunc = "ipIn"
+)
 
-var vmPool = sync.Pool{
-	New: func() any {
-		return &vm.VM{}
-	},
-}
+var (
+	vmPool = sync.Pool{
+		New: func() any {
+			return &vm.VM{}
+		},
+	}
+)
 
 // Kind is what an expression is compiled for
 type Kind int
@@ -218,20 +222,27 @@ func (n *networks) ipIn(params ...any) (any, error) {
 	return false, nil
 }
 
-// parsePrefix parses a CIDR prefix, or a single address as a full-length prefix
+// parsePrefix parses a CIDR prefix, or a single address as a full-length prefix. IPv4-mapped IPv6
+// networks are refused: ip is always unmapped, so they would never match.
 func parsePrefix(s string) (netip.Prefix, error) {
+	var prefix netip.Prefix
 	if strings.Contains(s, "/") {
-		prefix, err := netip.ParsePrefix(s)
+		p, err := netip.ParsePrefix(s)
 		if err != nil {
 			return netip.Prefix{}, fmt.Errorf("invalid network %q: %w", s, err)
 		}
-		return prefix.Masked(), nil
+		prefix = p.Masked()
+	} else {
+		addr, err := netip.ParseAddr(s)
+		if err != nil {
+			return netip.Prefix{}, fmt.Errorf("invalid network %q: %w", s, err)
+		}
+		prefix = netip.PrefixFrom(addr, addr.BitLen())
 	}
-	addr, err := netip.ParseAddr(s)
-	if err != nil {
-		return netip.Prefix{}, fmt.Errorf("invalid network %q: %w", s, err)
+	if prefix.Addr().Is4In6() {
+		return netip.Prefix{}, fmt.Errorf("invalid network %q: use the IPv4 form, client IPs are never IPv4-mapped", s)
 	}
-	return netip.PrefixFrom(addr, addr.BitLen()), nil
+	return prefix, nil
 }
 
 // flag is flag(name...), like ntfy's readParam for a boolean: the first of the names that is set

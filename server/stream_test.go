@@ -671,3 +671,31 @@ func TestStream_ForwardedHeadersSanitized(t *testing.T) {
 		require.Empty(t, got.Header.Get("X-Forwarded-Proto"), path)
 	}
 }
+
+func TestStream_HTTP2InvalidPathRejected(t *testing.T) {
+	// An HTTP/2 :path with a space reaches neither the stream path nor the reverse proxy
+	app1 := newTestUpstream(t, "app1")
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	writeTestCert(t, certFile, keyFile, "test")
+	s, _ := newTestServer(t, "listen-https: '127.0.0.3:0'\ncert-file: "+certFile+"\nkey-file: "+keyFile, app1)
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			ForceAttemptHTTP2: true,
+		},
+	}
+	req, err := http.NewRequest("GET", "https://"+s.HTTPSAddr()+"/mytopic/json", nil)
+	require.NoError(t, err)
+	req.URL.Opaque = "/mytopic/json?a b" // Sent as the :path as is
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, "HTTP/2.0", resp.Proto)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, "Bad Request\n", string(body)) // Our answer, not the upstream's parser ("400 Bad Request")
+	require.Equal(t, int64(0), app1.hits.Load())
+}

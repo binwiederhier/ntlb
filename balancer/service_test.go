@@ -354,13 +354,13 @@ func TestBalancer_DrainSpreadsFewStreams(t *testing.T) {
 	require.Equal(t, 4, closedAt[101])
 }
 
-func TestBalancer_RecordFailure(t *testing.T) {
+func TestBalancer_RecordAddressFailureCounts(t *testing.T) {
 	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
 	b := newTestBalancer(t, app1, app2)
 	u1 := b.upstream("app1")
-	b.RecordFailure(u1)
-	b.RecordFailure(u1)
-	b.RecordFailure(u1)
+	for range 3 {
+		b.RecordAddressFailure(u1, u1.NextAddress())
+	}
 	newTestSession(b, "app1")
 	status := b.Status()
 	require.Equal(t, uint64(3), status.Upstreams[0].Failures)
@@ -1055,11 +1055,11 @@ func TestBalancer_AddressBackoff(t *testing.T) {
 
 	// Once the backoff is over it is the least loaded again
 	now := time.Now()
-	u.recordAddressFailure("10.0.0.1:2", now.Add(-time.Hour))
+	u.recordAddressFailureNoLock("10.0.0.1:2", now.Add(-time.Hour))
 	require.Equal(t, "10.0.0.1:2", u.NextAddress())
 
 	// A stream that attaches to it clears its failures
-	u.recordAddressFailure("10.0.0.1:2", now)
+	u.recordAddressFailureNoLock("10.0.0.1:2", now)
 	b.Attach(s, u, "10.0.0.1:2")
 	u.mu.Lock()
 	require.Zero(t, u.addrFails["10.0.0.1:2"])
@@ -1166,4 +1166,24 @@ func addressesOf(upstreams []*Upstream) []string {
 		addrs = append(addrs, u.NextAddress())
 	}
 	return addrs
+}
+
+// NextAddress returns (for tests) the upstream address with the fewest streams and reserved attempts,
+// skipping addresses that failed recently (unless all did). It reserves nothing, see Reserve.
+func (u *Upstream) NextAddress() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.nextAddressNoLock(time.Now())
+}
+
+// upstream returns an upstream by ID or unique name (see findNoLock), removed or not, or nil
+func (b *Balancer) upstream(name string) *Upstream {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, u := range b.upstreams {
+		if u.id == name || u.name == name {
+			return u
+		}
+	}
+	return nil
 }

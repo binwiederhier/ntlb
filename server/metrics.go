@@ -11,9 +11,10 @@ import (
 
 // Request kinds, the "kind" label
 const (
-	kindRequest   = "request"   // Anything that is not a subscription
-	kindStream    = "stream"    // A subscription on the stream path
-	kindWebSocket = "websocket" // A subscription upgraded to a WebSocket
+	kindRequest    = "request"     // Anything that is not a subscription
+	kindStream     = "stream"      // A subscription on the stream path
+	kindWebSocket  = "websocket"   // A subscription upgraded to a WebSocket
+	kindBadRequest = "bad_request" // Rejected before the handler (malformed, oversized, cut off)
 )
 
 // Stream protocols, the "protocol" label of ntlb_streams
@@ -25,12 +26,18 @@ const (
 
 // Reasons for ntlb_retries_total and ntlb_streams_closed_total
 const (
-	retryConnect       = "connect" // The upstream refused or did not accept the connection
-	retryError         = "error"   // Any other error before a response, for idempotent requests
-	retry503           = "503"     // The upstream answered 503 (e.g. a draining ntfy node)
-	closedDrained      = "drained"
-	closedReadTimeout  = "read_timeout"
+	retryConnect      = "connect" // The upstream refused or did not accept the connection
+	retryError        = "error"   // Any other error before a response, for idempotent requests
+	retry503          = "503"     // The upstream answered 503 (e.g. a draining ntfy node)
+	closedDrained     = "drained"
+	closedReadTimeout = "read_timeout"
+)
+
+// Metric names and labels
+const (
 	metricsNamespace   = "ntlb"
+	labelSite          = "site"
+	labelUpstream      = "upstream"
 	streamDurationMax  = 24 * time.Hour
 	requestDurationMax = 5 * time.Minute
 )
@@ -70,7 +77,7 @@ func newMetrics(b *balancer.Balancer) *metrics {
 			Namespace: metricsNamespace,
 			Name:      "requests_total",
 			Help:      "Requests by site (empty if none serves the host), upstream (empty if none answered), status code and kind (request, stream, websocket)",
-		}, []string{"site", "upstream", "code", "kind"}),
+		}, []string{labelSite, labelUpstream, "code", "kind"}),
 		requestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Name:      "request_duration_seconds",
@@ -96,7 +103,7 @@ func newMetrics(b *balancer.Balancer) *metrics {
 		refused: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "refused_total",
-			Help:      "Requests turned away with 503 because the load balancer drains (new subscriptions, or anything once drained)",
+			Help:      "Requests turned away with 503: new subscriptions while the load balancer drains, anything once drained, and requests on a listener a reload removed",
 		}),
 		streamsClosed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -160,11 +167,11 @@ func newStatusCollector(b *balancer.Balancer) *statusCollector {
 		ready:            desc("ready", "Whether the load balancer is ready (healthy, not draining)"),
 		draining:         desc("draining", "Whether the load balancer is draining"),
 		openRequests:     desc("open_requests", "Open proxied requests, streams included"),
-		upstreamHealthy:  desc("upstream_healthy", "Whether the upstream passes its health checks", "site", "upstream"),
-		upstreamDraining: desc("upstream_draining", "Whether the upstream is draining or drained", "site", "upstream"),
-		upstreamStreams:  desc("upstream_streams", "Open proxied requests per upstream", "site", "upstream"),
-		upstreamRequests: desc("upstream_requests_total", "Requests the upstream answered", "site", "upstream"),
-		upstreamFailures: desc("upstream_failures_total", "Requests the upstream failed (connection errors, timeouts)", "site", "upstream"),
+		upstreamHealthy:  desc("upstream_healthy", "Whether the upstream passes its health checks", labelSite, labelUpstream),
+		upstreamDraining: desc("upstream_draining", "Whether the upstream is draining or drained", labelSite, labelUpstream),
+		upstreamStreams:  desc("upstream_streams", "Open proxied requests per upstream", labelSite, labelUpstream),
+		upstreamRequests: desc("upstream_requests_total", "Requests the upstream answered", labelSite, labelUpstream),
+		upstreamFailures: desc("upstream_failures_total", "Requests the upstream failed (connection errors, timeouts)", labelSite, labelUpstream),
 	}
 }
 

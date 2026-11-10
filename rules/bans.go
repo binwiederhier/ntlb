@@ -38,9 +38,10 @@ func newBans(conf *config.Bans, key *config.ClientKey) *bans {
 	}
 }
 
-// sameAs reports whether b counts the way conf and key say, so its state can carry over a reload
+// sameAs reports whether b counts the way conf and key say and writes to the same file, so its
+// state can carry over a reload
 func (b *bans) sameAs(conf *config.Bans, key *config.ClientKey) bool {
-	return b.conf.Threshold == conf.Threshold && b.conf.Window == conf.Window &&
+	return b.conf.File == conf.File && b.conf.Threshold == conf.Threshold && b.conf.Window == conf.Window &&
 		b.ipv4PrefixBits == key.IPv4PrefixBits && b.ipv6PrefixBits == key.IPv6PrefixBits
 }
 
@@ -61,6 +62,12 @@ func (b *bans) strike(addr netip.Addr, weight float64, rule string, now time.Tim
 		b.sweepNoLock(now)
 	}
 	s, ok := b.clients[prefix]
+	if !ok && len(b.clients) >= maxTracked {
+		b.sweepNoLock(now)
+		if len(b.clients) >= maxTracked {
+			return "", false // Untracked, see maxTracked
+		}
+	}
 	if !ok {
 		s = &striker{
 			room: b.conf.Threshold,

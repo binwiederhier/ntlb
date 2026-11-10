@@ -633,6 +633,29 @@ func TestProxy_StalledUploadTimesOut(t *testing.T) {
 	require.Less(t, time.Since(start), 3*time.Second)
 }
 
+func TestProxy_StalledUploadClientBodyTimeout(t *testing.T) {
+	// Like nginx's client_body_timeout (60s): a body that stalls is cut after that, even with a
+	// longer upstream-read-timeout
+	defer func(old time.Duration) {
+		clientBodyTimeout = old
+	}(clientBodyTimeout)
+	clientBodyTimeout = 300 * time.Millisecond
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "upstream-read-timeout: 1h", app1)
+	conn, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer conn.Close()
+	io.WriteString(conn, "POST /body-progress HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nhello")
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 1
+	})
+	start := time.Now()
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 0
+	})
+	require.Less(t, time.Since(start), 3*time.Second)
+}
+
 func TestProxy_DrainInterruptsStalledUpload(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	s, _ := newTestServer(t, "upstream-read-timeout: 1h", app1)
@@ -907,4 +930,395 @@ sites:
 	require.Equal(t, http.StatusOK, getHost(s.ListenerAddr("127.0.0.2:0"), "b.com"))
 	require.Equal(t, int64(1), b1.hits.Load())
 	require.Equal(t, http.StatusNotFound, getHost(s.ListenerAddr("127.0.0.2:0"), "a.com"))
+}
+
+func touched(body *trackingBody) bool {
+	return body != nil && body.touched.Load()
+}
+
+// echoUpstream is an upstream that records what reached it and answers with a fixed response
+type echoUpstream struct {
+	srv  *httptest.Server
+	mu   sync.Mutex
+	last *echoed
+}
+
+type echoed struct {
+	method, uri, proto string
+	header             http.Header
+	body               []byte
+	contentLength      int64
+	transferEncoding   []string
+}
+
+func newEchoUpstream(t *testing.T, respond func(w http.ResponseWriter, r *http.Request)) *echoUpstream {
+	e := &echoUpstream{}
+	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == config.DefaultHealthPath {
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		e.mu.Lock()
+		e.last = &echoed{
+			method:           r.Method,
+			uri:              r.RequestURI,
+			proto:            r.Proto,
+			header:           r.Header.Clone(),
+			body:             body,
+			contentLength:    r.ContentLength,
+			transferEncoding: r.TransferEncoding,
+		}
+		e.mu.Unlock()
+		if respond != nil {
+			respond(w, r)
+		}
+	}))
+	t.Cleanup(e.srv.Close)
+	return e
+}
+
+func (e *echoUpstream) lastRequest() *echoed {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.last
+}
+
+func echoServer(t *testing.T, e *echoUpstream) *Server {
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
+listen-admin: '127.0.0.1:0'
+sites: [{name: s, listen-http: '127.0.0.1:0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: e, addresses: [%q]}]}]
+`, strings.TrimPrefix(e.srv.URL, "http://"))), 0600))
+	return startTestServer(t, filename)
+}
+
+// rawRoundTrip sends a raw HTTP/1.x request and reads one response
+func rawRoundTrip(t *testing.T, addr, request string) *http.Response {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		conn.Close()
+	})
+	_, err = conn.Write([]byte(request))
+	require.NoError(t, err)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		resp.Body.Close()
+	})
+	return resp
+}
+
+func TestProxy_ClientRequestShapes(t *testing.T) {
+	// The request shapes of the ntfy clients (Android, iOS, web app, CLI, UnifiedPush and Matrix
+	// app servers, scripts) reach ntfy as sent
+	e := newEchoUpstream(t, nil)
+	s := echoServer(t, e)
+	addr := s.HTTPAddr()
+	tests := []struct {
+		name    string
+		request string
+		check   func(t *testing.T, got *echoed)
+	}{
+		{
+			name:    "HTTP/1.0 poll without Host",
+			request: "GET /mytopic/json?poll=1&since=all HTTP/1.0\r\n\r\n",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, "/mytopic/json?poll=1&since=all", got.uri)
+			},
+		},
+		{
+			name:    "Android publish with options in the query",
+			request: "PUT /mytopic?title=Hi%20there&message=" + strings.Repeat("x", 8000) + "&priority=high HTTP/1.1\r\nHost: ntfy.sh\r\nUser-Agent: ntfy/1.25.2 (play; Android 17; SDK 37)\r\nContent-Length: 0\r\n\r\n",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, http.MethodPut, got.method)
+				require.Len(t, got.uri, len("/mytopic?title=Hi%20there&message=")+8000+len("&priority=high"))
+				require.Equal(t, "ntfy/1.25.2 (play; Android 17; SDK 37)", got.header.Get("User-Agent"))
+			},
+		},
+		{
+			name:    "CLI chunked upload",
+			request: "PUT /mytopic HTTP/1.1\r\nHost: ntfy.sh\r\nTransfer-Encoding: chunked\r\nFilename: a.txt\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, "hello world", string(got.body))
+				require.Equal(t, int64(-1), got.contentLength) // Streamed on, not buffered into a length
+				require.Equal(t, "a.txt", got.header.Get("Filename"))
+			},
+		},
+		{
+			name:    "UnifiedPush encrypted body",
+			request: "POST /upAbCdEfGhIjKl?up=1 HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Encoding: aes128gcm\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\n\r\n\x00\x01\xfe\xff",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, []byte{0, 1, 0xfe, 0xff}, got.body)
+				require.Equal(t, "aes128gcm", got.header.Get("Content-Encoding"))
+			},
+		},
+		{
+			name:    "Matrix push gateway",
+			request: "POST /_matrix/push/v1/notify HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, "/_matrix/push/v1/notify", got.uri)
+			},
+		},
+		{
+			name:    "web app CORS preflight",
+			request: "OPTIONS /mytopic HTTP/1.1\r\nHost: ntfy.sh\r\nOrigin: https://example.com\r\nAccess-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: authorization\r\n\r\n",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, http.MethodOptions, got.method)
+				require.Equal(t, "https://example.com", got.header.Get("Origin"))
+				require.Equal(t, "authorization", got.header.Get("Access-Control-Request-Headers"))
+			},
+		},
+		{
+			name:    "web app webpush unsubscribe: DELETE with a body",
+			request: "DELETE /v1/webpush HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Length: 13\r\n\r\n{\"endpoint\":1}"[:len("DELETE /v1/webpush HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Length: 13\r\n\r\n")+13],
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, http.MethodDelete, got.method)
+				require.Len(t, got.body, 13)
+			},
+		},
+		{
+			name:    "auth header and auth query parameter",
+			request: "GET /mytopic/json?poll=1&auth=QmFzaWMgZm9v HTTP/1.1\r\nHost: ntfy.sh\r\nAuthorization: Bearer tk_secret\r\n\r\n",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, "Bearer tk_secret", got.header.Get("Authorization"))
+				require.Contains(t, got.uri, "auth=QmFzaWMgZm9v")
+			},
+		},
+		{
+			name:    "iOS notification extension: one message by id, raw UTF-8 in a header",
+			request: "GET /mytopic/json?poll=1&id=abcdefghijkl HTTP/1.1\r\nHost: ntfy.sh\r\nUser-Agent: ntfy/1.7.0 (build 9; iOS 26.6.2)\r\nX-Title: Gr\xc3\xbc\xc3\x9fe\r\n\r\n",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, "Gr\xc3\xbc\xc3\x9fe", got.header.Get("X-Title"))
+			},
+		},
+		{
+			name:    "UnifiedPush common-proxies: many topics at once",
+			request: "GET /" + strings.TrimSuffix(strings.Repeat("upAbCdEfGhIjKl,", 140), ",") + "/json?poll=1 HTTP/1.1\r\nHost: ntfy.sh\r\n\r\n",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, 140, strings.Count(got.uri, "upAbCdEfGhIjKl"))
+			},
+		},
+		{
+			name:    "absolute-form request target",
+			request: "GET http://ntfy.sh/mytopic/json?poll=1 HTTP/1.1\r\nHost: ntfy.sh\r\n\r\n",
+			check: func(t *testing.T, got *echoed) {
+				require.Equal(t, "/mytopic/json?poll=1", got.uri)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := rawRoundTrip(t, addr, tt.request)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			tt.check(t, e.lastRequest())
+		})
+	}
+}
+
+func TestProxy_Expect100Continue(t *testing.T) {
+	// curl's Expect: 100-continue for larger bodies: the body flows once ntfy reads it
+	e := newEchoUpstream(t, nil)
+	s := echoServer(t, e)
+	conn, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.Write([]byte("PUT /mytopic HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"))
+	require.NoError(t, err)
+	r := bufio.NewReader(conn)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := r.ReadString('\n')
+	require.NoError(t, err)
+	require.Equal(t, "HTTP/1.1 100 Continue\r\n", line)
+	_, err = r.ReadString('\n') // Blank line after the 100
+	require.NoError(t, err)
+	_, err = conn.Write([]byte("hello"))
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(r, nil)
+	require.NoError(t, err)
+	for resp.StatusCode == http.StatusContinue { // ntfy's own 100 is forwarded too; clients skip it
+		resp, err = http.ReadResponse(r, nil)
+		require.NoError(t, err)
+	}
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "hello", string(e.lastRequest().body))
+}
+
+func TestProxy_ConditionalAndRangeResponses(t *testing.T) {
+	// The web app's static files: ntfy's 304 and 206 answers reach the browser as they are
+	e := newEchoUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "app.js", time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), strings.NewReader("0123456789"))
+	})
+	s := echoServer(t, e)
+	resp := rawRoundTrip(t, s.HTTPAddr(), "GET /static/js/app.js HTTP/1.1\r\nHost: ntfy.sh\r\nRange: bytes=2-4\r\n\r\n")
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusPartialContent, resp.StatusCode)
+	require.Equal(t, "234", string(body))
+	resp = rawRoundTrip(t, s.HTTPAddr(), "GET /static/js/app.js HTTP/1.1\r\nHost: ntfy.sh\r\nIf-Modified-Since: Mon, 02 Nov 2026 00:00:00 GMT\r\n\r\n")
+	require.Equal(t, http.StatusNotModified, resp.StatusCode)
+}
+
+func TestProxy_SmugglingAttemptsRejected(t *testing.T) {
+	// Ambiguous framing is rejected before it reaches ntfy (400, or 501 for an unknown coding)
+	e := newEchoUpstream(t, nil)
+	s := echoServer(t, e)
+	for name, request := range map[string]string{
+		"two content lengths": "POST /mytopic HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
+		"chunked twice":       "POST /mytopic HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n",
+		"unknown coding":      "POST /mytopic HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n",
+		"no host in HTTP/1.1": "GET /mytopic HTTP/1.1\r\n\r\n",
+		"space before colon":  "GET /mytopic HTTP/1.1\r\nHost : a\r\n\r\n",
+		"control char":        "GET /mytopic HTTP/1.1\r\nHost: a\r\nX: a\x00b\r\n\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := rawRoundTrip(t, s.HTTPAddr(), request)
+			require.Contains(t, []int{http.StatusBadRequest, http.StatusNotImplemented}, resp.StatusCode, name)
+		})
+	}
+	require.Nil(t, e.lastRequest()) // None reached ntfy
+
+	// Content-Length with chunked: chunked wins (RFC 9112), and ntfy gets one framing only
+	resp := rawRoundTrip(t, s.HTTPAddr(), "POST /mytopic HTTP/1.1\r\nHost: a\r\nContent-Length: 40\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	got := e.lastRequest()
+	require.Equal(t, "hi", string(got.body))
+	require.Empty(t, got.header.Get("Content-Length"))
+}
+
+func TestProxy_WebSocketDrainClosesWithoutCloseFrame(t *testing.T) {
+	// The ntfy clients do not reconnect after a WebSocket close frame, so a drain must end the
+	// connection the way ntfy does: just close it
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "", app1)
+	conn, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.Write([]byte("GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")) // The fake upstream speaks "test"
+	require.NoError(t, err)
+	r := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(r, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 1
+	})
+	require.NoError(t, s.balancer.DrainUpstream("app1", 0))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	rest, err := io.ReadAll(r)
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded) // Closed
+	for i := 0; i+1 < len(rest); i++ {
+		require.NotEqual(t, byte(0x88), rest[i], "close frame sent") // FIN + opcode 8
+	}
+}
+
+func TestProxy_NoExtendedConnectOverHTTP2(t *testing.T) {
+	// Browsers would send WebSockets as HTTP/2 extended CONNECT (RFC 8441) if the server allowed
+	// it, which ntfy behind us cannot take; the HTTP/2 SETTINGS must not enable it
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	writeTestCert(t, certFile, keyFile, "test")
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "listen-https: '127.0.0.3:0'\ncert-file: "+certFile+"\nkey-file: "+keyFile, app1)
+	conn, err := tls.Dial("tcp", s.HTTPSAddr(), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2"},
+	})
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")) // Preface, empty SETTINGS
+	require.NoError(t, err)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	header := make([]byte, 9)
+	_, err = io.ReadFull(conn, header)
+	require.NoError(t, err)
+	require.Equal(t, byte(0x4), header[3]) // The server's SETTINGS come first
+	payload := make([]byte, int(header[0])<<16|int(header[1])<<8|int(header[2]))
+	_, err = io.ReadFull(conn, payload)
+	require.NoError(t, err)
+	for i := 0; i+6 <= len(payload); i += 6 {
+		id := int(payload[i])<<8 | int(payload[i+1])
+		value := int(payload[i+2])<<24 | int(payload[i+3])<<16 | int(payload[i+4])<<8 | int(payload[i+5])
+		if id == 0x8 { // SETTINGS_ENABLE_CONNECT_PROTOCOL
+			require.Zero(t, value)
+		}
+	}
+}
+
+// upgradeThen upgrades to "test" and then calls then with the hijacked connection
+func upgradeThen(then func(net.Conn)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")
+		brw.Flush()
+		then(conn)
+	}
+}
+
+// openUpgrade opens an upgraded connection through the load balancer
+func openUpgrade(t *testing.T, addr, path string) (net.Conn, *bufio.Reader) {
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		conn.Close()
+	})
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: x\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n", path)
+	r := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(r, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	return conn, r
+}
+
+func TestProxy_WebSocketEndsWhenUpstreamCloses(t *testing.T) {
+	// ntfy closes a WebSocket whose client stopped answering pings: the load balancer must end
+	// the client side too, even if the client sends nothing more, or the connection is a zombie
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/gone/ws", upgradeThen(func(conn net.Conn) {
+		time.Sleep(100 * time.Millisecond)
+	}))
+	s, _ := newTestServer(t, "", app1)
+	conn, r := openUpgrade(t, s.HTTPAddr(), "/gone/ws")
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err := r.ReadByte()
+	require.Error(t, err)
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded)
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 0
+	})
+}
+
+func TestProxy_WebSocketIdleTimeout(t *testing.T) {
+	// An upgraded connection on which nothing moves either way for the read timeout is cut
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/silent/ws", upgradeThen(func(conn net.Conn) {
+		io.Copy(io.Discard, conn) // Reads until the load balancer closes it
+	}))
+	s, _ := newTestServer(t, "upstream-read-timeout: 300ms", app1)
+	conn, r := openUpgrade(t, s.HTTPAddr(), "/silent/ws")
+	start := time.Now()
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err := r.ReadByte()
+	require.Error(t, err)
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.Less(t, time.Since(start), 3*time.Second)
+
+	// Traffic in either direction keeps it open
+	app1.on("/echo/ws", upgradeThen(func(conn net.Conn) {
+		io.Copy(conn, conn)
+	}))
+	conn, r = openUpgrade(t, s.HTTPAddr(), "/echo/ws")
+	for range 5 {
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprint(conn, "ping\n")
+		line, err := r.ReadString('\n')
+		require.NoError(t, err)
+		require.Equal(t, "ping\n", line)
+	}
 }

@@ -331,7 +331,7 @@ func TestParse_PortRanges(t *testing.T) {
 	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['10.0.0.1:2586-2588', '[fd00::1]:9000-9001', 'node:80']}]}]"))
 	require.NoError(t, err)
 	require.Equal(t, []string{"10.0.0.1:2586", "10.0.0.1:2587", "10.0.0.1:2588", "[fd00::1]:9000", "[fd00::1]:9001", "node:80"}, c.Sites[0].Upstreams[0].Addresses)
-	for _, bad := range []string{"10.0.0.1:2588-2586", "10.0.0.1:1-x", "10.0.0.1:0-5", "10.0.0.1:65535-65536", "10.0.0.1:1000-3000"} {
+	for _, bad := range []string{"10.0.0.1:2588-2586", "10.0.0.1:1-x", "10.0.0.1:x-5", "10.0.0.1:0-5", "10.0.0.1:65535-65536", "10.0.0.1:1000-3000"} {
 		_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['" + bad + "']}]}]"))
 		require.ErrorContains(t, err, "invalid address", bad)
 	}

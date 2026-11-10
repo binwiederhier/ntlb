@@ -1,6 +1,8 @@
 module heckel.io/ntlb
 
-go 1.24
+go 1.25.0
+
+toolchain go1.27.3
 
 require (
 	github.com/expr-lang/expr v1.17.8
@@ -19,6 +21,6 @@ require (
 	github.com/prometheus/common v0.62.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/sys v0.30.0 // indirect
+	golang.org/x/sys v0.44.0 // indirect
 	google.golang.org/protobuf v1.36.5 // indirect
 )

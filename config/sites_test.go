@@ -10,7 +10,9 @@ import (
 	"heckel.io/ntlb/match"
 )
 
-const testUp = "upstreams: [{name: x, addresses: ['1.2.3.4:80']}]"
+const (
+	testUp = "upstreams: [{name: x, addresses: ['1.2.3.4:80']}]"
+)
 
 func TestParse_Sites(t *testing.T) {
 	c, err := Parse([]byte(`
@@ -80,6 +82,13 @@ sites:
 	require.Equal(t, "other", c.SiteFor(":8080", "example.com").Name)
 	require.Nil(t, c.SiteFor(":8080", "ntfy.sh"))
 	require.Nil(t, c.SiteFor(":9999", "ntfy.sh"))
+}
+
+func TestParse_ListenersThatDoNotOverlap(t *testing.T) {
+	// Other IPs or ports, and port 0 (any free port), bind side by side
+	c, err := Parse([]byte("sites: [{name: a, listen-http: ['127.0.0.1:80', '127.0.0.1:0', '[::1]:80'], " + testUp + "}, {name: b, listen-http: ['127.0.0.2:80', '127.0.0.2:0', ':81'], hosts: [b.com], " + testUp + "}]"))
+	require.NoError(t, err)
+	require.Len(t, c.Listeners, 6)
 }
 
 func TestParse_SitesTLS(t *testing.T) {
@@ -152,6 +161,9 @@ func TestParse_SitesInvalid(t *testing.T) {
 		"http and https":           "sites: [{name: a, listen-http: ':80', " + testUp + "}, {name: b, listen-https: ':80', cert-file: /c, key-file: /k, hosts: [b.com], " + testUp + "}]",
 		"https without cert":       "sites: [{name: a, listen-https: ':443', " + testUp + "}]",
 		"duplicate listener":       "sites: [{name: a, listen-http: [':80', ':80'], " + testUp + "}]",
+		"overlapping listeners":    "sites: [{name: a, listen-http: ':80', " + testUp + "}, {name: b, listen-http: '0.0.0.0:80', hosts: [b.com], " + testUp + "}]",
+		"overlapping ipv6":         "sites: [{name: a, listen-http: '[::]:80', " + testUp + "}, {name: b, listen-http: '10.0.0.1:80', hosts: [b.com], " + testUp + "}]",
+		"same address respelled":   "sites: [{name: a, listen-http: '127.0.0.1:80', " + testUp + "}, {name: b, listen-http: '[::ffff:127.0.0.1]:80', hosts: [b.com], " + testUp + "}]",
 		"duplicate upstream":       "sites: [{name: a, listen-http: ':80', upstreams: [{name: x, addresses: ['1.2.3.4:80']}, {name: x, addresses: ['1.2.3.5:80']}]}]",
 		"two defaults":             "sites: [{name: a, " + up + "}, {name: b, " + up + "}]",
 		"duplicate host":           "sites: [{name: a, hosts: [a.com], " + up + "}, {name: b, hosts: [A.com], " + up + "}]",
@@ -263,4 +275,52 @@ func TestLoad_IncludeBadPattern(t *testing.T) {
 func writeFile(t *testing.T, filename, content string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(filename, []byte(content), 0600))
+}
+
+func TestParse_SiteBans(t *testing.T) {
+	// A site's bans settings replace the global ones for its requests; usually there are only global ones
+	c, err := Parse([]byte(`
+bans: {file: /var/log/ntlb/ban.log, threshold: 100}
+sites:
+  - {name: a, listen-http: ':80', hosts: [a.com], bans: {file: /var/log/ntlb/a-ban.log, threshold: 10}, rules: [{name: r, action: block, strike: 11}], ` + testUp + `}
+  - {name: b, listen-http: ':80', ` + testUp + `}
+`))
+	require.NoError(t, err)
+	require.Equal(t, DefaultBansWindow, c.Sites[0].Bans.Window)
+	require.Equal(t, "/var/log/ntlb/a-ban.log", c.BansFor(c.Sites[0]).File)
+	require.Equal(t, "/var/log/ntlb/ban.log", c.BansFor(c.Sites[1]).File)
+	require.Equal(t, "/var/log/ntlb/ban.log", c.BansFor(nil).File)
+
+	// Only site bans: strikes in that site's rules, and in global rules (they count for that
+	// site's requests), are fine
+	c, err = Parse([]byte(`
+rules: [{name: g, action: block, strike: 1}]
+sites: [{name: a, listen-http: ':80', bans: {file: /x, threshold: 1}, rules: [{name: r, action: block, strike: 1}], ` + testUp + `}]
+`))
+	require.NoError(t, err)
+	require.Nil(t, c.BansFor(nil))
+
+	// But a site without any bans cannot strike
+	_, err = Parse([]byte(`
+sites:
+  - {name: a, listen-http: ':80', hosts: [a.com], bans: {file: /x, threshold: 1}, ` + testUp + `}
+  - {name: b, listen-http: ':80', rules: [{name: r, action: block, strike: 1}], ` + testUp + `}
+`))
+	require.ErrorContains(t, err, "site b: rule b/r: strike needs a bans section")
+	for name, bans := range map[string]string{
+		"no file":         "{threshold: 1}",
+		"no threshold":    "{file: /x}",
+		"negative window": "{file: /x, threshold: 1, window: -1m}",
+	} {
+		_, err := Parse([]byte("sites: [{name: a, listen-http: ':80', bans: " + bans + ", " + testUp + "}]"))
+		require.ErrorContains(t, err, "site a: bans", name)
+	}
+}
+
+func TestConfig_Site(t *testing.T) {
+	c, err := Parse([]byte("sites: [{name: a, listen-http: ':80', " + testUp + "}]"))
+	require.NoError(t, err)
+	require.Equal(t, "a", c.Site("a").Name)
+	require.Nil(t, c.Site("b"))
+	require.Nil(t, c.Site(""))
 }

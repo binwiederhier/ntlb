@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/match"
@@ -34,6 +35,10 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request, env *match.Env, 
 // <fallback>: a path that is no regular file (missing, a directory) gets the fallback, or a 404
 // without one. The path is cleaned first, so it cannot leave root.
 func serveStatic(w http.ResponseWriter, r *http.Request, root, fallback string) {
+	if !cleanStaticPath(r.URL.Path) {
+		http.NotFound(w, r)
+		return
+	}
 	for _, p := range []string{r.URL.Path, fallback} {
 		if p == "" {
 			continue
@@ -50,7 +55,7 @@ func serveStatic(w http.ResponseWriter, r *http.Request, root, fallback string) 
 }
 
 func openStatic(root, p string) (*os.File, os.FileInfo) {
-	file, err := os.Open(filepath.Join(root, filepath.FromSlash(path.Clean("/"+p))))
+	file, err := os.OpenInRoot(root, filepath.FromSlash(path.Clean("/" + p)[1:])) // Also no symlink out of root
 	if err != nil {
 		return nil, nil
 	}
@@ -60,4 +65,14 @@ func openStatic(root, p string) (*os.File, os.FileInfo) {
 		return nil, nil
 	}
 	return file, info
+}
+
+// cleanStaticPath reports whether a path is what it names: no dot segments or empty segments
+// (rules match the path as sent, so "/s/../x" must not serve "/x"), and no dotfiles
+func cleanStaticPath(p string) bool {
+	clean := path.Clean(p)
+	if strings.HasSuffix(p, "/") && clean != "/" {
+		clean += "/"
+	}
+	return clean == p && !strings.Contains(p, "/.")
 }

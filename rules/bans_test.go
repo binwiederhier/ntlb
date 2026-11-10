@@ -8,7 +8,9 @@ import (
 	"heckel.io/ntlb/match"
 )
 
-const testBans = "bans: {file: /tmp/ban.log, window: 10m, threshold: 10}\n"
+const (
+	testBans = "bans: {file: /tmp/ban.log, window: 10m, threshold: 10}\n"
+)
 
 func TestBans_BlockStrikes(t *testing.T) {
 	e, now, lines := testEngineBans(t, testBans+"rules: [{name: abuse, match: 'path startsWith \"/nz_\"', action: block, strike: 5}]")
@@ -156,4 +158,16 @@ func TestBans_SweepForgetsRecoveredClients(t *testing.T) {
 	*now = now.Add(time.Hour)
 	decided(e, request("GET", "/", "192.0.2.3:1"))
 	require.Len(t, b.clients, 1)
+}
+
+func TestBans_UpdateWithNewFile(t *testing.T) {
+	// A reload that only moves the ban file writes there from then on
+	conf := testConfig(t, "bans: {file: /tmp/old.log, threshold: 1}\nrules: [{name: abuse, action: block, strike: 2}]")
+	var files []string
+	e := New(conf, func(file, _ string) {
+		files = append(files, file)
+	})
+	e.Update(testConfig(t, "bans: {file: /tmp/new.log, threshold: 1}\nrules: [{name: abuse, action: block, strike: 2}]"))
+	decided(e, request("GET", "/", "192.0.2.1:1"))
+	require.Equal(t, []string{"/tmp/new.log"}, files)
 }

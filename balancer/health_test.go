@@ -408,13 +408,47 @@ sites:
 }
 
 // testSite is a site for upstreams made without a config
-var testSite = &config.Site{
-	Name: "s",
-	HealthCheck: &config.HealthCheck{
-		Path:     config.DefaultHealthPath,
-		Interval: time.Hour,
-		Timeout:  time.Second,
-		Fails:    config.DefaultHealthFails,
-		Passes:   config.DefaultHealthPasses,
-	},
+var (
+	testSite = &config.Site{
+		Name: "s",
+		HealthCheck: &config.HealthCheck{
+			Path:     config.DefaultHealthPath,
+			Interval: time.Hour,
+			Timeout:  time.Second,
+			Fails:    config.DefaultHealthFails,
+			Passes:   config.DefaultHealthPasses,
+		},
+	}
+)
+
+func TestBalancer_SlowSiteDoesNotDelayOthers(t *testing.T) {
+	// A site whose probes hang until their timeout does not hold up the probes of another site
+	var fast atomic.Int32
+	fastServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fast.Add(1)
+	}))
+	t.Cleanup(fastServer.Close)
+	release := make(chan struct{})
+	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(slowServer.Close)
+	t.Cleanup(func() {
+		close(release)
+	})
+	conf := mustParse(t, fmt.Sprintf(`
+sites:
+  - {name: a, listen-http: ':0', hosts: [a.com], health-check: {interval: 10ms, timeout: 5ms}, upstreams: [{name: x, addresses: [%q]}]}
+  - {name: b, listen-http: ':0', health-check: {interval: 1h, timeout: 5s}, upstreams: [{name: x, addresses: [%q]}]}
+`, strings.TrimPrefix(fastServer.URL, "http://"), strings.TrimPrefix(slowServer.URL, "http://")))
+	b := New(conf)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.healthLoop(ctx)
+	require.Eventually(t, func() bool {
+		return fast.Load() >= 5
+	}, time.Second, 5*time.Millisecond)
 }

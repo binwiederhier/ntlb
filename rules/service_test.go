@@ -12,7 +12,9 @@ import (
 	"heckel.io/ntlb/match"
 )
 
-const testBase = "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
+const (
+	testBase = "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
+)
 
 func testConfig(t *testing.T, rules string) *config.Config {
 	t.Helper()
@@ -33,7 +35,7 @@ func testEngineBans(t *testing.T, rules string) (*Engine, *time.Time, *[]string)
 	t.Helper()
 	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 	var lines []string
-	e := New(testConfig(t, rules), func(line string) {
+	e := New(testConfig(t, rules), func(_, line string) {
 		lines = append(lines, line)
 	})
 	e.now = func() time.Time {
@@ -91,7 +93,7 @@ sites:
 `))
 	require.NoError(t, err)
 	var lines []string
-	e := New(conf, func(line string) {
+	e := New(conf, func(_, line string) {
 		lines = append(lines, line)
 	})
 
@@ -309,7 +311,8 @@ func TestEngine_SweepForgetsFullBuckets(t *testing.T) {
 // topic count, 6 exempt networks and a limit
 // benchRules are shaped like ntfy.sh's nginx rules today: 13 topic regexes, a user agent, the
 // topic count, 6 exempt networks and a limit
-const benchRules = `
+const (
+	benchRules = `
 rules:
   - name: abuse-topics
     action: block
@@ -327,6 +330,7 @@ rules:
     action: limit
     rate: 1000000000/s # Never exceeded: measure the full walk
 `
+)
 
 func BenchmarkEngine_Check(b *testing.B) {
 	conf, err := config.Parse([]byte(testBase + benchRules))
@@ -363,4 +367,80 @@ rules:
 	require.Equal(t, "docs", decided(e, request("GET", "/docs/x", "192.0.2.1:1")))
 	require.Equal(t, "site", decided(e, request("GET", "/", "192.0.2.1:1")))
 	require.Equal(t, "", decided(e, request("GET", "/mytopic", "192.0.2.1:1")))
+}
+
+func TestBans_PerSite(t *testing.T) {
+	// A site with its own bans settings counts its requests' strikes there (global rules' too),
+	// writing to its own file; other sites use the global ones
+	conf, err := config.Parse([]byte(`
+bans: {file: /tmp/ban.log, threshold: 10}
+rules: [{name: abuse, match: 'path == "/abuse"', action: block, strike: 6}]
+sites:
+  - {name: a, listen-http: ':80', hosts: [a.com], bans: {file: /tmp/a-ban.log, threshold: 1}, upstreams: [{name: x, addresses: ['1.2.3.4:80']}]}
+  - {name: b, listen-http: ':80', upstreams: [{name: x, addresses: ['1.2.3.4:80']}]}
+`))
+	require.NoError(t, err)
+	var bans []string
+	e := New(conf, func(file, line string) {
+		bans = append(bans, file+" "+line[len("2026-11-09T12:00:00Z "):])
+	})
+	e.now = func() time.Time {
+		return time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	}
+	decidedOn(e, request("GET", "/abuse", "192.0.2.1:1"), "a") // 6 > 1
+	require.Equal(t, []string{"/tmp/a-ban.log 192.0.2.1 192.0.2.1/32 abuse"}, bans)
+	decidedOn(e, request("GET", "/abuse", "192.0.2.1:1"), "b") // 6, separate count
+	require.Len(t, bans, 1)
+	decidedOn(e, request("GET", "/abuse", "192.0.2.1:1"), "") // 12 > 10 globally
+	require.Equal(t, "/tmp/ban.log 192.0.2.1 192.0.2.1/32 abuse", bans[1])
+
+	// Response rules too
+	env := match.NewResponseEnv(match.NewEnv(request("GET", "/", "192.0.2.2:1")))
+	env.Site = "a"
+	conf.Rules = append(conf.Rules, &config.Rule{ID: "errors", Name: "errors", On: config.OnResponse, Strike: 2})
+	e.Update(conf)
+	e.CheckResponse(env)
+	require.Equal(t, "/tmp/a-ban.log 192.0.2.2 192.0.2.2/32 errors", bans[2])
+
+	// A reload with the same site bans keeps its strikes: 192.0.2.2 was reported in this window
+	e.Update(conf)
+	e.CheckResponse(env)
+	require.Len(t, bans, 3)
+}
+
+func TestEngine_TrackedClientsCapped(t *testing.T) {
+	// Spraying client keys (an IPv6 /48 has 65k /64s) must not grow the limit buckets without
+	// bound: over the cap, a new client goes untracked (and passes) until a sweep makes room
+	defer func(old int) {
+		maxTracked = old
+	}(maxTracked)
+	maxTracked = 3
+	e, now := testEngine(t, "rules: [{name: limit, action: limit, rate: 1/h}]")
+	for i := range 3 {
+		decided(e, request("GET", "/", "[2001:db8:0:"+strconv.Itoa(i)+"::1]:1"))
+	}
+	limiter := e.state.Load().rules[0].limiter
+	require.Len(t, limiter.buckets, 3)
+	for range 3 {
+		require.Equal(t, "", decided(e, request("GET", "/", "[2001:db8:0:99::1]:1"))) // Untracked: never limited
+	}
+	require.Len(t, limiter.buckets, 3)
+
+	// Once the old buckets refilled, a sweep makes room again
+	*now = now.Add(2 * time.Hour)
+	decided(e, request("GET", "/", "[2001:db8:0:99::1]:1"))
+	require.Equal(t, "limit", decided(e, request("GET", "/", "[2001:db8:0:99::1]:1")))
+}
+
+func TestBans_TrackedClientsCapped(t *testing.T) {
+	defer func(old int) {
+		maxTracked = old
+	}(maxTracked)
+	maxTracked = 2
+	e, _, lines := testEngineBans(t, testBans+"rules: [{name: abuse, action: block, strike: 11}]")
+	decided(e, request("GET", "/", "192.0.2.1:1"))
+	decided(e, request("GET", "/", "192.0.2.2:1"))
+	decided(e, request("GET", "/", "192.0.2.3:1")) // Over the cap: not counted
+	require.Len(t, *lines, 2)
+	require.Len(t, e.state.Load().bans.clients, 2)
 }

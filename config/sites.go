@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,8 +17,7 @@ import (
 )
 
 var (
-	siteNameRegex = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`)
-	hostRegex     = regexp.MustCompile(`^(\*\.)?[-_a-z0-9]+(\.[-_a-z0-9]+)*$`)
+	hostRegex = regexp.MustCompile(`^(\*\.)?[-_a-z0-9]+(\.[-_a-z0-9]+)*$`)
 )
 
 // Site is one site: the addresses it listens on, the hosts it serves there, its certificate,
@@ -33,6 +33,7 @@ type Site struct {
 	CertFile    string       `yaml:"cert-file"`    // Picked by SNI among the certificates of a listener's sites
 	KeyFile     string       `yaml:"key-file"`     //
 	AccessLogs  []*AccessLog `yaml:"access-logs"`  // Replace the global access logs for this site
+	Bans        *Bans        `yaml:"bans"`         // Replace the global bans settings for this site (usually there are only global ones)
 	HealthCheck *HealthCheck `yaml:"health-check"` // Active health checks against every upstream
 	Streams     *Streams     `yaml:"streams"`      // Which requests are long-lived streams
 	Upstreams   []*Upstream  `yaml:"upstreams"`    // Upstream names are per site
@@ -108,6 +109,16 @@ func (c *Config) Listener(addr string) *Listener {
 	return nil
 }
 
+// Site returns the site with a name, or nil
+func (c *Config) Site(name string) *Site {
+	for _, site := range c.Sites {
+		if site.Name == name {
+			return site
+		}
+	}
+	return nil
+}
+
 // AccessLogsFor returns the access logs for a request to a site: its own, else the global ones.
 // site is nil for a request no site serves.
 func (c *Config) AccessLogsFor(site *Site) []*AccessLog {
@@ -115,6 +126,15 @@ func (c *Config) AccessLogsFor(site *Site) []*AccessLog {
 		return site.AccessLogs
 	}
 	return c.AccessLogs
+}
+
+// BansFor returns the bans settings for a request to a site: its own, else the global ones, or
+// nil if none count its strikes. site is nil for a request no site serves.
+func (c *Config) BansFor(site *Site) *Bans {
+	if site != nil && site.Bans != nil {
+		return site.Bans
+	}
+	return c.Bans
 }
 
 // UpstreamCount returns the number of upstreams over all sites
@@ -192,6 +212,7 @@ func (s *Site) applyDefaults() {
 	if s.Streams.Match == "" {
 		s.Streams.Match = DefaultStreamsMatch
 	}
+	s.Bans.applyDefaults()
 	applyRuleDefaults(s.Rules)
 }
 
@@ -204,7 +225,7 @@ func (c *Config) validateSites() error {
 	for i, site := range c.Sites {
 		if site == nil {
 			return fmt.Errorf("sites[%d] is empty", i)
-		} else if !siteNameRegex.MatchString(site.Name) {
+		} else if !nameRegex.MatchString(site.Name) {
 			return fmt.Errorf("invalid site name %q", site.Name)
 		} else if names[site.Name] {
 			return fmt.Errorf("duplicate site name %q", site.Name)
@@ -246,6 +267,8 @@ func (s *Site) validate(bans *Bans) error {
 	}
 	if err := validateAccessLogs(s.AccessLogs); err != nil {
 		return err
+	} else if err := validateBans(s.Bans); err != nil {
+		return err
 	}
 	if err := s.HealthCheck.validate(); err != nil {
 		return err
@@ -257,7 +280,7 @@ func (s *Site) validate(bans *Bans) error {
 	if err := validateUpstreams(s.Upstreams); err != nil {
 		return err
 	}
-	return validateRules(s.Rules, s.Name, bans)
+	return validateRules(s.Rules, s.Name, bans != nil || s.Bans != nil)
 }
 
 // addListeners adds the site to its listeners, creating those not seen yet
@@ -272,6 +295,11 @@ func (c *Config) addListeners(site *Site) error {
 		seen[addr] = true
 		l := c.Listener(addr)
 		if l == nil {
+			for _, other := range c.Listeners {
+				if overlaps(addr, other.Addr) {
+					return fmt.Errorf("listen address %s overlaps with %s (same port, and the same or a wildcard IP)", addr, other.Addr)
+				}
+			}
 			l = &Listener{
 				Addr: addr,
 				TLS:  tls,
@@ -315,7 +343,10 @@ func (l *Listener) indexSites() error {
 					return fmt.Errorf("duplicate host %q", host)
 				}
 				suffixes[suffix] = true
-				l.index.wildcards = append(l.index.wildcards, &wildcard{suffix: suffix, site: site})
+				l.index.wildcards = append(l.index.wildcards, &wildcard{
+					suffix: suffix,
+					site:   site,
+				})
 			} else if _, ok := l.index.exact[host]; ok {
 				return fmt.Errorf("duplicate host %q", host)
 			} else {
@@ -337,7 +368,7 @@ func validateUpstreams(upstreams []*Upstream) error {
 	for i, u := range upstreams {
 		if u == nil {
 			return fmt.Errorf("upstreams[%d] is empty", i)
-		} else if !upstreamNameRegex.MatchString(u.Name) {
+		} else if !nameRegex.MatchString(u.Name) {
 			return fmt.Errorf("invalid upstream name %q", u.Name)
 		} else if names[u.Name] {
 			return fmt.Errorf("duplicate upstream name %q", u.Name)
@@ -352,6 +383,25 @@ func validateUpstreams(upstreams []*Upstream) error {
 		u.Addresses = addresses
 	}
 	return nil
+}
+
+// overlaps reports whether two different listen addresses would bind the same socket: the same
+// port (not 0, any free port), and the same IP, or the wildcard on either side. Hostnames are only
+// compared as written.
+func overlaps(a, b string) bool {
+	hostA, portA, _ := net.SplitHostPort(a) // Both were checked
+	hostB, portB, _ := net.SplitHostPort(b)
+	if portA != portB || portA == "0" {
+		return false
+	}
+	ipA, errA := netip.ParseAddr(hostA)
+	ipB, errB := netip.ParseAddr(hostB)
+	wildcardA := hostA == "" || (errA == nil && ipA.IsUnspecified())
+	wildcardB := hostB == "" || (errB == nil && ipB.IsUnspecified())
+	if wildcardA || wildcardB {
+		return true
+	}
+	return errA == nil && errB == nil && ipA.Unmap() == ipB.Unmap()
 }
 
 // normalizeHost lowercases a Host header and strips its port and trailing dot

@@ -10,7 +10,9 @@ import (
 	"heckel.io/ntlb/config"
 )
 
-var errNoCertificate = errors.New("no certificate for this listener")
+var (
+	errNoCertificate = errors.New("no certificate for this listener")
+)
 
 // certStore holds the TLS certificates of each HTTPS listener's sites, swapped on reload so a
 // renewal needs no restart and cuts no stream

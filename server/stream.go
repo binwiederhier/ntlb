@@ -37,25 +37,29 @@ import (
 // Draining and the upstream read timeout close the upstream connection, which ends the copy.
 
 // hopHeaders are the hop-by-hop headers, never forwarded (RFC 9110, section 7.6.1)
-var hopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Connection",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"TE",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
-}
+var (
+	hopHeaders = []string{
+		headerConnection,
+		"Keep-Alive",
+		"Proxy-Connection",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+	}
+)
 
 // forwardedHeaders are dropped from client requests, like httputil.ReverseProxy's Rewrite does:
 // only the load balancer says who the client is (X-Forwarded-For)
-var forwardedHeaders = []string{
-	"Forwarded",
-	"X-Forwarded-Host",
-	"X-Forwarded-Proto",
-}
+var (
+	forwardedHeaders = []string{
+		"Forwarded",
+		"X-Forwarded-Host",
+		"X-Forwarded-Proto",
+	}
+)
 
 const (
 	streamHeaderBufferSize = 1024      // Reads the upstream's response headers; dropped after
@@ -174,7 +178,7 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, 
 	for _, name := range forwardedHeaders {
 		header.Del(name)
 	}
-	header.Set("X-Forwarded-For", forwardedFor(r))
+	header.Set(headerXForwardedFor, forwardedFor(r))
 	bw := bufio.NewWriterSize(conn, streamHeaderBufferSize)
 	fmt.Fprintf(bw, "GET %s HTTP/1.0\r\nHost: %s\r\n", r.URL.RequestURI(), r.Host)
 	header.Write(bw)
@@ -377,7 +381,7 @@ func waitReadable(raw syscall.RawConn) error {
 }
 
 func removeHopHeaders(h http.Header) {
-	for _, field := range h.Values("Connection") {
+	for _, field := range h.Values(headerConnection) {
 		for _, name := range strings.Split(field, ",") {
 			h.Del(strings.TrimSpace(name))
 		}

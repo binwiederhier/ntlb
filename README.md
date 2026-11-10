@@ -34,7 +34,8 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
   methods; a 503 (a draining ntfy node) only if no body byte was sent. A body that was partly sent
   is never resent. A node's other addresses are tried before the next node.
 - **Long-lived streams**: flushes every write, an upstream idle timeout (3m,
-  `proxy_read_timeout`) that also bounds stalled uploads and clients that stop reading, WebSocket
+  `proxy_read_timeout`) that also bounds clients that stop reading, a 60s bound on a stalled upload
+  (nginx's `client_body_timeout`), WebSocket
   upgrades, HTTP/2 on the TLS listener. Subscriptions take a
   lean path (raw upstream connection, no buffer held while idle, hijacked HTTP/1.1 connections):
   ~11 KiB per stream over HTTP/1.1, ~32 KiB with TLS, ~37 KiB over HTTP/2.
@@ -52,11 +53,13 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
   per site.
 - **Reload without cutting streams** (`SIGHUP`, `systemctl reload`, `ntlb reload`): sites and
   their listen addresses (new ones are bound, removed ones stop accepting while their streams run
-  on), upstreams, health checks, timeouts, drain durations, streams, the client key, rules, bans, the
-  TLS certificates and the log files. Streams to upstreams that stay are untouched. Listener addresses and client
-  keepalives need a restart; a reload says so. A broken config (or certificate, or log path) is
-  rejected as a whole.
-- **Rules, changed live** (global ones for every site, then the site's own): block, rate limit, allow, redirect or serve from disk the requests a
+  on), upstreams, health checks, timeouts, drain durations, streams, the client key, rules, bans,
+  the TLS certificates and the log files. Streams to upstreams that stay are untouched.
+  `listen-admin`, `listen-metrics` and `client-keepalive` need a restart, and so does an address
+  that switches between HTTP and HTTPS; a reload says so. A broken config (or certificate, log
+  path or listen address) is rejected as a whole.
+- **Rules, changed live** (global ones for every site, then the site's own): block, rate limit,
+  allow, redirect or serve from disk the requests a
   boolean expression matches (method, path, query, host, scheme, client IP and networks, headers;
   `&&`, `||`, `!`, regexes): abusive topics or user agents, a per-IP request limit like nginx's
   `limit_req` and exemptions from it, the HTTP -> HTTPS redirect, a static website. Expressions
@@ -64,7 +67,8 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
   the config loads. A reload swaps them without cutting open streams.
 - **Bans**: rules add strikes per client (blocks, exceeded limits, and response rules that look at
   the outcome, e.g. repeated 400s); a client over a threshold within a window gets one line in a
-  ban file, for CrowdSec to turn into a firewall ban, like ntfy's own ban feed.
+  ban file, for CrowdSec to turn into a firewall ban, like ntfy's own ban feed. Usually global; a
+  site can have its own settings and file.
 - **Access logs split by outcome**: several files, each with a response expression (e.g. `status
   < 400` to `access.log`, the rest to `access_error.log`), in nginx's `combined` format plus
   key=value fields, so existing parsers keep working. Global, or per site (a site's own replace
@@ -154,12 +158,24 @@ cannot be hijacked.
   of chunked encoding. That is valid HTTP, and streams end with their connection anyway.
 - A dead HTTP/1.1 subscriber is noticed on the next write (at most ntfy's 45s keepalive) or by
   TCP keepalive, because the LB no longer reads from these connections.
+- Requests Go rejects before the handler (malformed request lines, oversized headers, a request cut
+  off mid-headers, slowloris) are logged with the request `"-"` and status 400, where nginx logs
+  the garbage line and 400/414. They count for response rules like `status == 400 &&
+  upstream_status == 0`. A header over 64 KiB gets 431 (nginx: 400/414 over 8 KiB per line).
+- The access log escapes like nginx (`\xHH` for quotes, backslashes, non-printable bytes, and
+  spaces in the unquoted fields), caps each field at 4 KiB, and redacts `auth=` query values (the
+  web app's credentials), which nginx logged verbatim.
+- HTTP/2 `:path` and `:authority` are checked like Go's HTTP/1 parser does it (400 otherwise).
+- An upgraded connection (WebSocket) ends when the upstream ends it or after
+  `upstream-read-timeout` without traffic either way; drains close it without a close frame (the
+  ntfy clients do not reconnect after one).
+- TLS 1.2 offers only AEAD suites (Mozilla intermediate, as in the nginx config). `action: static`
+  serves only clean paths (no `.`, `..` or empty segments, no dotfiles) and no symlink out of root.
 
 ### Open items
 
-- The nginx features not ported yet, listed under [nginx parity](#nginx-parity): the CrowdSec log
-  partitioning by status, logging the 400s Go answers before the handler, gzip, website and docs
-  redirects.
+- The nginx features not ported yet, listed under [nginx parity](#nginx-parity): gzip, and the
+  ansible side (rules translation, CrowdSec ban-file scenario).
 - Optional: turn off HTTP/2 on the LB. The app would move to HTTP/1.1 over TLS (~32 KiB instead of
   ~37 KiB), at the cost of one TCP+TLS connection per subscription. Not worth it at today's size.
 - Rollout plan (one LB at a time behind DNS, or side by side on another port first).
@@ -324,9 +340,6 @@ the static website and the `/docs` redirects.
 
 - the translation of today's nginx config into rules, and the switch of the CrowdSec scenarios
   to the ban file: in ansible, not written yet
-- logging the 400s that Go answers before a request reaches the load balancer's code (malformed
-  request lines, oversized headers), so a `status == 400 && upstream_status == 0` response rule
-  does not see those yet
 - `gzip` of proxied responses
 - `lingering_time 3s` (Go reads at most 256 KiB of an unread body, then closes)
 - the nginx stub_status exporter (replaced by `/metrics`)

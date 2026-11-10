@@ -67,3 +67,27 @@ func servedBy(t *testing.T, addr, serverName string) string {
 	defer conn.Close()
 	return conn.ConnectionState().PeerCertificates[0].Subject.CommonName
 }
+
+func TestCerts_OnlyAEADCiphersForTLS12(t *testing.T) {
+	// Like the nginx config (Mozilla intermediate): TLS 1.2 with CBC suites is refused
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	writeTestCert(t, certFile, keyFile, "test")
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "listen-https: '127.0.0.3:0'\ncert-file: "+certFile+"\nkey-file: "+keyFile, app1)
+	dial := func(suite uint16) error {
+		conn, err := tls.Dial("tcp", s.HTTPSAddr(), &tls.Config{
+			InsecureSkipVerify: true,
+			MaxVersion:         tls.VersionTLS12,
+			CipherSuites:       []uint16{suite},
+		})
+		if err == nil {
+			conn.Close()
+		}
+		return err
+	}
+	require.NoError(t, dial(tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256))
+	require.NoError(t, dial(tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256))
+	require.Error(t, dial(tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA))
+	require.Error(t, dial(tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA))
+}

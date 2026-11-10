@@ -163,4 +163,18 @@ func TestLoad_PackagingExampleRules(t *testing.T) {
 	require.False(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/my-bets2/json", nil))))
 	require.Greater(t, byName["ntfy/abuse-topics"].Strike, c.Bans.Threshold) // Bans on the first request
 	require.Equal(t, OnResponse, byName["bad-requests"].On)
+
+	// The docs redirect, also for /docs itself, before the HTTPS redirect (like nginx's locations)
+	docs := func(path string) string {
+		return byName["ntfy/docs-redirect"].LocationProgram.String(match.NewEnv(httptest.NewRequest("GET", path, nil)))
+	}
+	require.Equal(t, "https://docs.ntfy.sh/", docs("/docs"))
+	require.Equal(t, "https://docs.ntfy.sh/", docs("/docs/"))
+	require.Equal(t, "https://docs.ntfy.sh/publish/", docs("/docs/publish/"))
+	order := make(map[string]int)
+	for i, r := range c.Sites[0].Rules {
+		order[r.Name] = i
+	}
+	require.Less(t, order["docs-redirect"], order["https-redirect"])
+	require.Empty(t, byName["ntfy/website-assets"].Fallback) // A missing asset is a 404
 }

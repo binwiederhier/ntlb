@@ -1,6 +1,6 @@
-# ntlb config. Reload with "systemctl reload ntlb" (SIGHUP) or "ntlb reload": everything
-# but the listen addresses and client-keepalive applies without cutting a stream (a reload says
-# which changed settings need a restart). A config with an error is rejected as a whole, and the
+# ntlb config. Reload with "systemctl reload ntlb" (SIGHUP) or "ntlb reload": everything but
+# listen-admin, listen-metrics and client-keepalive applies without cutting a stream, the sites'
+# listen addresses too (a reload says which changed settings need a restart). A config with an error is rejected as a whole, and the
 # old one stays. Unknown keys are an error. Check a file with "ntlb check-config".
 #
 # Expressions (match, location) are in the expr language (https://expr-lang.org, also used by
@@ -46,7 +46,8 @@ upstream-keepalive:
 
 upstream-connect-timeout: 5s # A node that does not accept within this is down, try the next
 upstream-read-timeout: 3m    # Cut a stream after this long without a byte (ntfy sends keepalives every 45s);
-                             # also bounds a stalled upload or a client that stops reading
+                             # also bounds a client that stops reading; a stalled upload is cut after
+                             # 60s (like nginx's client_body_timeout), or this if shorter
 
 drain-duration: 5m           # Default for "drain" commands and for upstreams removed from this file
 shutdown-drain-duration: 2m  # SIGTERM: not ready right away, streams closed over this long
@@ -61,7 +62,8 @@ client-key:
 # Bans: rules add strikes per client key; a client with more than threshold strikes within window
 # gets one line in file ("<time> <ip> <prefix> <rule>"), which CrowdSec (or fail2ban) turns into a
 # ban. A rule with a strike above the threshold bans on the first match. Strikes are not shared
-# between load balancers; the ban tool shares the bans.
+# between load balancers; the ban tool shares the bans. Usually this is the only bans section; a
+# site may have its own, which then counts its requests' strikes (global rules' too) separately.
 bans:
   file: /var/log/ntlb/ban.log
   window: 10m
@@ -107,5 +109,5 @@ include: [sites.d/*.yml]
 # hosts match its Host header (exact names, then the longest "*.name" wildcard), else to the one
 # site there without hosts; with none, it gets a 404. HTTPS serves HTTP/2 and HTTP/1.1, with the
 # certificate of the listener's site that matches the client's SNI (else its first site's).
-# New or removed listen addresses need a restart; sites can move between the existing ones on
-# reload. See sites.d/ntfy.yml.
+# A reload binds new listen addresses and closes removed ones (their open streams run on); only an
+# address that switches between listen-http and listen-https needs a restart. See sites.d/ntfy.yml.

@@ -15,6 +15,7 @@ import (
 const (
 	accessLogFlushInterval = time.Second
 	accessLogTimeFormat    = "02/Jan/2006:15:04:05 -0700" // nginx's $time_local
+	maxLogField            = 4096                         // Bytes per escaped field, so one request cannot write a huge line
 )
 
 // accessLog is a buffered log file that a reload can swap for a reopened one (for logrotate). As
@@ -25,44 +26,6 @@ type accessLog struct {
 	w    *bufio.Writer
 	done chan struct{}
 	mu   sync.Mutex // Protects file and w
-}
-
-// statusWriter records the status and body size of a response. Unwrap lets
-// http.ResponseController (used by the reverse proxy) reach Flush and Hijack.
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-	bytes  int64
-}
-
-func (w *statusWriter) WriteHeader(status int) {
-	if w.status == 0 {
-		w.status = status
-	}
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w *statusWriter) Write(p []byte) (int, error) {
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
-	n, err := w.ResponseWriter.Write(p)
-	w.bytes += int64(n)
-	return n, err
-}
-
-func (w *statusWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
-
-// newAccessLogFile creates a log that writes to an opened file (nil: off)
-func newAccessLogFile(file *os.File) *accessLog {
-	l := &accessLog{
-		done: make(chan struct{}),
-	}
-	l.swap(file)
-	go l.flushLoop()
-	return l
 }
 
 // accessLogEntry holds what a log line needs from the request, taken upfront so that a stream
@@ -76,6 +39,16 @@ type accessLogEntry struct {
 	host       string
 }
 
+// newAccessLogFile creates a log that writes to an opened file (nil: off)
+func newAccessLogFile(file *os.File) *accessLog {
+	l := &accessLog{
+		done: make(chan struct{}),
+	}
+	l.swap(file)
+	go l.flushLoop()
+	return l
+}
+
 // newAccessLogEntry takes what a log line needs from the request
 func newAccessLogEntry(r *http.Request, start time.Time) *accessLogEntry {
 	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -85,10 +58,10 @@ func newAccessLogEntry(r *http.Request, start time.Time) *accessLogEntry {
 	return &accessLogEntry{
 		start:      start,
 		remoteAddr: remoteAddr,
-		request:    r.Method + " " + escape(r.RequestURI) + " " + r.Proto,
-		referer:    r.Referer(),
-		userAgent:  r.UserAgent(),
-		host:       r.Host,
+		request:    escapeUnquoted(r.Method) + " " + escapeUnquoted(redactAuth(r.RequestURI)) + " " + escapeUnquoted(r.Proto),
+		referer:    escape(r.Referer()),
+		userAgent:  escape(r.UserAgent()),
+		host:       escapeUnquoted(r.Host),
 	}
 }
 
@@ -103,7 +76,7 @@ func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest, status int) {
 	}
 	line := fmt.Sprintf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s site=%s request_time=%.3f upstream=%s upstream_status=%s",
 		e.remoteAddr, e.start.Format(accessLogTimeFormat), e.request, status, bytes,
-		escape(e.referer), escape(e.userAgent), escape(e.host), site, time.Since(e.start).Seconds(), upstream, upstreamStatus)
+		orDash(e.referer), orDash(e.userAgent), orDash(e.host), site, time.Since(e.start).Seconds(), upstream, upstreamStatus)
 	if pr.rule != "" {
 		line += " rule=" + pr.rule
 	}
@@ -159,10 +132,52 @@ func (l *accessLog) flushLoop() {
 	}
 }
 
-// escape makes a value safe to put between quotes, like nginx's \x22 escaping, and "-" if empty
+// escape escapes a log field the way nginx does: quotes, backslashes, and the bytes that are not
+// printable ASCII become \xHH, so a field cannot end its quotes or the line. Long fields are cut.
 func escape(s string) string {
+	return escapeField(s, false)
+}
+
+// escapeUnquoted is escape for a field outside quotes (the request line's parts, http_host), where
+// a space would start another field
+func escapeUnquoted(s string) string {
+	return escapeField(s, true)
+}
+
+func escapeField(s string, spaces bool) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7e || c == '"' || c == '\\' || (spaces && c == ' ') {
+			fmt.Fprintf(&b, "\\x%02X", c)
+		} else {
+			b.WriteByte(c)
+		}
+		if b.Len() >= maxLogField {
+			return b.String() + "..."
+		}
+	}
+	return b.String()
+}
+
+// redactAuth hides the values of auth query parameters (the web app's credentials)
+func redactAuth(uri string) string {
+	path, query, ok := strings.Cut(uri, "?")
+	if !ok {
+		return uri
+	}
+	params := strings.Split(query, "&")
+	for i, p := range params {
+		if key, _, ok := strings.Cut(p, "="); ok && strings.EqualFold(key, "auth") {
+			params[i] = key + "=REDACTED"
+		}
+	}
+	return path + "?" + strings.Join(params, "&")
+}
+
+func orDash(s string) string {
 	if s == "" {
 		return "-"
 	}
-	return strings.NewReplacer(`"`, `\x22`, `\`, `\x5C`, "\n", `\x0A`).Replace(s)
+	return s
 }

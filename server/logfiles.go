@@ -29,6 +29,9 @@ func logPaths(conf *config.Config) []string {
 		for _, l := range site.AccessLogs {
 			paths = append(paths, l.File)
 		}
+		if site.Bans != nil {
+			paths = append(paths, site.Bans.File)
+		}
 	}
 	if conf.Bans != nil {
 		paths = append(paths, conf.Bans.File)

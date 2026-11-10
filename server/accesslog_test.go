@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,4 +136,61 @@ sites:
 	require.Contains(t, string(g), "GET /name?b.com ")
 	require.Contains(t, string(g), "GET /name?c.com HTTP/1.1\" 404")
 	require.NotContains(t, string(g), "a.com ")
+}
+
+func TestAccessLog_StreamOutlivesLogRename(t *testing.T) {
+	// A stream that ends after a reload moved the access log is logged to the new file
+	app1 := newTestUpstream(t, "app1")
+	dir := t.TempDir()
+	first, second := filepath.Join(dir, "first.log"), filepath.Join(dir, "second.log")
+	s, filename := newTestServer(t, "access-logs: [{file: "+first+"}]", app1)
+	_, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/stream")
+	writeConfig(t, filename, "access-logs: [{file: "+second+"}]", app1)
+	requireReload(t, s)
+	closeStream()
+	waitFor(t, func() bool {
+		b, _ := os.ReadFile(second)
+		return strings.Contains(string(b), "GET /stream ")
+	})
+}
+
+func TestAccessLog_FieldsCannotForgeALine(t *testing.T) {
+	// HTTP/2 lets a client put spaces and quotes into the method and :authority; like nginx, every
+	// field escapes quotes, backslashes and non-printable bytes, and the unquoted ones also spaces,
+	// so a line always parses into the same fields (CrowdSec reads them)
+	r := httptest.NewRequest("GET", "/x", nil)
+	r.Method = `GET /x HTTP/2.0" 200 1 "-" "curl" http_host=ntfy.sh #`
+	r.Host = `a b site=evil`
+	r.Header.Set("User-Agent", "ua\twith\x1b[31mcolor\x7f and \xff")
+	r.Header.Set("Referer", `ref"\`)
+	r.Proto = `HTTP/2.0 "x"`
+	e := newAccessLogEntry(r, time.Now())
+	require.Equal(t, `GET\x20/x\x20HTTP/2.0\x22\x20200\x201\x20\x22-\x22\x20\x22curl\x22\x20http_host=ntfy.sh\x20# /x HTTP/2.0\x20\x22x\x22`, e.request)
+	require.Equal(t, `a\x20b\x20site=evil`, e.host)
+	require.Equal(t, `ua\x09with\x1B[31mcolor\x7F and \xFF`, e.userAgent)
+	require.Equal(t, `ref\x22\x5C`, e.referer)
+}
+
+func TestAccessLog_AuthQueryRedacted(t *testing.T) {
+	// The web app sends credentials as ?auth=; they must not end up in the access log
+	for target, want := range map[string]string{
+		"/mytopic/ws?auth=QmFzaWMgZm9v":           "/mytopic/ws?auth=REDACTED",
+		"/mytopic/json?poll=1&auth=abc&since=all": "/mytopic/json?poll=1&auth=REDACTED&since=all",
+		"/mytopic/json?Auth=abc":                  "/mytopic/json?Auth=REDACTED",
+		"/mytopic/json?author=me":                 "/mytopic/json?author=me",
+		"/auth=x/json":                            "/auth=x/json",
+	} {
+		e := newAccessLogEntry(httptest.NewRequest("GET", target, nil), time.Now())
+		require.Equal(t, "GET "+want+" HTTP/1.1", e.request, target)
+	}
+}
+
+func TestAccessLog_LongFieldsTruncated(t *testing.T) {
+	// Fields are capped, so one request cannot write a 64 KiB line
+	r := httptest.NewRequest("GET", "/"+strings.Repeat("a", 20000), nil)
+	r.Header.Set("User-Agent", strings.Repeat("b", 20000))
+	e := newAccessLogEntry(r, time.Now())
+	require.LessOrEqual(t, len(e.request), len("GET ")+maxLogField+len("...")+len(" HTTP/1.1"))
+	require.True(t, strings.HasSuffix(e.userAgent, "..."))
+	require.LessOrEqual(t, len(e.userAgent), maxLogField+len("..."))
 }

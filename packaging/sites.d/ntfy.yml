@@ -6,9 +6,11 @@ sites:
     listen-https: ":443"
     hosts: [ntfy.sh, "*.ntfy.sh"] # Leave out to take every host no other site on these listeners serves
 
-    # Own access logs for this site, instead of the global ones (optional)
+    # Own access logs and bans settings for this site, instead of the global ones (optional;
+    # usually the global ones are all there is)
     # access-logs:
     #   - file: /var/log/ntlb/ntfy.log
+    # bans: {file: /var/log/ntlb/ntfy-ban.log, window: 10m, threshold: 100}
 
     # The certificate is re-read on reload, so a certbot deploy hook can just run "systemctl reload ntlb"
     cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
@@ -42,17 +44,22 @@ sites:
 
     # Rules of this site, checked after the global rules (see config.yml), and named "ntfy/<name>"
     rules:
-      # Web pages to HTTPS, the docs to docs.ntfy.sh, and the website
-      - name: https-redirect
-        match: scheme == "http" && method == "GET" && path matches "^/($|[-_a-z0-9]{0,64}$|docs/|static/|_next|_site)"
-        action: redirect
-        location: '"https://" + host + uri'
+      # The docs to docs.ntfy.sh (first, like nginx's "location /docs"), web pages to HTTPS, and
+      # the website on HTTPS: GET / and its assets
       - name: docs-redirect
         match: path == "/docs" || path startsWith "/docs/"
         action: redirect
-        location: '"https://docs.ntfy.sh/" + trimPrefix(path, "/docs/")'
+        location: '"https://docs.ntfy.sh/" + (path == "/docs" ? "" : trimPrefix(path, "/docs/"))'
+      - name: https-redirect
+        match: scheme == "http" && method == "GET" && uri matches "^/($|[-_a-z0-9]{0,64}$|docs/|static/|_next|_site)"
+        action: redirect
+        location: '"https://" + host + uri'
+      - name: website-assets
+        match: scheme == "https" && path matches "/(_site|_next)"
+        action: static
+        root: /var/www/website/html # No fallback: a missing asset is a 404
       - name: website
-        match: method == "GET" && (path == "/" || path matches "^/(_site|_next)/")
+        match: scheme == "https" && method == "GET" && path == "/"
         action: static
         root: /var/www/website/html
         fallback: /index.html

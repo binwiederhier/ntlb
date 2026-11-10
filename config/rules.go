@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -34,8 +33,7 @@ const (
 )
 
 var (
-	ruleNameRegex = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`)
-	ratePeriods   = map[string]float64{"s": 1, "m": 60, "h": 3600}
+	ratePeriods = map[string]float64{"s": 1, "m": 60, "h": 3600}
 )
 
 // Rule is one rule. Request rules are checked in order before a request is proxied: the first
@@ -82,13 +80,14 @@ func applyRuleDefaults(rules []*Rule) {
 	}
 }
 
-// validateRules checks and compiles rules; site is "" for the global rules
-func validateRules(rules []*Rule, site string, bans *Bans) error {
+// validateRules checks and compiles rules; site is "" for the global rules. Strikes need a bans
+// section that counts them.
+func validateRules(rules []*Rule, site string, canStrike bool) error {
 	names := make(map[string]bool)
 	for i, r := range rules {
 		if r == nil {
 			return fmt.Errorf("rules[%d] is empty", i)
-		} else if !ruleNameRegex.MatchString(r.Name) {
+		} else if !nameRegex.MatchString(r.Name) {
 			return fmt.Errorf("invalid rule name %q", r.Name)
 		} else if names[r.Name] {
 			return fmt.Errorf("duplicate rule name %q", r.Name)
@@ -100,7 +99,7 @@ func validateRules(rules []*Rule, site string, bans *Bans) error {
 		}
 		if err := r.compile(); err != nil {
 			return fmt.Errorf("rule %s: %w", r.ID, err)
-		} else if r.Strike > 0 && bans == nil {
+		} else if r.Strike > 0 && !canStrike {
 			return fmt.Errorf("rule %s: strike needs a bans section", r.ID)
 		}
 	}

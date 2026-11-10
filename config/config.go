@@ -45,7 +45,7 @@ const (
 )
 
 var (
-	upstreamNameRegex = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`)
+	nameRegex = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`) // Names of sites, upstreams and rules
 )
 
 // Config is the ntlb config file. Field names follow ntfy's server.yml (kebab-case).
@@ -139,31 +139,6 @@ func Parse(b []byte) (*Config, error) {
 	return parse(b, ".")
 }
 
-func parse(b []byte, dir string) (*Config, error) {
-	c := &Config{}
-	if err := decode(b, c); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
-	}
-	if err := c.loadIncludes(dir); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
-	}
-	c.applyDefaults()
-	if err := c.validate(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
-	}
-	return c, nil
-}
-
-// decode decodes YAML strictly; an empty document leaves v as it is
-func decode(b []byte, v any) error {
-	dec := yaml.NewDecoder(bytes.NewReader(b))
-	dec.KnownFields(true)
-	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
-		return err
-	}
-	return nil
-}
-
 // RestartRequired returns the settings that differ between c and other but that a reload cannot
 // apply: the admin and metrics listeners, and the keepalives of the sites' listeners. (A reload
 // binds and closes the sites' listen addresses.)
@@ -192,6 +167,31 @@ func (k *Keepalive) KeepAliveConfig() net.KeepAliveConfig {
 		Interval: k.Interval,
 		Count:    k.Count,
 	}
+}
+
+func parse(b []byte, dir string) (*Config, error) {
+	c := &Config{}
+	if err := decode(b, c); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	if err := c.loadIncludes(dir); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	c.applyDefaults()
+	if err := c.validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	return c, nil
+}
+
+// decode decodes YAML strictly; an empty document leaves v as it is
+func decode(b []byte, v any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 func (c *Config) applyDefaults() {
@@ -227,9 +227,7 @@ func (c *Config) applyDefaults() {
 	if c.ClientKey.IPv6PrefixBits == 0 {
 		c.ClientKey.IPv6PrefixBits = DefaultClientKeyIPv6PrefixBits
 	}
-	if c.Bans != nil && c.Bans.Window == 0 {
-		c.Bans.Window = DefaultBansWindow
-	}
+	c.Bans.applyDefaults()
 	applyRuleDefaults(c.Rules)
 	for _, site := range c.Sites {
 		if site != nil {
@@ -261,10 +259,10 @@ func (c *Config) validate() error {
 	if err := validateAccessLogs(c.AccessLogs); err != nil {
 		return err
 	}
-	if err := c.validateBans(); err != nil {
+	if err := validateBans(c.Bans); err != nil {
 		return err
 	}
-	if err := validateRules(c.Rules, "", c.Bans); err != nil {
+	if err := validateRules(c.Rules, "", c.anyBans()); err != nil {
 		return err
 	}
 	return c.validateSites()
@@ -286,14 +284,34 @@ func validateAccessLogs(logs []*AccessLog) error {
 	return nil
 }
 
-func (c *Config) validateBans() error {
-	if c.Bans == nil {
+func (b *Bans) applyDefaults() {
+	if b != nil && b.Window == 0 {
+		b.Window = DefaultBansWindow
+	}
+}
+
+// anyBans reports whether there is a bans section at all, globally or in a site: the global
+// rules' strikes count for the requests of the sites that have one
+func (c *Config) anyBans() bool {
+	if c.Bans != nil {
+		return true
+	}
+	for _, site := range c.Sites {
+		if site != nil && site.Bans != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func validateBans(b *Bans) error {
+	if b == nil {
 		return nil
-	} else if c.Bans.File == "" {
+	} else if b.File == "" {
 		return errors.New("bans.file is required")
-	} else if c.Bans.Threshold <= 0 {
+	} else if b.Threshold <= 0 {
 		return errors.New("bans.threshold must be positive")
-	} else if c.Bans.Window <= 0 {
+	} else if b.Window <= 0 {
 		return errors.New("bans.window must be positive")
 	}
 	return nil
@@ -312,9 +330,8 @@ func expandAddresses(addresses []string) ([]string, error) {
 		if !isRange {
 			to = from
 		}
-		first, err1 := strconv.Atoi(from)
-		last, err2 := strconv.Atoi(to)
-		if err1 != nil || err2 != nil || first < 1 || last > 65535 || last < first || last-first >= maxPortRange {
+		first, last, err := parsePortRange(from, to)
+		if err != nil {
 			return nil, fmt.Errorf("invalid address %q, expected host:port or host:from-to", addr)
 		}
 		for p := first; p <= last; p++ {
@@ -330,6 +347,21 @@ func expandAddresses(addresses []string) ([]string, error) {
 		}
 	}
 	return expanded, nil
+}
+
+// parsePortRange parses the first and last port of a range, at most maxPortRange ports
+func parsePortRange(from, to string) (int, int, error) {
+	first, err := strconv.Atoi(from)
+	if err != nil {
+		return 0, 0, err
+	}
+	last, err := strconv.Atoi(to)
+	if err != nil {
+		return 0, 0, err
+	} else if first < 1 || last > 65535 || last < first || last-first >= maxPortRange {
+		return 0, 0, errors.New("invalid port range")
+	}
+	return first, last, nil
 }
 
 func (k *Keepalive) applyDefaults() {

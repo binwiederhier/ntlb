@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,12 +15,14 @@ import (
 )
 
 // noRedirects is a client that shows redirects instead of following them
-var noRedirects = &http.Client{
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-	Timeout: 3 * time.Second,
-}
+var (
+	noRedirects = &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 3 * time.Second,
+	}
+)
 
 // notFound makes /missing on an upstream answer 404
 func notFound(u *testUpstream) {
@@ -236,6 +239,29 @@ rules:
 	require.Contains(t, metrics, "ntlb_bans_total 2")
 }
 
+func TestServer_SiteBans(t *testing.T) {
+	// A site's own ban file gets the bans of its requests; a reload opens it like any log file
+	app1 := newTestUpstream(t, "app1")
+	dir := t.TempDir()
+	globalLog, siteLog := filepath.Join(dir, "ban.log"), filepath.Join(dir, "s-ban.log")
+	filename := filepath.Join(dir, "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
+listen-admin: '127.0.0.1:0'
+bans: {file: %s, threshold: 100}
+rules: [{name: abuse, match: 'path startsWith "/nz_"', action: block, strike: 101}]
+sites:
+  - {name: s, listen-http: '127.0.0.1:0', bans: {file: %s, threshold: 1}, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+`, globalLog, siteLog, app1.addr())), 0600))
+	s := startTestServer(t, filename)
+	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/nz_x")
+	waitFor(t, func() bool {
+		data, _ := os.ReadFile(siteLog)
+		return strings.Contains(string(data), " 127.0.0.1 127.0.0.1/32 abuse\n")
+	})
+	data, _ := os.ReadFile(globalLog)
+	require.Empty(t, string(data))
+}
+
 func TestServer_AccessLogsByStatus(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	notFound(app1)
@@ -289,4 +315,50 @@ func TestServer_NewFailsOnBanFile(t *testing.T) {
 	writeConfig(t, filename, "bans: {file: /nonexistent/dir/ban.log, threshold: 1}", app1)
 	_, err := New(filename)
 	require.Error(t, err)
+}
+
+func TestServer_RuleStaticStaysInRoot(t *testing.T) {
+	// A symlink in the root that points out of it is not followed; one inside it is
+	app1 := newTestUpstream(t, "app1")
+	dir := t.TempDir()
+	root := filepath.Join(dir, "html")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "sub"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "sub", "inside.txt"), []byte("inside"), 0644))
+	require.NoError(t, os.Symlink(filepath.Join(dir, "secret.txt"), filepath.Join(root, "escape.txt")))
+	require.NoError(t, os.Symlink(filepath.Join(dir), filepath.Join(root, "up")))
+	require.NoError(t, os.Symlink("sub/inside.txt", filepath.Join(root, "link.txt")))
+	s, _ := newTestServer(t, "rules: [{name: website, match: 'path != \"/v1/health\"', action: static, root: "+root+"}]", app1)
+	for path, want := range map[string]int{
+		"/escape.txt":     http.StatusNotFound,
+		"/up/secret.txt":  http.StatusNotFound,
+		"/link.txt":       http.StatusOK,
+		"/sub/inside.txt": http.StatusOK,
+	} {
+		status, body := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+path)
+		require.Equal(t, want, status, path)
+		require.NotContains(t, body, "secret", path)
+	}
+}
+
+func TestServer_RuleStaticOnlyCleanPaths(t *testing.T) {
+	// A rule matches the path as sent, so a path with dot segments could reach files outside what
+	// the rule meant to serve; those and dotfiles are a 404
+	app1 := newTestUpstream(t, "app1")
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "s"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".env"), []byte("secret"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "private.txt"), []byte("secret"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "s", "ok.txt"), []byte("ok"), 0644))
+	s, _ := newTestServer(t, "rules: [{name: site, match: 'path startsWith \"/s\"', action: static, root: "+root+"}]", app1)
+	conn := func(target string) int {
+		resp := rawRoundTrip(t, s.HTTPAddr(), "GET "+target+" HTTP/1.1\r\nHost: a\r\n\r\n")
+		return resp.StatusCode
+	}
+	require.Equal(t, http.StatusOK, conn("/s/ok.txt"))
+	require.Equal(t, http.StatusNotFound, conn("/s/../private.txt"))
+	require.Equal(t, http.StatusNotFound, conn("/s/../.env"))
+	require.Equal(t, http.StatusNotFound, conn("/s/./ok.txt"))
+	require.Equal(t, http.StatusNotFound, conn("/s//ok.txt"))
+	require.Equal(t, http.StatusNotFound, conn("/s/.hidden"))
 }

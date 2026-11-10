@@ -17,7 +17,11 @@ func newStatusCommand() *cli.Command {
 		Name:  "status",
 		Usage: "Show the load balancer's and the upstreams' status",
 		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: flagJSON, Aliases: []string{"j"}, Usage: "print the raw JSON"},
+			&cli.BoolFlag{
+				Name:    flagJSON,
+				Aliases: []string{"j"},
+				Usage:   "print the raw JSON",
+			},
 		},
 		Action: execStatus,
 	}

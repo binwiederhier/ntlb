@@ -209,8 +209,24 @@ rejects the reload.
 
 Rules have an ID: the name for global rules, `site/name` for a site's, used for limit buckets,
 access logs (`rule=`), metrics and ban lines. `site` is an expression field (request and
-response), so global rules and access logs can tell sites apart. A site's `access-logs`, if any,
-replace the global ones for its requests (`Config.AccessLogsFor`).
+response), so global rules and access logs can tell sites apart. A site's `access-logs` and `bans`, if
+any, replace the global ones for its requests (`Config.AccessLogsFor`, `Config.BansFor`): a site
+with its own bans settings counts its requests' strikes (global rules' included) in its own
+buckets and writes to its own file. Usually there is only the global section.
+
+## Requests Go rejects (`server/conns.go`)
+
+Go answers malformed and oversized requests (and ends ones cut off while their headers arrive)
+before any handler runs, so they would leave no trace, while nginx logged them as 400s and
+CrowdSec banned on that (floods of header-too-large loops and garbage request lines on ntfy.sh).
+A `connTracker` per public listener follows each connection through `ConnState`: Go turns a
+connection active once it read a byte of a request, also one it then rejects, and the handler
+marks the connection's `connInfo` (from `ConnContext`) as handled. A connection that closes while
+active and unhandled had its request rejected: `badRequest` writes an access log line (request
+`"-"`, status 400, no site, no upstream), runs the response rules, and counts
+`ntlb_requests_total{kind="bad_request"}`. HTTP/2 connections are skipped (one without a
+request is normal: browsers open them ahead of time). The status is always 400; Go may have sent
+431 or nothing (timeout).
 
 ## Rules and bans (`rules/`, `match/`, `config/rules.go`, `server/rules.go`)
 
@@ -250,7 +266,9 @@ line, `<RFC 3339 time> <ip> <prefix> <rule>`, at most once per window per client
 CrowdSec reads only that (a trigger scenario, like ntfy's ban feed) and does the banning, the
 sharing across load balancers and the escalation. Strikes are counted per load balancer.
 
-Limit buckets and strike buckets are swept inline (at most once a minute, in the request that
+Limit buckets and strike buckets are capped at `maxTracked` (1M) clients each: over it, a sweep
+runs, and if that frees nothing a new client goes untracked (allowed, no strikes), so spraying keys
+(IPv6 /64s from a /48) costs no unbounded memory. Limit buckets and strike buckets are swept inline (at most once a minute, in the request that
 notices), so there is no goroutine. On `Update`, a limit rule with the same ID, rate and burst
 keeps its buckets, and the strikes stay if the bans settings and the client key are unchanged, so
 a reload for an unrelated change resets nobody.
@@ -380,6 +398,42 @@ The 32 KB `io.Copy` buffers of WebSocket streams are ~70 MB of it.
 
 Cheap wins, not done yet: skip the `drainTick` scan when nothing drains, pool or shrink the
 WebSocket copy buffers, and set `GOMEMLIMIT` (less memory for more GC CPU).
+
+## Full nginx config comparison (2026-11-10)
+
+The production nginx config (`roles/nginx/templates/nginx.conf.j2`, rendered with `nginx_lb`,
+static upstreams) against its translation to ntlb rules (abuse maps, `limit_req` with exemptions,
+the website, the docs and HTTPS redirects, the CrowdSec log partitions, the ban feed), same VM,
+same load: 40k streams (h2, h1+TLS, h1, WebSocket, SSE), 150 publishes/s, 430 polls/s, 30 noise/s,
+35 minutes each.
+
+| | ntlb | nginx |
+|---|---|---|
+| Published / lost | 292,745 / 0 | 292,402 / 0 |
+| Polls / errors | 902,806 / 0 | 902,942 / 0 |
+| CPU | 0.72 cores | 0.35 cores |
+| Memory at 40k streams (PSS) | 2.11 GB | 2.15 GB |
+| Delivery latency p50 / max p99 | 1.1 / 8.9 ms | 1.2 / 5.4 ms |
+
+The rules cost nothing measurable (0.75 cores without them on 2026-11-05).
+
+A replay of 67 request shapes (from the ntfy.sh access logs, aggregated on the host, and the
+clients' code: polls with every `since=` form, multi-topic polls, streams per protocol, WebSockets,
+publishes incl. chunked and `Expect: 100-continue`, UnifiedPush, Matrix, account and web push
+calls, CORS, HEAD, the website and redirects, the abuse rules, the garbage of nginx's
+`access_error_400.log`, oversized and slow requests) against both: 60 the same. The differences:
+nginx rejects a header line over 8 KiB (400) and a request line over 8 KiB (414), ntlb takes up to
+64 KiB of headers (431 above); nginx rejects HTTP/1.0 without Host, ntlb proxies it; slowloris
+headers are cut after 30s (nginx: 60s). The replay found two ntlb bugs, both fixed: raw quotes in
+a query were refused, and a stalled body was only cut after 3m (now 60s, like
+`client_body_timeout`). A first nginx run failed on a lab mistake: one node's two ports listed as
+two upstream servers sent half the clients to it, over ntfy's global topic limit (429s).
+
+## Lab tools
+
+`lab/replay` sends the same request shapes to two load balancers and compares the answers (run
+it on the lab LB VM: `go build ./lab/replay`). [docs/client-patterns.md](client-patterns.md) is
+the catalog of what the ntfy clients send, with references into their code.
 
 ## Testing
 

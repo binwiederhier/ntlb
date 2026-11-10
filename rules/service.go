@@ -18,12 +18,20 @@ import (
 )
 
 // sweepInterval is how often a limiter forgets the buckets that refilled
-const sweepInterval = time.Minute
+const (
+	sweepInterval = time.Minute
+)
+
+var (
+	// maxTracked caps the clients one limit or one bans section tracks, against key spraying (a
+	// variable for the tests)
+	maxTracked = 1_000_000
+)
 
 // Engine checks requests against the current rules
 type Engine struct {
 	state atomic.Pointer[state]
-	onBan func(line string)
+	onBan func(file, line string)
 	now   func() time.Time
 }
 
@@ -31,7 +39,8 @@ type Engine struct {
 type state struct {
 	rules          []*rule            // Global rules
 	sites          map[string][]*rule // Rules by site
-	bans           *bans
+	bans           *bans              // Global, nil if none
+	siteBans       map[string]*bans   // Of the sites with their own bans settings
 	ipv4PrefixBits int
 	ipv6PrefixBits int
 }
@@ -55,8 +64,9 @@ type bucket struct {
 	last   time.Time
 }
 
-// New creates an engine with the config's rules; onBan gets the ban lines (may be nil without bans)
-func New(conf *config.Config, onBan func(line string)) *Engine {
+// New creates an engine with the config's rules; onBan gets the ban lines and the file they go to
+// (may be nil without bans)
+func New(conf *config.Config, onBan func(file, line string)) *Engine {
 	e := &Engine{
 		now:   time.Now,
 		onBan: onBan,
@@ -69,6 +79,9 @@ func New(conf *config.Config, onBan func(line string)) *Engine {
 // client key (the hash prefix bits) are unchanged, so a reload does not reset clients' limits.
 func (e *Engine) Update(conf *config.Config) {
 	old := e.state.Load()
+	if old == nil {
+		old = &state{} // First update: nothing to carry over
+	}
 	next := &state{
 		sites:          make(map[string][]*rule),
 		ipv4PrefixBits: conf.ClientKey.IPv4PrefixBits,
@@ -78,11 +91,11 @@ func (e *Engine) Update(conf *config.Config) {
 	for _, site := range conf.Sites {
 		next.sites[site.Name] = old.newRules(next, site.Rules)
 	}
-	if conf.Bans != nil {
-		if old != nil && old.bans != nil && old.bans.sameAs(conf.Bans, conf.ClientKey) {
-			next.bans = old.bans
-		} else {
-			next.bans = newBans(conf.Bans, conf.ClientKey)
+	next.bans = old.reusableBans("", conf.Bans, conf.ClientKey)
+	next.siteBans = make(map[string]*bans)
+	for _, site := range conf.Sites {
+		if site.Bans != nil {
+			next.siteBans[site.Name] = old.reusableBans(site.Name, site.Bans, conf.ClientKey)
 		}
 	}
 	e.state.Store(next)
@@ -101,7 +114,7 @@ func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 		case config.ActionAllow:
 			return nil
 		case config.ActionBlock:
-			e.strike(s, remoteAddr(r), rl.conf)
+			e.strike(s.bansFor(env.Site), remoteAddr(r), rl.conf)
 			return rl.conf
 		case config.ActionRedirect, config.ActionStatic:
 			return rl.conf
@@ -110,12 +123,57 @@ func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 				key = string(balancer.ClientKey(remoteAddr(r), s.ipv4PrefixBits, s.ipv6PrefixBits))
 			}
 			if !rl.limiter.take(key, e.now()) {
-				e.strike(s, remoteAddr(r), rl.conf)
+				e.strike(s.bansFor(env.Site), remoteAddr(r), rl.conf)
 				return rl.conf
 			}
 		}
 	}
 	return nil
+}
+
+// CheckResponse adds the strikes of the response rules that match a request that ended
+func (e *Engine) CheckResponse(env *match.ResponseEnv) {
+	s := e.state.Load()
+	b := s.bansFor(env.Site)
+	if b == nil {
+		return
+	}
+	var addr netip.Addr
+	for rl := range s.rulesFor(env.Site) {
+		if rl.conf.On != config.OnResponse || (rl.conf.Program != nil && !rl.conf.Program.Match(env)) {
+			continue
+		}
+		if !addr.IsValid() {
+			addr, _ = netip.ParseAddr(env.IP)
+		}
+		e.strike(b, addr, rl.conf)
+	}
+}
+
+// reusableBans returns the old strike counts of a scope (a site, or "" for the global ones) if its
+// settings are unchanged, else new ones; nil without settings
+func (s *state) reusableBans(site string, conf *config.Bans, key *config.ClientKey) *bans {
+	if conf == nil {
+		return nil
+	}
+	var old *bans
+	if site == "" {
+		old = s.bans
+	} else {
+		old = s.siteBans[site]
+	}
+	if old != nil && old.sameAs(conf, key) {
+		return old
+	}
+	return newBans(conf, key)
+}
+
+// bansFor returns the strike counts for a site's requests: its own, else the global ones
+func (s *state) bansFor(site string) *bans {
+	if b, ok := s.siteBans[site]; ok {
+		return b
+	}
+	return s.bans
 }
 
 // rulesFor returns the global rules followed by the site's
@@ -158,7 +216,7 @@ func (s *state) newRules(next *state, confs []*config.Rule) []*rule {
 
 // reusableLimiter returns the old limiter of the rule (by ID) if it can carry over into next
 func (s *state) reusableLimiter(next *state, c *config.Rule) *limiter {
-	if s == nil || s.ipv4PrefixBits != next.ipv4PrefixBits || s.ipv6PrefixBits != next.ipv6PrefixBits {
+	if s.ipv4PrefixBits != next.ipv4PrefixBits || s.ipv6PrefixBits != next.ipv6PrefixBits {
 		return nil
 	}
 	for r := range s.all() {
@@ -195,6 +253,12 @@ func (l *limiter) take(key string, now time.Time) bool {
 		l.sweepNoLock(now)
 	}
 	b, ok := l.buckets[key]
+	if !ok && len(l.buckets) >= maxTracked {
+		l.sweepNoLock(now)
+		if len(l.buckets) >= maxTracked {
+			return true // Untracked: a spray of keys must not grow the map without bound
+		}
+	}
 	if !ok {
 		b = &bucket{
 			tokens: l.capacity,
@@ -235,30 +299,12 @@ func remoteAddr(r *http.Request) netip.Addr {
 	return ap.Addr().Unmap()
 }
 
-// CheckResponse adds the strikes of the response rules that match a request that ended
-func (e *Engine) CheckResponse(env *match.ResponseEnv) {
-	s := e.state.Load()
-	if s.bans == nil {
+// strike adds a rule's strikes for a client to b, and hands the ban line on if that reports it
+func (e *Engine) strike(b *bans, addr netip.Addr, rule *config.Rule) {
+	if b == nil || rule.Strike == 0 {
 		return
 	}
-	var addr netip.Addr
-	for rl := range s.rulesFor(env.Site) {
-		if rl.conf.On != config.OnResponse || (rl.conf.Program != nil && !rl.conf.Program.Match(env)) {
-			continue
-		}
-		if !addr.IsValid() {
-			addr, _ = netip.ParseAddr(env.IP)
-		}
-		e.strike(s, addr, rl.conf)
-	}
-}
-
-// strike adds a rule's strikes for a client, and hands the ban line on if that reports it
-func (e *Engine) strike(s *state, addr netip.Addr, rule *config.Rule) {
-	if s.bans == nil || rule.Strike == 0 {
-		return
-	}
-	if line, ok := s.bans.strike(addr, rule.Strike, rule.ID, e.now()); ok && e.onBan != nil {
-		e.onBan(line)
+	if line, ok := b.strike(addr, rule.Strike, rule.ID, e.now()); ok && e.onBan != nil {
+		e.onBan(b.conf.File, line)
 	}
 }
