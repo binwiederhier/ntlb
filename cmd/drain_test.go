@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/balancer"
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/config"
 )
 
 func TestDrainUndrain(t *testing.T) {
@@ -53,7 +53,7 @@ func TestReload(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'"), 0600))
 	_, err = run(t, s, "reload")
-	require.ErrorContains(t, err, "at least one upstream")
+	require.ErrorContains(t, err, "at least one site")
 	require.NoError(t, os.WriteFile(filename, good, 0600))
 	out, err := run(t, s, "reload")
 	require.NoError(t, err)
@@ -70,9 +70,9 @@ func TestReload(t *testing.T) {
 func TestCheckConfig(t *testing.T) {
 	_, filename := newTestServer(t, "app1")
 	app := New()
-	require.NoError(t, app.Run(context.Background(), []string{"ntfy-lb", "check-config", "--config", filename}))
+	require.NoError(t, app.Run(context.Background(), []string{"ntlb", "check-config", "--config", filename}))
 	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'"), 0600))
-	require.ErrorContains(t, app.Run(context.Background(), []string{"ntfy-lb", "check-config", "--config", filename}), "at least one upstream")
+	require.ErrorContains(t, app.Run(context.Background(), []string{"ntlb", "check-config", "--config", filename}), "at least one site")
 }
 
 func TestDrain_Duration(t *testing.T) {

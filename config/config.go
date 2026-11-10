@@ -1,4 +1,4 @@
-// Package config loads and validates the ntfy-lb YAML config file.
+// Package config loads and validates the ntlb YAML config file.
 package config
 
 import (
@@ -8,18 +8,19 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/match"
 )
 
 // Defaults, mostly mirroring the nginx + lbagent setup on ntfy.sh
 const (
-	DefaultFile                    = "/etc/ntfy-lb/config.yml"
+	DefaultFile                    = "/etc/ntlb/config.yml"
 	DefaultListenAdmin             = "127.0.0.1:2590"
 	DefaultUpstreamConnectTimeout  = 5 * time.Second // Private network: a node that does not accept within 5s is down
 	DefaultUpstreamReadTimeout     = 3 * time.Minute // ntfy sends a keepalive every 45s, so 3m of silence is a dead stream
@@ -47,12 +48,10 @@ var (
 	upstreamNameRegex = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`)
 )
 
-// Config is the ntfy-lb config file. Field names follow ntfy's server.yml (kebab-case).
+// Config is the ntlb config file. Field names follow ntfy's server.yml (kebab-case).
 type Config struct {
 	ListenHTTP             string        `yaml:"listen-http"`
 	ListenHTTPS            string        `yaml:"listen-https"`
-	CertFile               string        `yaml:"cert-file"`
-	KeyFile                string        `yaml:"key-file"`
 	ListenAdmin            string        `yaml:"listen-admin"`   // Admin API, status, metrics, pprof; no auth
 	ListenMetrics          string        `yaml:"listen-metrics"` // Only /metrics, e.g. for Prometheus on a private network
 	AccessLogs             []*AccessLog  `yaml:"access-logs"`
@@ -62,12 +61,13 @@ type Config struct {
 	UpstreamReadTimeout    time.Duration `yaml:"upstream-read-timeout"`
 	DrainDuration          time.Duration `yaml:"drain-duration"`
 	ShutdownDrainDuration  time.Duration `yaml:"shutdown-drain-duration"`
-	HealthCheck            *HealthCheck  `yaml:"health-check"`
-	Streams                *Streams      `yaml:"streams"`
 	ClientKey              *ClientKey    `yaml:"client-key"`
-	Upstreams              []*Upstream   `yaml:"upstreams"`
 	Bans                   *Bans         `yaml:"bans"`
-	Rules                  []*Rule       `yaml:"rules"`
+	Rules                  []*Rule       `yaml:"rules"`   // Checked for every request, before its site's rules
+	Include                []string      `yaml:"include"` // Globs of site files, relative to the config file's directory
+	Sites                  []*Site       `yaml:"sites"`
+
+	sites *siteIndex // Sites by host, see SiteFor
 }
 
 // AccessLog is one access log file. A request is logged to the first file whose match (a response
@@ -126,22 +126,27 @@ type Upstream struct {
 	Addresses []string `yaml:"addresses"`
 }
 
-// Load reads, defaults and validates a config file
+// Load reads, defaults and validates a config file and the site files it includes
 func Load(filename string) (*Config, error) {
 	b, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
-	return Parse(b)
+	return parse(b, filepath.Dir(filename))
 }
 
 // Parse defaults and validates a config from YAML. Unknown fields are rejected, so that a typo
-// does not silently fall back to a default.
+// does not silently fall back to a default. Includes are relative to the working directory.
 func Parse(b []byte) (*Config, error) {
+	return parse(b, ".")
+}
+
+func parse(b []byte, dir string) (*Config, error) {
 	c := &Config{}
-	dec := yaml.NewDecoder(bytes.NewReader(b))
-	dec.KnownFields(true)
-	if err := dec.Decode(c); err != nil && !errors.Is(err, io.EOF) { // EOF: empty file
+	if err := decode(b, c); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	if err := c.loadIncludes(dir); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	c.applyDefaults()
@@ -149,6 +154,16 @@ func Parse(b []byte) (*Config, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	return c, nil
+}
+
+// decode decodes YAML strictly; an empty document leaves v as it is
+func decode(b []byte, v any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 // RestartRequired returns the settings that differ between c and other but that a reload cannot
@@ -210,18 +225,8 @@ func (c *Config) applyDefaults() {
 	}
 	c.ClientKeepalive.applyDefaults()
 	c.UpstreamKeepalive.applyDefaults()
-	if c.HealthCheck == nil {
-		c.HealthCheck = &HealthCheck{}
-	}
-	c.HealthCheck.applyDefaults()
-	if c.Streams == nil {
-		c.Streams = &Streams{}
-	}
 	if c.ClientKey == nil {
 		c.ClientKey = &ClientKey{}
-	}
-	if c.Streams.Match == "" {
-		c.Streams.Match = DefaultStreamsMatch
 	}
 	if c.ClientKey.IPv4PrefixBits == 0 {
 		c.ClientKey.IPv4PrefixBits = DefaultClientKeyIPv4PrefixBits
@@ -232,23 +237,22 @@ func (c *Config) applyDefaults() {
 	if c.Bans != nil && c.Bans.Window == 0 {
 		c.Bans.Window = DefaultBansWindow
 	}
-	c.applyRuleDefaults()
+	applyRuleDefaults(c.Rules)
+	for _, site := range c.Sites {
+		if site != nil {
+			site.applyDefaults()
+		}
+	}
 }
 
 func (c *Config) validate() error {
 	if c.ListenHTTP == "" && c.ListenHTTPS == "" {
 		return errors.New("listen-http or listen-https must be set")
 	}
-	if c.ListenHTTPS != "" && (c.CertFile == "" || c.KeyFile == "") {
-		return errors.New("listen-https requires cert-file and key-file")
-	}
 	if c.UpstreamConnectTimeout <= 0 {
 		return errors.New("upstream-connect-timeout must be positive")
 	} else if c.UpstreamReadTimeout <= 0 {
 		return errors.New("upstream-read-timeout must be positive")
-	}
-	if err := c.HealthCheck.validate(); err != nil {
-		return err
 	}
 	if err := c.ClientKeepalive.validate("client-keepalive"); err != nil {
 		return err
@@ -257,10 +261,6 @@ func (c *Config) validate() error {
 	}
 	if c.DrainDuration < 0 || c.ShutdownDrainDuration < 0 {
 		return errors.New("drain durations must not be negative")
-	}
-	var err error
-	if c.Streams.Program, err = match.Compile(c.Streams.Match, match.Request); err != nil {
-		return fmt.Errorf("invalid streams.match: %w", err)
 	}
 	if c.ClientKey.IPv4PrefixBits < 1 || c.ClientKey.IPv4PrefixBits > 32 {
 		return errors.New("client-key.ipv4-prefix-bits must be between 1 and 32")
@@ -274,28 +274,10 @@ func (c *Config) validate() error {
 	if err := c.validateBans(); err != nil {
 		return err
 	}
-	if len(c.Upstreams) == 0 {
-		return errors.New("at least one upstream is required")
+	if err := validateRules(c.Rules, "", c.Bans); err != nil {
+		return err
 	}
-	names := make(map[string]bool)
-	for i, u := range c.Upstreams {
-		if u == nil {
-			return fmt.Errorf("upstreams[%d] is empty", i)
-		} else if !upstreamNameRegex.MatchString(u.Name) {
-			return fmt.Errorf("invalid upstream name %q", u.Name)
-		} else if names[u.Name] {
-			return fmt.Errorf("duplicate upstream name %q", u.Name)
-		} else if len(u.Addresses) == 0 {
-			return fmt.Errorf("upstream %s has no addresses", u.Name)
-		}
-		names[u.Name] = true
-		addresses, err := expandAddresses(u.Addresses)
-		if err != nil {
-			return fmt.Errorf("upstream %s: %w", u.Name, err)
-		}
-		u.Addresses = addresses
-	}
-	return c.validateRules()
+	return c.validateSites()
 }
 
 func (c *Config) validateAccessLogs() error {

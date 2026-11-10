@@ -84,7 +84,7 @@ func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 	for _, s := range b.sessions {
 		if s.canceled {
 			continue
-		} else if s.upstream != nil && b.upstreams[s.upstream.name] != s.upstream {
+		} else if s.upstream != nil && b.upstreams[s.upstream.id] != s.upstream {
 			// Attached after its removed upstream was forgotten (Attach raced the last tick), so
 			// no drain would ever close it
 			orphans = append(orphans, s)
@@ -109,12 +109,12 @@ func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 	for _, s := range victims {
 		s.canceled = true
 	}
-	for name, u := range b.upstreams {
+	for id, u := range b.upstreams {
 		if u.removed && u.drain != nil && u.drain.done(now) && u.streamCount() == 0 {
-			slog.Info("Removed upstream drained, forgetting it", "upstream", name)
-			delete(b.upstreams, name)
+			slog.Info("Removed upstream drained, forgetting it", "site", u.site, "upstream", u.name)
+			delete(b.upstreams, id)
 			b.order = slices.DeleteFunc(b.order, func(n string) bool {
-				return n == name
+				return n == id
 			})
 		}
 	}

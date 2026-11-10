@@ -214,3 +214,15 @@ func TestString_RuntimeError(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "", p.String(NewEnv(testRequest("GET", "/x", "192.0.2.1:1"))))
 }
+
+func TestSite(t *testing.T) {
+	// The site is set once the request's site is known, and carries over to the response
+	env := NewEnv(testRequest("GET", "/x", "192.0.2.1:1"))
+	env.Site = "ntfy"
+	p, err := Compile(`site == "ntfy"`, Request)
+	require.NoError(t, err)
+	require.True(t, p.Match(env))
+	p, err = Compile(`site == "ntfy"`, Response)
+	require.NoError(t, err)
+	require.True(t, p.Match(NewResponseEnv(env)))
+}

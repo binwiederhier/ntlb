@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/balancer"
+	"heckel.io/ntlb/balancer"
 )
 
 // recordedRequest is what the fake admin API saw
@@ -169,7 +169,7 @@ func TestClient_Unreachable(t *testing.T) {
 	require.NoError(t, ln.Close())
 	c := New("http://" + addr)
 	_, err = c.Status(context.Background())
-	require.ErrorContains(t, err, "cannot reach ntfy-lb admin API")
+	require.ErrorContains(t, err, "cannot reach ntlb admin API")
 	var opErr *net.OpError
 	require.ErrorAs(t, err, &opErr)
 }
@@ -198,7 +198,7 @@ func TestClient_ContextCanceled(t *testing.T) {
 	cancel()
 	select {
 	case err := <-errChan:
-		require.ErrorContains(t, err, "cannot reach ntfy-lb admin API")
+		require.ErrorContains(t, err, "cannot reach ntlb admin API")
 		require.True(t, errors.Is(err, context.Canceled))
 	case <-time.After(5 * time.Second):
 		t.Fatal("request not canceled")

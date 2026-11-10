@@ -14,7 +14,7 @@ func TestServer_MetricsListener(t *testing.T) {
 	s, _ := newTestServer(t, "listen-metrics: '127.0.0.1:0'", app1)
 	status, body := get(t, http.DefaultClient, "http://"+s.MetricsAddr()+"/metrics")
 	require.Equal(t, http.StatusOK, status)
-	require.Contains(t, body, "ntfy_lb_ready")
+	require.Contains(t, body, "ntlb_ready")
 
 	// Nothing else: no admin API, no pprof
 	for _, path := range []string{"/v1/status", "/debug/pprof/", "/v1/health"} {

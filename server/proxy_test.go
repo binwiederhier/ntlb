@@ -20,9 +20,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/balancer"
-	"heckel.io/ntfy-lb/config"
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/match"
 )
 
 func TestProxy_StreamsResponse(t *testing.T) {
@@ -202,11 +202,11 @@ func TestProxy_DrainingRefusesNewSubscriptions(t *testing.T) {
 }
 
 func TestIsSubscription(t *testing.T) {
-	ntfy, err := config.Parse([]byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+	ntfy, err := config.Parse([]byte("listen-http: ':80'\nsites: [{name: s, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
 	require.NoError(t, err)
-	custom, err := config.Parse([]byte("listen-http: ':80'\nstreams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+	custom, err := config.Parse([]byte("listen-http: ':80'\nsites: [{name: s, streams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
 	require.NoError(t, err)
-	disabled, err := config.Parse([]byte("listen-http: ':80'\nstreams: {match: 'false'}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+	disabled, err := config.Parse([]byte("listen-http: ':80'\nsites: [{name: s, streams: {match: 'false'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
 	require.NoError(t, err)
 	tests := []struct {
 		name    string
@@ -216,32 +216,32 @@ func TestIsSubscription(t *testing.T) {
 		header  string
 		want    bool
 	}{
-		{"json", ntfy.Streams, http.MethodGet, "/mytopic/json", "", true},
-		{"sse", ntfy.Streams, http.MethodGet, "/mytopic/sse", "", true},
-		{"raw", ntfy.Streams, http.MethodGet, "/mytopic/raw?since=all", "", true},
-		{"ws", ntfy.Streams, http.MethodGet, "/mytopic/ws", "", true},
-		{"multiple topics", ntfy.Streams, http.MethodGet, "/a,b,c/json", "", true},
-		{"poll=1", ntfy.Streams, http.MethodGet, "/mytopic/json?poll=1", "", false},
-		{"poll=true", ntfy.Streams, http.MethodGet, "/mytopic/json?poll=TRUE", "", false},
-		{"po=yes", ntfy.Streams, http.MethodGet, "/mytopic/json?po=yes", "", false},
-		{"x-poll header", ntfy.Streams, http.MethodGet, "/mytopic/json", "X-Poll: 1", false},
-		{"poll header", ntfy.Streams, http.MethodGet, "/mytopic/json", "Poll: true", false},
-		{"poll=0", ntfy.Streams, http.MethodGet, "/mytopic/json?poll=0", "", true},
-		{"header wins over query", ntfy.Streams, http.MethodGet, "/mytopic/json?poll=1", "X-Poll: no", true},
-		{"header poll over query", ntfy.Streams, http.MethodGet, "/mytopic/json?poll=0", "Po: 1", false},
-		{"first query param wins", ntfy.Streams, http.MethodGet, "/mytopic/json?x-poll=0&poll=1", "", true},
-		{"later query param if first unset", ntfy.Streams, http.MethodGet, "/mytopic/json?po=1", "", false},
-		{"publish", ntfy.Streams, http.MethodPost, "/mytopic", "", false},
-		{"post to json", ntfy.Streams, http.MethodPost, "/mytopic/json", "", false},
-		{"topic page", ntfy.Streams, http.MethodGet, "/mytopic", "", false},
-		{"nested path", ntfy.Streams, http.MethodGet, "/v1/account/json", "", false},
-		{"bad topic", ntfy.Streams, http.MethodGet, "/my%20topic/json", "", false},
-		{"root", ntfy.Streams, http.MethodGet, "/json", "", false},
-		{"custom", custom.Streams, http.MethodGet, "/events", "", true},
-		{"custom excluded", custom.Streams, http.MethodGet, "/events?once=1", "", false},
-		{"custom ignores ntfy", custom.Streams, http.MethodGet, "/mytopic/json", "", false},
-		{"custom ignores poll", custom.Streams, http.MethodGet, "/events?poll=1", "", true},
-		{"disabled", disabled.Streams, http.MethodGet, "/mytopic/json", "", false},
+		{"json", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json", "", true},
+		{"sse", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/sse", "", true},
+		{"raw", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/raw?since=all", "", true},
+		{"ws", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/ws", "", true},
+		{"multiple topics", ntfy.Sites[0].Streams, http.MethodGet, "/a,b,c/json", "", true},
+		{"poll=1", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json?poll=1", "", false},
+		{"poll=true", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json?poll=TRUE", "", false},
+		{"po=yes", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json?po=yes", "", false},
+		{"x-poll header", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json", "X-Poll: 1", false},
+		{"poll header", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json", "Poll: true", false},
+		{"poll=0", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json?poll=0", "", true},
+		{"header wins over query", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json?poll=1", "X-Poll: no", true},
+		{"header poll over query", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json?poll=0", "Po: 1", false},
+		{"first query param wins", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json?x-poll=0&poll=1", "", true},
+		{"later query param if first unset", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic/json?po=1", "", false},
+		{"publish", ntfy.Sites[0].Streams, http.MethodPost, "/mytopic", "", false},
+		{"post to json", ntfy.Sites[0].Streams, http.MethodPost, "/mytopic/json", "", false},
+		{"topic page", ntfy.Sites[0].Streams, http.MethodGet, "/mytopic", "", false},
+		{"nested path", ntfy.Sites[0].Streams, http.MethodGet, "/v1/account/json", "", false},
+		{"bad topic", ntfy.Sites[0].Streams, http.MethodGet, "/my%20topic/json", "", false},
+		{"root", ntfy.Sites[0].Streams, http.MethodGet, "/json", "", false},
+		{"custom", custom.Sites[0].Streams, http.MethodGet, "/events", "", true},
+		{"custom excluded", custom.Sites[0].Streams, http.MethodGet, "/events?once=1", "", false},
+		{"custom ignores ntfy", custom.Sites[0].Streams, http.MethodGet, "/mytopic/json", "", false},
+		{"custom ignores poll", custom.Sites[0].Streams, http.MethodGet, "/events?poll=1", "", true},
+		{"disabled", disabled.Sites[0].Streams, http.MethodGet, "/mytopic/json", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -601,7 +601,7 @@ func TestProxy_ReloadUnderLoad(t *testing.T) {
 func clientForRank(t *testing.T, s *Server, names ...string) *http.Client {
 	for i := 1; i < 250; i++ {
 		ip := fmt.Sprintf("127.0.2.%d", i)
-		candidates := s.balancer.Pick(clientKey(ip+":1", s.config.Load().ClientKey))
+		candidates := s.balancer.Pick("s", clientKey(ip+":1", s.config.Load().ClientKey))
 		ok := len(candidates) >= len(names)
 		for j := 0; ok && j < len(names); j++ {
 			ok = candidates[j].Name() == names[j]
@@ -702,7 +702,7 @@ func TestProxy_DeadAddressTriesSameUpstreamFirst(t *testing.T) {
 	deadAddr := dead.Addr().String()
 	dead.Close()
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	conf := fmt.Sprintf("listen-http: '127.0.0.1:0'\nlisten-admin: '127.0.0.1:0'\nhealth-check: {interval: 1h, timeout: 1s}\nupstreams:\n  - name: app1\n    addresses: [%q, %q]\n  - name: app2\n    addresses: [%q]\n", app1.addr(), deadAddr, app2.addr())
+	conf := fmt.Sprintf("listen-http: '127.0.0.1:0'\nlisten-admin: '127.0.0.1:0'\nsites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n      - name: app2\n        addresses: [%q]\n", app1.addr(), deadAddr, app2.addr())
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	s := startTestServer(t, filename) // Health checks probe the first address, which is alive
 	client := clientForRank(t, s, "app1", "app2")
@@ -794,4 +794,89 @@ func streamsToggle(i int) string {
 		return "false"
 	}
 	return config.DefaultStreamsMatch
+}
+
+func TestProxy_Sites(t *testing.T) {
+	// Two sites with an upstream of the same name each, picked by Host; global rules apply to
+	// both, site rules to their site only
+	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
+listen-http: '127.0.0.1:0'
+listen-admin: '127.0.0.1:0'
+rules: [{name: global, match: 'site == "a" && query == "global"', action: block}]
+sites:
+  - name: a
+    hosts: [a.com]
+    health-check: {interval: 1h, timeout: 1s}
+    upstreams: [{name: app1, addresses: [%q]}]
+  - name: b
+    hosts: ["*.b.com"]
+    health-check: {interval: 1h, timeout: 1s}
+    upstreams: [{name: app1, addresses: [%q]}]
+    rules: [{name: blocked, match: 'query == "blocked"', action: block, status: 451}]
+`, a1.addr(), b1.addr())), 0600))
+	s := startTestServer(t, filename)
+	getHost := func(host, path string) int {
+		req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+path, nil)
+		require.NoError(t, err)
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// By host
+	require.Equal(t, http.StatusOK, getHost("a.com", "/name"))
+	require.Equal(t, int64(1), a1.hits.Load())
+	require.Equal(t, http.StatusOK, getHost("www.B.com:80", "/name"))
+	require.Equal(t, int64(1), b1.hits.Load())
+
+	// No site for the host, and none takes the rest
+	require.Equal(t, http.StatusNotFound, getHost("c.com", "/name"))
+	require.Equal(t, int64(2), a1.hits.Load()+b1.hits.Load())
+
+	// Rules
+	require.Equal(t, http.StatusForbidden, getHost("a.com", "/name?global"))
+	require.Equal(t, http.StatusOK, getHost("x.b.com", "/name?global"))
+	require.Equal(t, 451, getHost("x.b.com", "/name?blocked"))
+	require.Equal(t, http.StatusOK, getHost("a.com", "/name?blocked"))
+
+	// Upstreams are named per site in the status and the drains
+	status := s.balancer.Status()
+	require.Equal(t, "a", status.Upstreams[0].Site)
+	require.Equal(t, "b", status.Upstreams[1].Site)
+	require.NoError(t, s.balancer.DrainUpstream("b/app1", 0))
+	waitFor(t, func() bool {
+		return getHost("x.b.com", "/name") == http.StatusServiceUnavailable
+	})
+	require.Equal(t, http.StatusOK, getHost("a.com", "/name"))
+}
+
+func TestProxy_SiteStreams(t *testing.T) {
+	// Each site decides which of its requests are streams
+	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
+listen-http: '127.0.0.1:0'
+listen-admin: '127.0.0.1:0'
+sites:
+  - {name: a, hosts: [a.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: b, streams: {match: 'false'}, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+`, a1.addr(), b1.addr())), 0600))
+	s := startTestServer(t, filename)
+	for _, host := range []string{"a.com", "other.com"} {
+		req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+"/bcast/json", nil)
+		require.NoError(t, err)
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+	}
+	waitFor(t, func() bool {
+		_, metrics := get(t, http.DefaultClient, "http://"+s.AdminAddr()+"/metrics")
+		return strings.Contains(metrics, `ntlb_streams{protocol="http1"} 1`) && s.balancer.Status().Streams == 2
+	})
 }

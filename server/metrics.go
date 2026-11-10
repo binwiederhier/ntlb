@@ -6,7 +6,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
-	"heckel.io/ntfy-lb/balancer"
+	"heckel.io/ntlb/balancer"
 )
 
 // Request kinds, the "kind" label
@@ -16,21 +16,21 @@ const (
 	kindWebSocket = "websocket" // A subscription upgraded to a WebSocket
 )
 
-// Stream protocols, the "protocol" label of ntfy_lb_streams
+// Stream protocols, the "protocol" label of ntlb_streams
 const (
 	protocolHTTP1     = "http1"
 	protocolHTTP2     = "http2"
 	protocolWebSocket = "websocket"
 )
 
-// Reasons for ntfy_lb_retries_total and ntfy_lb_streams_closed_total
+// Reasons for ntlb_retries_total and ntlb_streams_closed_total
 const (
 	retryConnect       = "connect" // The upstream refused or did not accept the connection
 	retryError         = "error"   // Any other error before a response, for idempotent requests
 	retry503           = "503"     // The upstream answered 503 (e.g. a draining ntfy node)
 	closedDrained      = "drained"
 	closedReadTimeout  = "read_timeout"
-	metricsNamespace   = "ntfy_lb"
+	metricsNamespace   = "ntlb"
 	streamDurationMax  = 24 * time.Hour
 	requestDurationMax = 5 * time.Minute
 )
@@ -69,8 +69,8 @@ func newMetrics(b *balancer.Balancer) *metrics {
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "requests_total",
-			Help:      "Requests by upstream (empty if none answered), status code and kind (request, stream, websocket)",
-		}, []string{"upstream", "code", "kind"}),
+			Help:      "Requests by site (empty if none serves the host), upstream (empty if none answered), status code and kind (request, stream, websocket)",
+		}, []string{"site", "upstream", "code", "kind"}),
 		requestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Name:      "request_duration_seconds",
@@ -142,7 +142,7 @@ func newMetrics(b *balancer.Balancer) *metrics {
 
 // observe records a request that ended
 func (m *metrics) observe(pr *proxyRequest, status int, start time.Time) {
-	m.requests.WithLabelValues(pr.upstream, strconv.Itoa(status), pr.kind).Inc()
+	m.requests.WithLabelValues(pr.site, pr.upstream, strconv.Itoa(status), pr.kind).Inc()
 	elapsed := time.Since(start).Seconds()
 	if pr.kind == kindRequest {
 		m.requestDuration.WithLabelValues(pr.kind).Observe(elapsed)
@@ -160,11 +160,11 @@ func newStatusCollector(b *balancer.Balancer) *statusCollector {
 		ready:            desc("ready", "Whether the load balancer is ready (healthy, not draining)"),
 		draining:         desc("draining", "Whether the load balancer is draining"),
 		openRequests:     desc("open_requests", "Open proxied requests, streams included"),
-		upstreamHealthy:  desc("upstream_healthy", "Whether the upstream passes its health checks", "upstream"),
-		upstreamDraining: desc("upstream_draining", "Whether the upstream is draining or drained", "upstream"),
-		upstreamStreams:  desc("upstream_streams", "Open proxied requests per upstream", "upstream"),
-		upstreamRequests: desc("upstream_requests_total", "Requests the upstream answered", "upstream"),
-		upstreamFailures: desc("upstream_failures_total", "Requests the upstream failed (connection errors, timeouts)", "upstream"),
+		upstreamHealthy:  desc("upstream_healthy", "Whether the upstream passes its health checks", "site", "upstream"),
+		upstreamDraining: desc("upstream_draining", "Whether the upstream is draining or drained", "site", "upstream"),
+		upstreamStreams:  desc("upstream_streams", "Open proxied requests per upstream", "site", "upstream"),
+		upstreamRequests: desc("upstream_requests_total", "Requests the upstream answered", "site", "upstream"),
+		upstreamFailures: desc("upstream_failures_total", "Requests the upstream failed (connection errors, timeouts)", "site", "upstream"),
 	}
 }
 
@@ -181,11 +181,11 @@ func (c *statusCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.openRequests, prometheus.GaugeValue, float64(status.Streams))
 	for _, u := range status.Upstreams {
 		draining := u.State == balancer.StateDraining || u.State == balancer.StateDrained
-		ch <- prometheus.MustNewConstMetric(c.upstreamHealthy, prometheus.GaugeValue, boolFloat(u.Healthy), u.Name)
-		ch <- prometheus.MustNewConstMetric(c.upstreamDraining, prometheus.GaugeValue, boolFloat(draining), u.Name)
-		ch <- prometheus.MustNewConstMetric(c.upstreamStreams, prometheus.GaugeValue, float64(u.Streams), u.Name)
-		ch <- prometheus.MustNewConstMetric(c.upstreamRequests, prometheus.CounterValue, float64(u.Requests), u.Name)
-		ch <- prometheus.MustNewConstMetric(c.upstreamFailures, prometheus.CounterValue, float64(u.Failures), u.Name)
+		ch <- prometheus.MustNewConstMetric(c.upstreamHealthy, prometheus.GaugeValue, boolFloat(u.Healthy), u.Site, u.Name)
+		ch <- prometheus.MustNewConstMetric(c.upstreamDraining, prometheus.GaugeValue, boolFloat(draining), u.Site, u.Name)
+		ch <- prometheus.MustNewConstMetric(c.upstreamStreams, prometheus.GaugeValue, float64(u.Streams), u.Site, u.Name)
+		ch <- prometheus.MustNewConstMetric(c.upstreamRequests, prometheus.CounterValue, float64(u.Requests), u.Site, u.Name)
+		ch <- prometheus.MustNewConstMetric(c.upstreamFailures, prometheus.CounterValue, float64(u.Failures), u.Site, u.Name)
 	}
 }
 

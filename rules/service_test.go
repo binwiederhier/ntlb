@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/config"
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/match"
 )
 
-const testBase = "listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]\n"
+const testBase = "listen-http: ':80'\nsites: [{name: s, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
 
 func testConfig(t *testing.T, rules string) *config.Config {
 	t.Helper()
@@ -51,12 +51,103 @@ func request(method, target, remoteAddr string, headers ...string) *http.Request
 	return r
 }
 
-// decided returns the name of the rule that decided, or "" if the request passes
+// decided returns the ID of the rule that decided, or "" if the request passes
 func decided(e *Engine, r *http.Request) string {
-	if rule := e.Check(r, match.NewEnv(r)); rule != nil {
-		return rule.Name
+	return decidedOn(e, r, "")
+}
+
+// decidedOn is decided for a request to a site
+func decidedOn(e *Engine, r *http.Request, site string) string {
+	env := match.NewEnv(r)
+	env.Site = site
+	if rule := e.Check(r, env); rule != nil {
+		return rule.ID
 	}
 	return ""
+}
+
+func TestEngine_SiteRules(t *testing.T) {
+	conf, err := config.Parse([]byte(`
+listen-http: ':80'
+bans: {file: /tmp/ban.log, threshold: 10}
+rules:
+  - {name: abuse, match: 'path == "/abuse"', action: block}
+  - {name: exempt, match: 'ip == "192.0.2.9"', action: allow}
+  - {name: errors, on: response, match: 'status >= 500', strike: 4}
+sites:
+  - name: a
+    hosts: [a.com]
+    upstreams: [{name: x, addresses: ['1.2.3.4:80']}]
+    rules:
+      - {name: abuse, match: 'path == "/site-abuse"', action: block, strike: 11}
+      - {name: limit, action: limit, rate: 1/h}
+      - {name: errors, on: response, match: 'status == 404', strike: 4}
+  - name: b
+    hosts: [b.com]
+    upstreams: [{name: x, addresses: ['1.2.3.4:80']}]
+    rules:
+      - {name: limit, action: limit, rate: 1/h}
+`))
+	require.NoError(t, err)
+	var lines []string
+	e := New(conf, func(line string) {
+		lines = append(lines, line)
+	})
+
+	// Global rules come first, for every site and for requests no site serves
+	require.Equal(t, "abuse", decidedOn(e, request("GET", "/abuse", "192.0.2.1:1"), "a"))
+	require.Equal(t, "abuse", decidedOn(e, request("GET", "/abuse", "192.0.2.1:1"), ""))
+
+	// Then the site's own; other sites' rules do not apply
+	require.Equal(t, "a/abuse", decidedOn(e, request("GET", "/site-abuse", "192.0.2.1:1"), "a"))
+	require.Equal(t, []string{"2026-11-09T12:00:00Z 192.0.2.1 192.0.2.1/32 a/abuse"[len("2026-11-09T12:00:00Z "):]}, trimTimes(lines))
+	require.Equal(t, "", decidedOn(e, request("GET", "/site-abuse", "192.0.2.2:1"), "b"))
+
+	// Limits are per site
+	require.Equal(t, "", decidedOn(e, request("GET", "/", "192.0.2.3:1"), "a"))
+	require.Equal(t, "a/limit", decidedOn(e, request("GET", "/", "192.0.2.3:1"), "a"))
+	require.Equal(t, "", decidedOn(e, request("GET", "/", "192.0.2.3:1"), "b"))
+
+	// A global allow skips the site's rules too
+	require.Equal(t, "", decidedOn(e, request("GET", "/site-abuse", "192.0.2.9:1"), "a"))
+
+	// Response rules: global and the site's
+	env := match.NewResponseEnv(match.NewEnv(request("GET", "/", "192.0.2.4:1")))
+	env.Site, env.Status = "a", 404
+	e.CheckResponse(env)
+	e.CheckResponse(env)
+	require.Len(t, lines, 1)
+	env.Status = 500
+	e.CheckResponse(env) // 12
+	require.Len(t, lines, 2)
+	require.Contains(t, lines[1], " 192.0.2.4/32 errors")
+	env.Site = "b"
+	env.IP = "192.0.2.5"
+	env.Status = 404
+	for range 5 {
+		e.CheckResponse(env) // Not a's rule
+	}
+	require.Len(t, lines, 2)
+}
+
+func TestEngine_SiteLimitKeptOnReload(t *testing.T) {
+	site := "sites: [{name: a, upstreams: [{name: x, addresses: ['1.2.3.4:80']}], rules: [{name: limit, action: limit, rate: 1/h}]}]"
+	conf, err := config.Parse([]byte("listen-http: ':80'\n" + site))
+	require.NoError(t, err)
+	e := New(conf, nil)
+	require.Equal(t, "", decidedOn(e, request("GET", "/", "192.0.2.1:1"), "a"))
+	conf, err = config.Parse([]byte("listen-http: ':80'\nrules: [{name: limit, action: limit, rate: 1/h}]\n" + site))
+	require.NoError(t, err)
+	e.Update(conf)
+	require.Equal(t, "a/limit", decidedOn(e, request("GET", "/", "192.0.2.1:1"), "a")) // Not the global one's bucket
+}
+
+func trimTimes(lines []string) []string {
+	trimmed := make([]string, len(lines))
+	for i, l := range lines {
+		trimmed[i] = l[len("2026-11-09T12:00:00Z "):]
+	}
+	return trimmed
 }
 
 func TestEngine_Match(t *testing.T) {

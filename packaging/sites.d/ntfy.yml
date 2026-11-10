@@ -1,0 +1,71 @@
+# The ntfy.sh site. The site's name is the file name ("ntfy") unless "name:" is set.
+hosts: [ntfy.sh, "*.ntfy.sh"] # Leave out to take every host no other site serves
+
+# The certificate is re-read on reload, so a certbot deploy hook can just run "systemctl reload ntlb"
+cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
+key-file: /etc/letsencrypt/live/ntfy.sh/privkey.pem
+
+# Every address of every upstream is probed; an upstream is healthy if any address is, and an
+# address that fails is skipped until it passes again
+health-check:
+  path: /v1/ready # ntfy's readiness: 503 while draining or passive
+  interval: 5s
+  timeout: 3s
+  fails: 3        # Failed probes in a row before an upstream leaves the rotation
+  passes: 2       # Good probes in a row before it comes back
+
+# Long-lived streams (a request expression; bodyless requests only): they take the low-memory
+# stream path, a draining load balancer turns new ones away, and drains close them at a pace. The
+# default is ntfy's subscriptions minus polls; set your own for another backend, or 'false'.
+# streams:
+#   match: method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")
+
+# Clients are hashed to upstream NAMES, so every load balancer with the same names routes a client
+# to the same node. An address may be a port range, one address per port; each address holds up
+# to ~63k connections from one source IP. Example addresses:
+upstreams:
+  - name: app1
+    addresses: ["10.108.0.11:25010-25017"]
+  - name: app3
+    addresses: ["10.108.0.13:25010-25017"]
+  - name: app5
+    addresses: ["10.108.0.15:25010-25017"]
+
+# Rules of this site, checked after the global rules (see config.yml)
+rules:
+  # Web pages to HTTPS, the docs to docs.ntfy.sh, and the website
+  - name: https-redirect
+    match: scheme == "http" && method == "GET" && path matches "^/($|[-_a-z0-9]{0,64}$|docs/|static/|_next|_site)"
+    action: redirect
+    location: '"https://" + host + uri'
+  - name: docs-redirect
+    match: path == "/docs" || path startsWith "/docs/"
+    action: redirect
+    location: '"https://docs.ntfy.sh/" + trimPrefix(path, "/docs/")'
+  - name: website
+    match: method == "GET" && (path == "/" || path matches "^/(_site|_next)/")
+    action: static
+    root: /var/www/website/html
+    fallback: /index.html
+
+  # Abusive topics: blocked, and banned if they keep coming. A strike above the bans threshold
+  # bans on the first request.
+  - name: abuse-topics
+    match: path matches "(^/|,)(spam-[^,/]*|my-bets)(,|/|$)"
+    action: block
+    strike: 101
+  - name: abuse-topic-count # Subscribing to 150+ topics at once
+    match: path matches "^/[^/]*(,[^/,]*){150,}"
+    action: block
+    strike: 20
+
+  # A request limit for everyone except a few known heavy users
+  - name: limit-exempt
+    match: ipIn(ip, "198.51.100.7", "203.0.113.0/24")
+    action: allow
+  - name: limit
+    action: limit
+    rate: 45/m
+    burst: 1000
+    status: 503 # What nginx's limit_req answers by default
+    strike: 1

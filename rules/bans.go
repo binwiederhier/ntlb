@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/config"
 )
 
 // bans counts strikes per client prefix (the client key) in a leaky bucket that holds threshold

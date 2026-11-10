@@ -7,8 +7,8 @@ import (
 	"path"
 	"path/filepath"
 
-	"heckel.io/ntfy-lb/config"
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/match"
 )
 
 // answer answers a request that a rule decided: blocked, limited, redirected or served from disk

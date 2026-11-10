@@ -14,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"heckel.io/ntfy-lb/balancer"
-	"heckel.io/ntfy-lb/config"
-	"heckel.io/ntfy-lb/match"
-	"heckel.io/ntfy-lb/rules"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/match"
+	"heckel.io/ntlb/rules"
 )
 
 const (
@@ -66,10 +66,12 @@ func New(configFile string) (*Server, error) {
 	s.metrics = newMetrics(s.balancer)
 	s.proxy = newProxy(s.balancer, s.metrics, conf)
 	if conf.ListenHTTPS != "" {
-		s.certs = &certStore{}
-		if err := s.certs.load(conf.CertFile, conf.KeyFile); err != nil {
+		certs, err := loadCerts(conf)
+		if err != nil {
 			return nil, err
 		}
+		s.certs = &certStore{}
+		s.certs.store(certs)
 	}
 	files, err := openLogFiles(logPaths(conf))
 	if err != nil {
@@ -117,9 +119,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// Reload re-reads the config file and applies it: upstreams, health checks, timeouts, drain
-// durations, streams, the client key, rules, bans, the certificate and the log files. A broken config (or a
-// certificate or log file that cannot be opened) is rejected as a whole. It returns the changed
+// Reload re-reads the config file and the site files it includes, and applies them: sites,
+// upstreams, health checks, timeouts, drain durations, streams, the client key, rules, bans, the
+// certificates and the log files. A broken config (or a certificate or log file that cannot be
+// opened) is rejected as a whole. It returns the changed
 // settings that only a restart applies: listener addresses and client keepalives.
 func (s *Server) Reload() ([]string, error) {
 	s.reloadMu.Lock()
@@ -135,9 +138,9 @@ func (s *Server) Reload() ([]string, error) {
 	}
 
 	// Open everything that can fail first, then apply
-	var cert *tls.Certificate
-	if s.certs != nil && conf.CertFile != "" && conf.KeyFile != "" {
-		if cert, err = loadCert(conf.CertFile, conf.KeyFile); err != nil {
+	var certs []*tls.Certificate
+	if s.certs != nil {
+		if certs, err = loadCerts(conf); err != nil {
 			return nil, err
 		}
 	}
@@ -145,15 +148,15 @@ func (s *Server) Reload() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cert != nil {
-		s.certs.cert.Store(cert)
+	if s.certs != nil {
+		s.certs.store(certs)
 	}
 	s.files.swap(files)
 	s.rules.Update(conf)
 	s.balancer.Update(conf)
 	s.proxy.update(conf)
 	s.config.Store(conf)
-	slog.Info("Config reloaded", "upstreams", len(conf.Upstreams), "rules", len(conf.Rules))
+	slog.Info("Config reloaded", "sites", len(conf.Sites), "upstreams", conf.UpstreamCount())
 	return restart, nil
 }
 
@@ -203,19 +206,23 @@ func (s *Server) observe(next http.Handler) http.Handler {
 		start := time.Now()
 		conf := s.config.Load()
 		env := match.NewEnv(r)
+		if site := conf.SiteFor(r.Host); site != nil {
+			env.Site = site.Name
+		}
 		respEnv := match.NewResponseEnv(env) // Strings only, so the request can be let go
 		var entry *accessLogEntry
 		if len(conf.AccessLogs) > 0 {
 			entry = newAccessLogEntry(r, start)
 		}
 		pr := &proxyRequest{
-			env: env,
+			env:  env,
+			site: env.Site,
 		}
 		sw := &statusWriter{ResponseWriter: w}
 		rule := s.rules.Check(r, env)
 		if rule != nil {
-			pr.rule, pr.kind = rule.Name, kindRequest
-			s.metrics.ruleMatches.WithLabelValues(rule.Name).Inc()
+			pr.rule, pr.kind = rule.ID, kindRequest
+			s.metrics.ruleMatches.WithLabelValues(rule.ID).Inc()
 		}
 		pr.onFinish(func() {
 			status := pr.finalStatus() // Must not use sw: it references the server's connection state

@@ -14,7 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v3"
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/config"
 )
 
 // fakeAdmin is an admin API on 127.0.0.1 that answers every request with status and body, and
@@ -63,14 +63,14 @@ func runApp(args ...string) (string, error) {
 	var out bytes.Buffer
 	app.Writer, app.ErrWriter = &out, &out
 	app.ExitErrHandler = func(context.Context, *cli.Command, error) {} // Do not os.Exit the test
-	err := app.Run(context.Background(), append([]string{"ntfy-lb"}, args...))
+	err := app.Run(context.Background(), append([]string{"ntlb"}, args...))
 	return out.String(), err
 }
 
 // writeConfig writes a config file with the given listen-admin and returns its path
 func writeConfig(t *testing.T, listenAdmin string) string {
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	conf := "listen-http: '127.0.0.1:0'\nupstreams: [{name: app1, addresses: ['127.0.0.1:1']}]\n"
+	conf := "listen-http: '127.0.0.1:0'\nsites: [{name: s, upstreams: [{name: app1, addresses: ['127.0.0.1:1']}]}]\n"
 	if listenAdmin != "" {
 		conf += "listen-admin: '" + listenAdmin + "'\n"
 	}
@@ -128,20 +128,20 @@ func TestNewClient_ListenAdminFromConfig(t *testing.T) {
 
 func TestNewClient_Env(t *testing.T) {
 	f := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
-	t.Setenv("NTFY_LB_ADMIN_URL", f.srv.URL)
+	t.Setenv("NTLB_ADMIN_URL", f.srv.URL)
 	_, err := runApp("undrain")
 	require.NoError(t, err)
 	require.Equal(t, http.MethodDelete, f.method)
 
-	// NTFY_LB_CONFIG is read when there is no admin URL, also after an earlier run of another
+	// NTLB_CONFIG is read when there is no admin URL, also after an earlier run of another
 	// app in the same process had --config
 	g := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
 	h := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
-	t.Setenv("NTFY_LB_ADMIN_URL", "")
+	t.Setenv("NTLB_ADMIN_URL", "")
 	_, err = runApp("--config", writeConfig(t, "127.0.0.1:"+h.port()), "undrain")
 	require.NoError(t, err)
 	require.Equal(t, http.MethodDelete, h.method)
-	t.Setenv("NTFY_LB_CONFIG", writeConfig(t, "127.0.0.1:"+g.port()))
+	t.Setenv("NTLB_CONFIG", writeConfig(t, "127.0.0.1:"+g.port()))
 	_, err = runApp("undrain")
 	require.NoError(t, err)
 	require.Equal(t, http.MethodDelete, g.method)
@@ -200,7 +200,7 @@ func TestApp_LogLevelEnv(t *testing.T) {
 	t.Cleanup(func() {
 		slog.SetLogLoggerLevel(slog.LevelInfo)
 	})
-	t.Setenv("NTFY_LB_LOG_LEVEL", "nope")
+	t.Setenv("NTLB_LOG_LEVEL", "nope")
 	_, err := runApp("check-config")
 	require.EqualError(t, err, `invalid log level "nope"`)
 }

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"heckel.io/ntfy-lb/balancer"
+	"heckel.io/ntlb/balancer"
 )
 
 // Admin API, served on the admin listener only (keep it on localhost or a private address):
@@ -22,7 +22,8 @@ import (
 //	POST   /v1/reload                    re-read the config file (like SIGHUP)
 //	POST   /v1/drain                     drain the load balancer, body {"duration":"5m"} (optional)
 //	DELETE /v1/drain                     undrain it
-//	POST   /v1/upstreams/{name}/drain    drain an upstream, body {"duration":"5m"} (optional)
+//	POST   /v1/upstreams/{name}/drain    drain an upstream ("site%2Fname", or the name if only one
+//	                                     site has it), body {"duration":"5m"} (optional)
 //	DELETE /v1/upstreams/{name}/drain    undrain it
 //	GET    /metrics                      Prometheus metrics
 //	GET    /debug/pprof/                 Go profiles (heap, goroutine, profile, ...)
@@ -189,6 +190,9 @@ func (s *Server) readDrainDuration(r *http.Request) (time.Duration, error) {
 func upstreamError(err error) error {
 	if errors.Is(err, balancer.ErrUpstreamNotFound) {
 		return &adminError{status: http.StatusNotFound, err: err}
+	}
+	if errors.Is(err, balancer.ErrUpstreamAmbiguous) {
+		return &adminError{status: http.StatusBadRequest, err: err}
 	}
 	return err
 }

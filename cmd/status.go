@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/urfave/cli/v3"
-	"heckel.io/ntfy-lb/balancer"
+	"heckel.io/ntlb/balancer"
 )
 
 func newStatusCommand() *cli.Command {
@@ -35,9 +35,9 @@ func execStatus(ctx context.Context, cmd *cli.Command) error {
 	}
 	fmt.Fprintf(cmd.Root().Writer, "Load balancer: %s, %d stream(s)\n\n", lbState(status), status.Streams)
 	w := tabwriter.NewWriter(cmd.Root().Writer, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "UPSTREAM\tSTATE\tSTREAMS\tREQUESTS\tFAILURES\tADDRESSES\tNOTE")
+	fmt.Fprintln(w, "SITE\tUPSTREAM\tSTATE\tSTREAMS\tREQUESTS\tFAILURES\tADDRESSES\tNOTE")
 	for _, u := range status.Upstreams {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", u.Name, u.State, u.Streams, u.Requests, u.Failures, strings.Join(u.Addresses, ","), upstreamNote(u))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n", u.Site, u.Name, u.State, u.Streams, u.Requests, u.Failures, strings.Join(u.Addresses, ","), upstreamNote(u))
 	}
 	return w.Flush()
 }

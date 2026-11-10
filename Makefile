@@ -1,6 +1,6 @@
-# ntfy-lb: build, test, lint. "make" runs fmt-check + vet + tests + a linux/amd64 build.
+# ntlb: build, test, lint. "make" runs fmt-check + vet + tests + a linux/amd64 build.
 
-BINARY  := ntfy-lb
+BINARY  := ntlb
 
 .PHONY: all build test race vet fmt fmt-check lint clean
 

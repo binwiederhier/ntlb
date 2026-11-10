@@ -1,4 +1,4 @@
-module heckel.io/ntfy-lb
+module heckel.io/ntlb
 
 go 1.24
 

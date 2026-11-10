@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/config"
 )
 
 func newProbeUpstream(addr string) *Upstream {
-	return newUpstream(&config.Upstream{
+	return newUpstream(testSite, &config.Upstream{
 		Name:      "app1",
 		Addresses: []string{addr},
 	})
@@ -103,11 +103,12 @@ func TestBalancer_ProbeOne(t *testing.T) {
 	})
 
 	t.Run("every address", func(t *testing.T) {
-		u := newUpstream(&config.Upstream{
+		u := newUpstream(testSite, &config.Upstream{
 			Name:      "app1",
 			Addresses: []string{"10.0.0.1:1", "10.0.0.1:2"},
 		})
-		generation, addresses := u.probeTargets()
+		generation, hc, addresses := u.probeTargets()
+		require.Same(t, testSite.HealthCheck, hc)
 		require.Equal(t, uint64(0), generation)
 		require.Equal(t, []string{"10.0.0.1:1", "10.0.0.1:2"}, addresses)
 	})
@@ -190,8 +191,8 @@ func TestBalancer_HealthHysteresisFromConfig(t *testing.T) {
 	// The probe rounds use fails and passes from the config, also after a reload
 	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
 	conf := newTestConfig(app1, app2)
-	conf.HealthCheck.Fails = 1
-	conf.HealthCheck.Passes = 3
+	conf.Sites[0].HealthCheck.Fails = 1
+	conf.Sites[0].HealthCheck.Passes = 3
 	b := New(conf)
 	b.checkHealth(context.Background())
 	app2.ready.Store(false)
@@ -205,8 +206,8 @@ func TestBalancer_HealthHysteresisFromConfig(t *testing.T) {
 	require.Equal(t, StateHealthy, b.Status().Upstreams[1].State)
 
 	reloaded := newTestConfig(app1, app2)
-	reloaded.HealthCheck.Fails = 2
-	reloaded.HealthCheck.Passes = 1
+	reloaded.Sites[0].HealthCheck.Fails = 2
+	reloaded.Sites[0].HealthCheck.Passes = 1
 	b.Update(reloaded)
 	app2.ready.Store(false)
 	b.checkHealth(context.Background())
@@ -245,7 +246,7 @@ func TestBalancer_HealthLoop(t *testing.T) {
 	t.Cleanup(server.Close)
 	app1 := &testUpstream{name: "app1", server: server}
 	conf := newTestConfig(app1)
-	conf.HealthCheck.Interval = 10 * time.Millisecond
+	conf.Sites[0].HealthCheck.Interval = 10 * time.Millisecond
 	b := New(conf)
 	ctx, cancel := context.WithCancel(context.Background())
 	exited := make(chan struct{})
@@ -301,7 +302,7 @@ func TestBalancer_ProbeOfReplacedAddressIsDiscarded(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	app2old := &testUpstream{name: "app2", server: old}
 	conf := newTestConfig(app1, app2old)
-	conf.HealthCheck.Fails = 1 // One failed probe would take it out
+	conf.Sites[0].HealthCheck.Fails = 1 // One failed probe would take it out
 	b := New(conf)
 	b.checkHealth(context.Background())
 	slow.Store(true)
@@ -313,7 +314,7 @@ func TestBalancer_ProbeOfReplacedAddressIsDiscarded(t *testing.T) {
 	<-probing
 	app2new := newTestUpstream(t, "app2")
 	reloaded := newTestConfig(app1, app2new)
-	reloaded.HealthCheck.Fails = 1
+	reloaded.Sites[0].HealthCheck.Fails = 1
 	b.Update(reloaded)
 	close(release)
 	<-checked
@@ -348,7 +349,7 @@ func TestBalancer_HealthProbesEveryAddress(t *testing.T) {
 	dead := ln.Addr().String()
 	ln.Close()
 	for _, order := range [][]string{{dead, live.addr()}, {live.addr(), dead}} {
-		conf, err := config.Parse([]byte(fmt.Sprintf("listen-http: ':0'\nhealth-check: {interval: 1h, timeout: 1s}\nupstreams:\n  - name: app1\n    addresses: [%q, %q]\n", order[0], order[1])))
+		conf, err := config.Parse([]byte(fmt.Sprintf("listen-http: ':0'\nsites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n", order[0], order[1])))
 		require.NoError(t, err)
 		b := New(conf)
 		b.checkHealth(context.Background())
@@ -364,9 +365,57 @@ func TestBalancer_HealthProbesEveryAddress(t *testing.T) {
 
 	// All addresses down: unhealthy
 	live.ready.Store(false)
-	conf, err := config.Parse([]byte(fmt.Sprintf("listen-http: ':0'\nhealth-check: {interval: 1h, timeout: 1s}\nupstreams:\n  - name: app1\n    addresses: [%q, %q]\n", dead, live.addr())))
+	conf, err := config.Parse([]byte(fmt.Sprintf("listen-http: ':0'\nsites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n", dead, live.addr())))
 	require.NoError(t, err)
 	b := New(conf)
 	b.checkHealth(context.Background())
 	require.False(t, b.Status().Upstreams[0].Healthy)
+}
+
+func TestBalancer_HealthCheckPerSite(t *testing.T) {
+	// One node, two sites that check it on their own paths and at their own intervals
+	var defaultProbes, otherProbes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/other" {
+			otherProbes.Add(1)
+			return
+		}
+		defaultProbes.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	addr := strings.TrimPrefix(server.URL, "http://")
+	conf := mustParse(t, fmt.Sprintf(`
+listen-http: ':0'
+sites:
+  - {name: a, hosts: [a.com], health-check: {interval: 10ms, timeout: 5ms}, upstreams: [{name: x, addresses: [%q]}]}
+  - {name: b, health-check: {path: /other, interval: 1h, timeout: 1s}, upstreams: [{name: x, addresses: [%q]}]}
+`, addr, addr))
+	b := New(conf)
+	b.checkHealth(context.Background())
+	status := b.Status()
+	require.False(t, status.Upstreams[0].Healthy)
+	require.True(t, status.Upstreams[1].Healthy)
+	require.Equal(t, int32(1), otherProbes.Load())
+
+	// The loop probes each site at its interval
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.healthLoop(ctx)
+	require.Eventually(t, func() bool {
+		return defaultProbes.Load() >= 5
+	}, 3*time.Second, 5*time.Millisecond)
+	require.Equal(t, int32(1), otherProbes.Load())
+}
+
+// testSite is a site for upstreams made without a config
+var testSite = &config.Site{
+	Name: "s",
+	HealthCheck: &config.HealthCheck{
+		Path:     config.DefaultHealthPath,
+		Interval: time.Hour,
+		Timeout:  time.Second,
+		Fails:    config.DefaultHealthFails,
+		Passes:   config.DefaultHealthPasses,
+	},
 }

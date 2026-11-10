@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/match"
 )
 
 const testBans = "bans: {file: /tmp/ban.log, window: 10m, threshold: 10}\n"

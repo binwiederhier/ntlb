@@ -1,4 +1,4 @@
-// Package client talks to a running ntfy-lb's admin API, for the CLI
+// Package client talks to a running ntlb's admin API, for the CLI
 package client
 
 import (
@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"heckel.io/ntfy-lb/balancer"
-	"heckel.io/ntfy-lb/server"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/server"
 )
 
 const (
@@ -91,7 +91,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, result any) 
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("cannot reach ntfy-lb admin API: %w", err)
+		return fmt.Errorf("cannot reach ntlb admin API: %w", err)
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)

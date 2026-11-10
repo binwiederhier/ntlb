@@ -5,52 +5,71 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"slices"
 	"sync"
 	"time"
 
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/config"
 )
 
-// healthLoop probes every upstream each health-check interval. The interval is read from the
-// current config every round, so a reload changes it.
+// maxDuration is a slack that makes every upstream due
+const maxDuration = time.Duration(math.MaxInt64)
+
+// healthLoop probes each upstream every health-check interval of its site. It wakes at the
+// shortest interval and probes the upstreams that are due, give or take half a round. The
+// intervals are read every round, so a reload changes them.
 func (b *Balancer) healthLoop(ctx context.Context) {
 	for {
-		b.mu.RLock()
-		interval := b.config.HealthCheck.Interval
-		b.mu.RUnlock()
+		interval := b.shortestHealthInterval()
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(interval):
 		}
-		b.checkHealth(ctx)
+		b.probe(ctx, b.dueUpstreams(time.Now(), interval/2))
 	}
 }
 
 // checkHealth runs one probe round over every upstream still in the config, in parallel
 func (b *Balancer) checkHealth(ctx context.Context) {
+	b.probe(ctx, b.dueUpstreams(time.Now(), maxDuration))
+}
+
+// dueUpstreams returns the upstreams still in the config whose last round started at least their
+// interval minus slack ago, and marks them as probed now
+func (b *Balancer) dueUpstreams(now time.Time, slack time.Duration) []*Upstream {
 	b.mu.RLock()
-	hc := b.config.HealthCheck
+	defer b.mu.RUnlock()
 	upstreams := make([]*Upstream, 0, len(b.upstreams))
 	for _, u := range b.upstreams {
-		if !u.removed {
+		if !u.removed && u.dueForProbe(now, slack) {
 			upstreams = append(upstreams, u)
 		}
 	}
-	b.mu.RUnlock()
-	b.probe(ctx, hc, upstreams)
+	return upstreams
 }
 
-// probe checks the given upstreams in parallel and applies the results
-func (b *Balancer) probe(ctx context.Context, hc *config.HealthCheck, upstreams []*Upstream) {
+func (b *Balancer) shortestHealthInterval() time.Duration {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	shortest := time.Duration(maxDuration)
+	for _, site := range b.config.Sites {
+		shortest = min(shortest, site.HealthCheck.Interval)
+	}
+	return shortest
+}
+
+// probe checks the given upstreams in parallel, each with its site's health check, and applies
+// the results
+func (b *Balancer) probe(ctx context.Context, upstreams []*Upstream) {
 	var wg sync.WaitGroup
 	for _, u := range upstreams {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			generation, addresses := u.probeTargets()
+			generation, hc, addresses := u.probeTargets()
 			results := make([]error, len(addresses))
 			var addrWG sync.WaitGroup
 			for i, addr := range addresses {
@@ -87,12 +106,24 @@ func (b *Balancer) probeOne(ctx context.Context, hc *config.HealthCheck, addr st
 	return nil
 }
 
-// probeTargets returns the addresses to probe, all of them, and the address generation they
-// belong to
-func (u *Upstream) probeTargets() (uint64, []string) {
+// probeTargets returns the addresses to probe, all of them, the address generation they belong
+// to, and the health check to probe them with
+func (u *Upstream) probeTargets() (uint64, *config.HealthCheck, []string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return u.generation, slices.Clone(u.addresses)
+	return u.generation, u.health, slices.Clone(u.addresses)
+}
+
+// dueForProbe reports whether the upstream's last probe round started its interval minus slack
+// ago, and if so, records now as the start of the next
+func (u *Upstream) dueForProbe(now time.Time, slack time.Duration) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if !u.lastProbe.IsZero() && now.Sub(u.lastProbe) < u.health.Interval-slack {
+		return false
+	}
+	u.lastProbe = now
+	return true
 }
 
 // applyProbes applies a probe round over all addresses: the upstream passes if any address
@@ -143,7 +174,7 @@ func (u *Upstream) applyProbe(hc *config.HealthCheck, generation uint64, err err
 		u.probed = true
 		u.healthy = err == nil
 		if err != nil {
-			slog.Warn("Upstream failed its first health check", "upstream", u.name, "error", err)
+			slog.Warn("Upstream failed its first health check", "site", u.site, "upstream", u.name, "error", err)
 		}
 		return
 	}
@@ -151,14 +182,14 @@ func (u *Upstream) applyProbe(hc *config.HealthCheck, generation uint64, err err
 		u.fails = 0
 		u.passes++
 		if !u.healthy && u.passes >= hc.Passes {
-			slog.Info("Upstream is healthy again", "upstream", u.name)
+			slog.Info("Upstream is healthy again", "site", u.site, "upstream", u.name)
 			u.healthy = true
 		}
 	} else {
 		u.passes = 0
 		u.fails++
 		if u.healthy && u.fails >= hc.Fails {
-			slog.Warn("Upstream is unhealthy", "upstream", u.name, "error", err)
+			slog.Warn("Upstream is unhealthy", "site", u.site, "upstream", u.name, "error", err)
 			u.healthy = false
 		}
 	}

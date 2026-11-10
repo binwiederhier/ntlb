@@ -9,8 +9,8 @@ import (
 	"syscall"
 
 	"github.com/urfave/cli/v3"
-	"heckel.io/ntfy-lb/config"
-	"heckel.io/ntfy-lb/server"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/server"
 )
 
 var (
@@ -26,7 +26,7 @@ func newServeCommand() *cli.Command {
 		Description: `Runs the load balancer with the config file (--config).
 
 Signals:
-  SIGHUP           reload the config file (same as "ntfy-lb reload")
+  SIGHUP           reload the config file (same as "ntlb reload")
   SIGTERM, SIGINT  drain over shutdown-drain-duration, then exit; a second one exits right away`,
 		Action: execServe,
 	}
@@ -60,7 +60,7 @@ func execCheckConfig(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.Root().Writer, "Config OK, %d upstream(s)\n", len(conf.Upstreams))
+	fmt.Fprintf(cmd.Root().Writer, "Config OK, %d site(s), %d upstream(s)\n", len(conf.Sites), conf.UpstreamCount())
 	return nil
 }
 

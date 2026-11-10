@@ -5,7 +5,7 @@ import (
 	"os"
 	"sync/atomic"
 
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/config"
 )
 
 // logFiles are the open log files (access logs, the ban file) by path; uses of one path share it

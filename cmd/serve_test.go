@@ -18,9 +18,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/balancer"
-	"heckel.io/ntfy-lb/config"
-	"heckel.io/ntfy-lb/server"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/server"
 )
 
 // startSignalHandler runs handleSignals on an unbuffered channel, so that a send returns only
@@ -160,7 +160,7 @@ func TestHandleSignals_Reload(t *testing.T) {
 	require.NoError(t, err)
 
 	// SIGHUP applies a good config
-	added := string(good) + "  - name: app3\n    addresses: ['127.0.0.1:1']\n"
+	added := string(good) + "      - name: app3\n        addresses: ['127.0.0.1:1']\n"
 	require.NoError(t, os.WriteFile(filename, []byte(added), 0600))
 	reload(signals)
 	require.Equal(t, []string{"app1", "app2", "app3"}, upstreamNames(fetchStatus(t, s)))
@@ -330,7 +330,7 @@ func TestServe_Errors(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'"), 0600))
 	_, err = runApp("--config", filename, "serve")
-	require.ErrorContains(t, err, "at least one upstream")
+	require.ErrorContains(t, err, "at least one site")
 
 	// Listen address taken
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -346,13 +346,13 @@ func TestCheckConfig_Output(t *testing.T) {
 	filename := writeTestConfig(t, "", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), "app1", "app2", "app3")
 	out, err := runApp("check-config", "--config", filename)
 	require.NoError(t, err)
-	require.Equal(t, "Config OK, 3 upstream(s)\n", out)
+	require.Equal(t, "Config OK, 1 site(s), 3 upstream(s)\n", out)
 
 	// From the env var
-	t.Setenv("NTFY_LB_CONFIG", filename)
+	t.Setenv("NTLB_CONFIG", filename)
 	out, err = runApp("check-config")
 	require.NoError(t, err)
-	require.Equal(t, "Config OK, 3 upstream(s)\n", out)
+	require.Equal(t, "Config OK, 1 site(s), 3 upstream(s)\n", out)
 }
 
 func TestCheckConfig_Errors(t *testing.T) {
@@ -364,7 +364,7 @@ func TestCheckConfig_Errors(t *testing.T) {
 	out, err := runApp("check-config", "-c", filename)
 	require.ErrorContains(t, err, "invalid config")
 	require.Empty(t, out)
-	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['nope']}]"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'\nsites: [{name: s, upstreams: [{name: a, addresses: ['nope']}]}]"), 0600))
 	_, err = runApp("check-config", "-c", filename)
 	require.ErrorContains(t, err, `invalid address "nope"`)
 }

@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/config"
 )
 
 const (
@@ -23,12 +23,13 @@ const (
 	addressBackoffMax = 30 * time.Second
 )
 
-// Balancer routes clients to upstreams by rendezvous hashing their IP over the healthy upstreams,
-// and owns the health checks and the drains
+// Balancer routes clients to upstreams by rendezvous hashing their IP over the healthy upstreams
+// of their site, and owns the health checks and the drains. Upstreams are keyed by their ID,
+// "<site>/<name>".
 type Balancer struct {
 	config    *config.Config
 	upstreams map[string]*Upstream
-	order     []string // Config order, then removed upstreams still draining
+	order     []string // IDs in config order, then removed upstreams still draining
 	sessions  map[uint64]*Session
 	nextID    uint64
 	drain     *drainState // Draining the load balancer itself
@@ -39,6 +40,8 @@ type Balancer struct {
 // Upstream is one ntfy node and its addresses. Several addresses (usually one node's ports) let
 // the load balancer hold more than ~63k connections to one node from a single source IP.
 type Upstream struct {
+	id          string // site/name
+	site        string
 	name        string
 	removed     bool        // Protected by Balancer.mu
 	drain       *drainState // Protected by Balancer.mu
@@ -51,13 +54,15 @@ type Upstream struct {
 	addrFails   map[string]int       // Consecutive failures per address
 	addrRetry   map[string]time.Time // An address that failed is skipped until then
 	addrDown    map[string]bool      // Failed its last health check: skipped while others are up
+	health      *config.HealthCheck  // The site's health check
+	lastProbe   time.Time            // Start of the last probe round that included the upstream
 	healthy     bool
 	probed      bool
 	fails       int
 	passes      int
 	lastCheck   time.Time
 	lastError   string
-	mu          sync.Mutex // Protects addresses, generation, addrStreams, addrPending, addrFails, addrRetry, addrDown, healthy, probed, fails, passes, lastCheck, lastError
+	mu          sync.Mutex // Protects addresses, generation, addrStreams, addrPending, addrFails, addrRetry, addrDown, health, lastProbe, healthy, probed, fails, passes, lastCheck, lastError
 }
 
 // New creates a balancer for the upstreams in the config. Call Start to run the health checks.
@@ -75,9 +80,12 @@ func New(conf *config.Config) *Balancer {
 			},
 		},
 	}
-	for _, uc := range conf.Upstreams {
-		b.upstreams[uc.Name] = newUpstream(uc)
-		b.order = append(b.order, uc.Name)
+	for _, site := range conf.Sites {
+		for _, uc := range site.Upstreams {
+			u := newUpstream(site, uc)
+			b.upstreams[u.id] = u
+			b.order = append(b.order, u.id)
+		}
 	}
 	return b
 }
@@ -90,22 +98,25 @@ func (b *Balancer) Start(ctx context.Context) {
 	go b.drainLoop(ctx.Done())
 }
 
-// Pick returns the upstreams to try for a client key, best first: the healthy upstreams that are
-// not draining. If none is healthy, it fails open and returns every upstream that is not
+// Pick returns the upstreams of a site to try for a client key, best first: the healthy upstreams
+// that are not draining. If none is healthy, it fails open and returns every upstream that is not
 // draining, since a problem shared by all nodes (e.g. their database) is no reason to turn every
-// client away. Returns nothing only if every upstream is draining.
-func (b *Balancer) Pick(key []byte) []*Upstream {
+// client away. Returns nothing only if every upstream of the site is draining. Clients are hashed
+// to the upstream names, not the IDs, so the site's name does not change the order.
+func (b *Balancer) Pick(site string, key []byte) []*Upstream {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	names := make([]string, 0, len(b.upstreams))
-	for name, u := range b.upstreams {
-		if !u.removed && u.drain == nil {
-			names = append(names, name)
+	byName := make(map[string]*Upstream)
+	for _, u := range b.upstreams {
+		if u.site == site && !u.removed && u.drain == nil {
+			names = append(names, u.name)
+			byName[u.name] = u
 		}
 	}
 	var healthy, unhealthy []*Upstream
 	for _, name := range rank(key, names) {
-		if u := b.upstreams[name]; u.isHealthy() {
+		if u := byName[name]; u.isHealthy() {
 			healthy = append(healthy, u)
 		} else {
 			unhealthy = append(unhealthy, u)
@@ -211,86 +222,103 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	// The probes of new addresses run on a copy, whose health replaces the upstream's below.
 	b.mu.RLock()
 	var added, changed []*Upstream
-	addedNames := make(map[string]bool)
-	changedByName := make(map[string]*Upstream)
-	for _, uc := range conf.Upstreams {
-		if u, ok := b.upstreams[uc.Name]; !ok {
-			added = append(added, newUpstream(uc))
-			addedNames[uc.Name] = true
-		} else if !u.hasAddresses(uc.Addresses) {
-			probed := newUpstream(uc)
-			changed = append(changed, probed)
-			changedByName[uc.Name] = probed
+	addedIDs := make(map[string]bool)
+	changedByID := make(map[string]*Upstream)
+	for _, site := range conf.Sites {
+		for _, uc := range site.Upstreams {
+			id := upstreamID(site.Name, uc.Name)
+			if u, ok := b.upstreams[id]; !ok {
+				added = append(added, newUpstream(site, uc))
+				addedIDs[id] = true
+			} else if !u.hasAddresses(uc.Addresses) {
+				probed := newUpstream(site, uc)
+				changed = append(changed, probed)
+				changedByID[id] = probed
+			}
 		}
 	}
 	b.mu.RUnlock()
-	b.probe(context.Background(), conf.HealthCheck, slices.Concat(added, changed))
+	b.probe(context.Background(), slices.Concat(added, changed))
 
 	// Swap in the new set, unless an upstream went away or changed in between
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, uc := range conf.Upstreams {
-		u, ok := b.upstreams[uc.Name]
-		if !ok && !addedNames[uc.Name] {
-			return false
-		} else if ok && !u.hasAddresses(uc.Addresses) && changedByName[uc.Name] == nil {
-			return false
+	for _, site := range conf.Sites {
+		for _, uc := range site.Upstreams {
+			id := upstreamID(site.Name, uc.Name)
+			u, ok := b.upstreams[id]
+			if !ok && !addedIDs[id] {
+				return false
+			} else if ok && !u.hasAddresses(uc.Addresses) && changedByID[id] == nil {
+				return false
+			}
 		}
 	}
 	now := time.Now()
 	wanted := make(map[string]bool)
-	order := make([]string, 0, len(conf.Upstreams))
-	for _, uc := range conf.Upstreams {
-		wanted[uc.Name] = true
-		order = append(order, uc.Name)
-		u, ok := b.upstreams[uc.Name]
-		if !ok {
-			continue
-		}
-		if u.removed {
-			slog.Info("Upstream re-added", "upstream", uc.Name)
-			u.removed = false
-			if u.drain != nil && u.drain.removal {
-				u.drain = nil
+	order := make([]string, 0, conf.UpstreamCount())
+	for _, site := range conf.Sites {
+		for _, uc := range site.Upstreams {
+			id := upstreamID(site.Name, uc.Name)
+			wanted[id] = true
+			order = append(order, id)
+			if u, ok := b.upstreams[id]; ok {
+				u.update(site, uc, changedByID[id])
 			}
-		}
-		if probed := changedByName[uc.Name]; probed != nil && !u.hasAddresses(uc.Addresses) {
-			slog.Info("Upstream addresses changed", "upstream", uc.Name, "addresses", uc.Addresses, "healthy", probed.isHealthy())
-			u.replaceAddresses(probed)
 		}
 	}
 	for _, u := range added {
-		slog.Info("Upstream added", "upstream", u.name, "healthy", u.isHealthy())
-		b.upstreams[u.name] = u
+		slog.Info("Upstream added", "site", u.site, "upstream", u.name, "healthy", u.isHealthy())
+		b.upstreams[u.id] = u
 	}
-	for _, name := range b.order {
-		if wanted[name] {
+	for _, id := range b.order {
+		if wanted[id] {
 			continue
 		}
-		u := b.upstreams[name]
+		u := b.upstreams[id]
 		if !u.removed {
-			slog.Info("Upstream removed, draining it", "upstream", name, "duration", conf.DrainDuration)
+			slog.Info("Upstream removed, draining it", "site", u.site, "upstream", u.name, "duration", conf.DrainDuration)
 			u.removed = true
 			if u.drain == nil {
 				u.drain = newDrainState(now, conf.DrainDuration, true)
 			}
 		}
-		order = append(order, name)
+		order = append(order, id)
 	}
 	b.order = order
 	b.config = conf
 	return true
 }
 
-// DrainUpstream takes an upstream out of rotation and closes its streams over d
+// update applies an upstream's reloaded config: back from removal, the site's health check, and
+// the addresses and first-probe health of probed, if they changed. The caller must hold Balancer.mu.
+func (u *Upstream) update(site *config.Site, uc *config.Upstream, probed *Upstream) {
+	if u.removed {
+		slog.Info("Upstream re-added", "site", u.site, "upstream", u.name)
+		u.removed = false
+		if u.drain != nil && u.drain.removal {
+			u.drain = nil
+		}
+	}
+	if probed != nil && !u.hasAddresses(uc.Addresses) {
+		slog.Info("Upstream addresses changed", "site", u.site, "upstream", u.name, "addresses", uc.Addresses, "healthy", probed.isHealthy())
+		u.replaceAddresses(probed)
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.health = site.HealthCheck
+}
+
+// DrainUpstream takes an upstream ("site/name", or the name if only one site has it) out of
+// rotation and closes its streams over d
 func (b *Balancer) DrainUpstream(name string, d time.Duration) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	u, ok := b.upstreams[name]
-	if !ok || u.removed {
-		return ErrUpstreamNotFound
+	u, err := b.findNoLock(name)
+	if err != nil {
+		return err
 	}
-	slog.Info("Draining upstream", "upstream", name, "duration", d)
+	slog.Info("Draining upstream", "site", u.site, "upstream", u.name, "duration", d)
 	u.drain = newDrainState(time.Now(), d, false)
 	return nil
 }
@@ -299,11 +327,11 @@ func (b *Balancer) DrainUpstream(name string, d time.Duration) error {
 func (b *Balancer) UndrainUpstream(name string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	u, ok := b.upstreams[name]
-	if !ok || u.removed {
-		return ErrUpstreamNotFound
+	u, err := b.findNoLock(name)
+	if err != nil {
+		return err
 	}
-	slog.Info("Undraining upstream", "upstream", name)
+	slog.Info("Undraining upstream", "site", u.site, "upstream", u.name)
 	u.drain = nil
 	return nil
 }
@@ -390,6 +418,11 @@ func (u *Upstream) Name() string {
 	return u.name
 }
 
+// Site returns the name of the upstream's site
+func (u *Upstream) Site() string {
+	return u.site
+}
+
 // AddressCount returns how many addresses the upstream has
 func (u *Upstream) AddressCount() int {
 	u.mu.Lock()
@@ -405,9 +438,12 @@ func (u *Upstream) NextAddress() string {
 	return u.nextAddressNoLock(time.Now())
 }
 
-func newUpstream(uc *config.Upstream) *Upstream {
+func newUpstream(site *config.Site, uc *config.Upstream) *Upstream {
 	return &Upstream{
+		id:          upstreamID(site.Name, uc.Name),
+		site:        site.Name,
 		name:        uc.Name,
+		health:      site.HealthCheck,
 		addresses:   slices.Clone(uc.Addresses),
 		addrStreams: make(map[string]int),
 		addrPending: make(map[string]int),
@@ -427,10 +463,41 @@ func (b *Balancer) healthyNoLock() bool {
 	return false
 }
 
+// upstream returns an upstream by ID or unique name (see findNoLock), removed or not, or nil
 func (b *Balancer) upstream(name string) *Upstream {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.upstreams[name]
+	for _, u := range b.upstreams {
+		if u.id == name || u.name == name {
+			return u
+		}
+	}
+	return nil
+}
+
+// findNoLock returns the upstream in the config with an ID, or with a name that only one site
+// has. The caller must hold b.mu.
+func (b *Balancer) findNoLock(name string) (*Upstream, error) {
+	if u, ok := b.upstreams[name]; ok && !u.removed {
+		return u, nil
+	}
+	var found *Upstream
+	for _, id := range b.order {
+		if u := b.upstreams[id]; u.name == name && !u.removed {
+			if found != nil {
+				return nil, ErrUpstreamAmbiguous
+			}
+			found = u
+		}
+	}
+	if found == nil {
+		return nil, ErrUpstreamNotFound
+	}
+	return found, nil
+}
+
+func upstreamID(site, name string) string {
+	return site + "/" + name
 }
 
 // status returns the upstream's snapshot. The caller must hold Balancer.mu.
@@ -438,6 +505,7 @@ func (u *Upstream) status(now time.Time) *UpstreamStatus {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	s := &UpstreamStatus{
+		Site:      u.site,
 		Name:      u.name,
 		Healthy:   u.healthy,
 		Removed:   u.removed,

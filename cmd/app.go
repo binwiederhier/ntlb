@@ -1,4 +1,4 @@
-// Package cmd implements the ntfy-lb command line
+// Package cmd implements the ntlb command line
 package cmd
 
 import (
@@ -9,8 +9,8 @@ import (
 	"os"
 
 	"github.com/urfave/cli/v3"
-	"heckel.io/ntfy-lb/client"
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/client"
+	"heckel.io/ntlb/config"
 )
 
 const (
@@ -21,12 +21,12 @@ const (
 	flagLogLevel = "log-level"
 )
 
-// New returns the ntfy-lb CLI app. Its flags work anywhere on the command line, also after a
+// New returns the ntlb CLI app. Its flags work anywhere on the command line, also after a
 // subcommand and its arguments. Commands and flags are created fresh for every app, because
 // urfave/cli keeps parse state in them, e.g. a flag set once ignores its env var from then on.
 func New() *cli.Command {
 	return &cli.Command{
-		Name:                   "ntfy-lb",
+		Name:                   "ntlb",
 		Usage:                  "load balancer for ntfy",
 		UseShortOptionHandling: true,
 		Reader:                 os.Stdin,
@@ -36,19 +36,19 @@ func New() *cli.Command {
 			&cli.StringFlag{
 				Name:    flagConfig,
 				Aliases: []string{"c"},
-				Sources: cli.EnvVars("NTFY_LB_CONFIG"),
+				Sources: cli.EnvVars("NTLB_CONFIG"),
 				Value:   config.DefaultFile,
 				Usage:   "config file",
 			},
 			&cli.StringFlag{
 				Name:    flagAdminURL,
 				Aliases: []string{"a"},
-				Sources: cli.EnvVars("NTFY_LB_ADMIN_URL"),
+				Sources: cli.EnvVars("NTLB_ADMIN_URL"),
 				Usage:   "admin API URL (default: listen-admin from the config file, or " + config.DefaultListenAdmin + ")",
 			},
 			&cli.StringFlag{
 				Name:    flagLogLevel,
-				Sources: cli.EnvVars("NTFY_LB_LOG_LEVEL"),
+				Sources: cli.EnvVars("NTLB_LOG_LEVEL"),
 				Value:   "info",
 				Usage:   "log level: debug, info, warn or error",
 			},

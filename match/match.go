@@ -48,6 +48,7 @@ type Env struct {
 	Host   string                     `expr:"host"`   // The Host header
 	Scheme string                     `expr:"scheme"` // "http" or "https"
 	IP     string                     `expr:"ip"`     // Client address; IPv4-mapped IPv6 as IPv4
+	Site   string                     `expr:"site"`   // The site serving the host, "" if none does
 	Header func(name string) string   `expr:"header"` // First value of a header, "" if missing
 	Flag   func(names ...string) bool `expr:"flag"`   // See flag
 }
@@ -63,6 +64,7 @@ type ResponseEnv struct {
 	Host           string `expr:"host"`
 	Scheme         string `expr:"scheme"`
 	IP             string `expr:"ip"`
+	Site           string `expr:"site"`
 	Status         int    `expr:"status"`          // Status sent to the client (499: it left before one)
 	UpstreamStatus int    `expr:"upstream_status"` // Status of the upstream that answered, 0 if none did
 	Rule           string `expr:"rule"`            // The rule that decided the request, "" if none did
@@ -142,6 +144,7 @@ func NewResponseEnv(env *Env) *ResponseEnv {
 		Host:   env.Host,
 		Scheme: env.Scheme,
 		IP:     env.IP,
+		Site:   env.Site,
 	}
 }
 

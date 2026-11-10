@@ -5,15 +5,16 @@
 package rules
 
 import (
+	"iter"
 	"net/http"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"heckel.io/ntfy-lb/balancer"
-	"heckel.io/ntfy-lb/config"
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/match"
 )
 
 // sweepInterval is how often a limiter forgets the buckets that refilled
@@ -28,7 +29,8 @@ type Engine struct {
 
 // state is one generation of rules, swapped as a whole on Update
 type state struct {
-	rules          []*rule
+	rules          []*rule            // Global rules
+	sites          map[string][]*rule // Rules by site
 	bans           *bans
 	ipv4PrefixBits int
 	ipv6PrefixBits int
@@ -68,24 +70,13 @@ func New(conf *config.Config, onBan func(line string)) *Engine {
 func (e *Engine) Update(conf *config.Config) {
 	old := e.state.Load()
 	next := &state{
+		sites:          make(map[string][]*rule),
 		ipv4PrefixBits: conf.ClientKey.IPv4PrefixBits,
 		ipv6PrefixBits: conf.ClientKey.IPv6PrefixBits,
 	}
-	for _, c := range conf.Rules {
-		r := &rule{
-			conf: c,
-		}
-		if c.Action == config.ActionLimit {
-			r.limiter = old.reusableLimiter(next, c)
-			if r.limiter == nil {
-				r.limiter = &limiter{
-					perSecond: c.RatePerSecond,
-					capacity:  float64(c.Burst + 1),
-					buckets:   make(map[string]*bucket),
-				}
-			}
-		}
-		next.rules = append(next.rules, r)
+	next.rules = old.newRules(next, conf.Rules)
+	for _, site := range conf.Sites {
+		next.sites[site.Name] = old.newRules(next, site.Rules)
 	}
 	if conf.Bans != nil {
 		if old != nil && old.bans != nil && old.bans.sameAs(conf.Bans, conf.ClientKey) {
@@ -97,11 +88,12 @@ func (e *Engine) Update(conf *config.Config) {
 	e.state.Store(next)
 }
 
-// Check returns the rule that blocks or limits the request, or nil if it may pass
+// Check returns the rule that decides the request, or nil if it is to be proxied: the global
+// rules first, then those of the request's site (env.Site)
 func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 	s := e.state.Load()
 	var key string
-	for _, rl := range s.rules {
+	for rl := range s.rulesFor(env.Site) {
 		if rl.conf.On != config.OnRequest || (rl.conf.Program != nil && !rl.conf.Program.Match(env)) {
 			continue
 		}
@@ -126,17 +118,73 @@ func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 	return nil
 }
 
-// reusableLimiter returns the old limiter of the rule if it can carry over into next
+// rulesFor returns the global rules followed by the site's
+func (s *state) rulesFor(site string) iter.Seq[*rule] {
+	return func(yield func(*rule) bool) {
+		for _, rl := range s.rules {
+			if !yield(rl) {
+				return
+			}
+		}
+		for _, rl := range s.sites[site] {
+			if !yield(rl) {
+				return
+			}
+		}
+	}
+}
+
+// newRules makes the rules of the next state, with the limiters of s that can carry over
+func (s *state) newRules(next *state, confs []*config.Rule) []*rule {
+	rules := make([]*rule, 0, len(confs))
+	for _, c := range confs {
+		r := &rule{
+			conf: c,
+		}
+		if c.Action == config.ActionLimit {
+			r.limiter = s.reusableLimiter(next, c)
+			if r.limiter == nil {
+				r.limiter = &limiter{
+					perSecond: c.RatePerSecond,
+					capacity:  float64(c.Burst + 1),
+					buckets:   make(map[string]*bucket),
+				}
+			}
+		}
+		rules = append(rules, r)
+	}
+	return rules
+}
+
+// reusableLimiter returns the old limiter of the rule (by ID) if it can carry over into next
 func (s *state) reusableLimiter(next *state, c *config.Rule) *limiter {
 	if s == nil || s.ipv4PrefixBits != next.ipv4PrefixBits || s.ipv6PrefixBits != next.ipv6PrefixBits {
 		return nil
 	}
-	for _, r := range s.rules {
-		if r.limiter != nil && r.conf.Name == c.Name && r.conf.RatePerSecond == c.RatePerSecond && r.conf.Burst == c.Burst {
+	for r := range s.all() {
+		if r.limiter != nil && r.conf.ID == c.ID && r.conf.RatePerSecond == c.RatePerSecond && r.conf.Burst == c.Burst {
 			return r.limiter
 		}
 	}
 	return nil
+}
+
+// all returns every rule, global and of all sites
+func (s *state) all() iter.Seq[*rule] {
+	return func(yield func(*rule) bool) {
+		for _, rl := range s.rules {
+			if !yield(rl) {
+				return
+			}
+		}
+		for _, rules := range s.sites {
+			for _, rl := range rules {
+				if !yield(rl) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // take takes a token from the client's bucket, and reports whether there was one
@@ -194,7 +242,7 @@ func (e *Engine) CheckResponse(env *match.ResponseEnv) {
 		return
 	}
 	var addr netip.Addr
-	for _, rl := range s.rules {
+	for rl := range s.rulesFor(env.Site) {
 		if rl.conf.On != config.OnResponse || (rl.conf.Program != nil && !rl.conf.Program.Match(env)) {
 			continue
 		}
@@ -210,7 +258,7 @@ func (e *Engine) strike(s *state, addr netip.Addr, rule *config.Rule) {
 	if s.bans == nil || rule.Strike == 0 {
 		return
 	}
-	if line, ok := s.bans.strike(addr, rule.Strike, rule.Name, e.now()); ok && e.onBan != nil {
+	if line, ok := s.bans.strike(addr, rule.Strike, rule.ID, e.now()); ok && e.onBan != nil {
 		e.onBan(line)
 	}
 }

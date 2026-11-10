@@ -72,9 +72,9 @@ rules:
 
 	// Counted per rule
 	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
-	require.Contains(t, metrics, `ntfy_lb_rule_matches_total{rule="abuse"} 1`)
-	require.Contains(t, metrics, `ntfy_lb_rule_matches_total{rule="spy"} 1`)
-	require.Contains(t, metrics, `ntfy_lb_requests_total{code="403",kind="request",upstream=""} 1`)
+	require.Contains(t, metrics, `ntlb_rule_matches_total{rule="abuse"} 1`)
+	require.Contains(t, metrics, `ntlb_rule_matches_total{rule="spy"} 1`)
+	require.Contains(t, metrics, `ntlb_requests_total{code="403",kind="request",site="s",upstream=""} 1`)
 }
 
 func TestServer_RuleLimits(t *testing.T) {
@@ -233,7 +233,7 @@ rules:
 	require.Contains(t, string(data), " 127.0.0.1 127.0.0.1/32 abuse\n")
 	require.Contains(t, string(data), " 127.0.0.2 127.0.0.2/32 not-found\n")
 	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
-	require.Contains(t, metrics, "ntfy_lb_bans_total 2")
+	require.Contains(t, metrics, "ntlb_bans_total 2")
 }
 
 func TestServer_AccessLogsByStatus(t *testing.T) {

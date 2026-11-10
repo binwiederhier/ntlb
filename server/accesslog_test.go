@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntlb/config"
 )
 
 func TestAccessLog_AccessLog(t *testing.T) {
@@ -25,7 +25,7 @@ func TestAccessLog_AccessLog(t *testing.T) {
 	resp.Body.Close()
 	waitFor(t, func() bool {
 		b, _ := os.ReadFile(logFile)
-		return strings.Contains(string(b), `"GET /name HTTP/1.1" 200 4 "-" "ntfy-test"`) && strings.Contains(string(b), "upstream=app1 upstream_status=200")
+		return strings.Contains(string(b), `"GET /name HTTP/1.1" 200 4 "-" "ntfy-test"`) && strings.Contains(string(b), "http_host="+s.HTTPAddr()+" site=s request_time=") && strings.Contains(string(b), "upstream=app1 upstream_status=200")
 	})
 }
 

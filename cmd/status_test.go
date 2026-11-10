@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/balancer"
-	"heckel.io/ntfy-lb/server"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/server"
 )
 
 // newTestServer runs a load balancer in front of fake upstreams that answer every request with 200
@@ -29,13 +29,13 @@ func newTestServer(t *testing.T, names ...string) (*server.Server, string) {
 // by handler, and returns its path
 func writeTestConfig(t *testing.T, extra string, handler http.Handler, names ...string) string {
 	var b strings.Builder
-	b.WriteString("listen-http: '127.0.0.1:0'\nlisten-admin: '127.0.0.1:0'\nhealth-check: {interval: 1h, timeout: 1s}\n")
+	b.WriteString("listen-http: '127.0.0.1:0'\nlisten-admin: '127.0.0.1:0'\n")
 	b.WriteString(extra)
-	b.WriteString("upstreams:\n")
+	b.WriteString("sites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n")
 	for _, name := range names {
 		upstream := httptest.NewServer(handler)
 		t.Cleanup(upstream.Close)
-		fmt.Fprintf(&b, "  - name: %s\n    addresses: [%q]\n", name, strings.TrimPrefix(upstream.URL, "http://"))
+		fmt.Fprintf(&b, "      - name: %s\n        addresses: [%q]\n", name, strings.TrimPrefix(upstream.URL, "http://"))
 	}
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(b.String()), 0600))
@@ -72,7 +72,7 @@ func run(t *testing.T, s *server.Server, args ...string) (string, error) {
 	app := New()
 	var out bytes.Buffer
 	app.Writer, app.ErrWriter = &out, &out
-	err := app.Run(context.Background(), append([]string{"ntfy-lb", "--admin-url", "http://" + s.AdminAddr()}, args...))
+	err := app.Run(context.Background(), append([]string{"ntlb", "--admin-url", "http://" + s.AdminAddr()}, args...))
 	return out.String(), err
 }
 
@@ -99,7 +99,7 @@ func TestStatus_Unreachable(t *testing.T) {
 	app := New()
 	var out bytes.Buffer
 	app.Writer, app.ErrWriter = &out, &out
-	err := app.Run(context.Background(), []string{"ntfy-lb", "--admin-url", "http://127.0.0.1:1", "status"})
+	err := app.Run(context.Background(), []string{"ntlb", "--admin-url", "http://127.0.0.1:1", "status"})
 	require.Error(t, err)
 }
 
@@ -209,6 +209,7 @@ func TestStatus_AllStates(t *testing.T) {
 		Streams:       42,
 		Upstreams: []*balancer.UpstreamStatus{
 			{
+				Site:      "ntfy",
 				Name:      "app1",
 				State:     balancer.StateHealthy,
 				Healthy:   true,
@@ -218,12 +219,14 @@ func TestStatus_AllStates(t *testing.T) {
 				Failures:  3,
 			},
 			{
+				Site:      "ntfy",
 				Name:      "app2",
 				State:     balancer.StateUnhealthy,
 				Addresses: []string{"10.0.0.2:2586"},
 				LastError: "connection refused",
 			},
 			{
+				Site:          "ntfy",
 				Name:          "app3",
 				State:         balancer.StateDraining,
 				Addresses:     []string{"10.0.0.3:2586"},
@@ -231,6 +234,7 @@ func TestStatus_AllStates(t *testing.T) {
 				DrainDeadline: &deadline,
 			},
 			{
+				Site:      "ntfy",
 				Name:      "app4",
 				State:     balancer.StateDrained,
 				Healthy:   true,
@@ -248,11 +252,11 @@ func TestStatus_AllStates(t *testing.T) {
 	lines := strings.Split(out, "\n")
 	require.Regexp(t, `^Load balancer: draining, done in (1h0m0s|59m59s) \(\d\d:\d\d:\d\d\), 42 stream\(s\)$`, lines[0])
 	require.Empty(t, lines[1])
-	require.Regexp(t, `^UPSTREAM\s+STATE\s+STREAMS\s+REQUESTS\s+FAILURES\s+ADDRESSES\s+NOTE$`, lines[2])
-	require.Regexp(t, `^app1\s+healthy\s+40\s+1000\s+3\s+10\.0\.0\.1:2586,10\.0\.0\.1:2587\s*$`, lines[3])
-	require.Regexp(t, `^app2\s+unhealthy\s+0\s+0\s+0\s+10\.0\.0\.2:2586\s+last check: connection refused$`, lines[4])
-	require.Regexp(t, `^app3\s+draining\s+2\s+0\s+0\s+10\.0\.0\.3:2586\s+drained in (1h0m0s|59m59s) \(\d\d:\d\d:\d\d\); unhealthy$`, lines[5])
-	require.Regexp(t, `^app4\s+drained\s+0\s+0\s+0\s+10\.0\.0\.4:2586\s+removed from config$`, lines[6])
+	require.Regexp(t, `^SITE\s+UPSTREAM\s+STATE\s+STREAMS\s+REQUESTS\s+FAILURES\s+ADDRESSES\s+NOTE$`, lines[2])
+	require.Regexp(t, `^ntfy\s+app1\s+healthy\s+40\s+1000\s+3\s+10\.0\.0\.1:2586,10\.0\.0\.1:2587\s*$`, lines[3])
+	require.Regexp(t, `^ntfy\s+app2\s+unhealthy\s+0\s+0\s+0\s+10\.0\.0\.2:2586\s+last check: connection refused$`, lines[4])
+	require.Regexp(t, `^ntfy\s+app3\s+draining\s+2\s+0\s+0\s+10\.0\.0\.3:2586\s+drained in (1h0m0s|59m59s) \(\d\d:\d\d:\d\d\); unhealthy$`, lines[5])
+	require.Regexp(t, `^ntfy\s+app4\s+drained\s+0\s+0\s+0\s+10\.0\.0\.4:2586\s+removed from config$`, lines[6])
 	require.Len(t, lines, 8) // Trailing newline
 
 	// The columns line up

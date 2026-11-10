@@ -1,7 +1,7 @@
-# ntfy-lb config. Reload with "systemctl reload ntfy-lb" (SIGHUP) or "ntfy-lb reload": everything
+# ntlb config. Reload with "systemctl reload ntlb" (SIGHUP) or "ntlb reload": everything
 # but the listen addresses and client-keepalive applies without cutting a stream (a reload says
 # which changed settings need a restart). A config with an error is rejected as a whole, and the
-# old one stays. Unknown keys are an error. Check a file with "ntfy-lb check-config".
+# old one stays. Unknown keys are an error. Check a file with "ntlb check-config".
 #
 # Expressions (match, location) are in the expr language (https://expr-lang.org, also used by
 # CrowdSec's filters) and are checked when the config loads:
@@ -12,17 +12,16 @@
 #   flag("name", ...)                   whether the first of these set (headers first, then
 #                                       query parameters) is 1, yes or true, like ntfy's params
 #   ipIn(ip, "net", ...)                ip in any of these CIDR prefixes or addresses (literals)
+#   site                                the name of the site serving the host ("" if none)
 #   status, upstream_status, rule       response expressions only (access-logs, response rules):
 #                                       the status sent, the upstream's (0: none answered), and
 #                                       the rule that decided the request ("" if none did)
 #   == != < > && || ! in matches (RE2) startsWith endsWith contains + ( ), lower(), trimPrefix(), ...
 
-# Public listeners. HTTPS serves HTTP/2 and HTTP/1.1; the certificate is re-read on reload, so a
-# certbot deploy hook can just run "systemctl reload ntfy-lb".
+# Public listeners, shared by all sites. HTTPS serves HTTP/2 and HTTP/1.1, with the certificate of
+# the site whose hosts match the client's SNI (else the first site's).
 listen-http: ":80"
 listen-https: ":443"
-cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
-key-file: /etc/letsencrypt/live/ntfy.sh/privkey.pem
 
 # Admin API (reload, drain, status), /metrics and pprof. No auth: keep it on localhost.
 listen-admin: "127.0.0.1:2590"
@@ -34,9 +33,9 @@ listen-admin: "127.0.0.1:2590"
 # file whose match (a response expression) is true; one without match takes the rest. A reload
 # reopens the files (logrotate). No access-logs: no access log.
 access-logs:
-  - file: /var/log/ntfy-lb/access.log
+  - file: /var/log/ntlb/access.log
     match: status < 400
-  - file: /var/log/ntfy-lb/access_error.log
+  - file: /var/log/ntlb/access_error.log
 
 # TCP keepalive probes towards the clients and towards the upstreams. Dead peers are detected
 # after idle + interval*count. Set "disable: true" to turn them off.
@@ -56,21 +55,6 @@ upstream-read-timeout: 3m    # Cut a stream after this long without a byte (ntfy
 drain-duration: 5m           # Default for "drain" commands and for upstreams removed from this file
 shutdown-drain-duration: 2m  # SIGTERM: not ready right away, streams closed over this long
 
-# Every address of every upstream is probed; an upstream is healthy if any address is, and an
-# address that fails is skipped until it passes again
-health-check:
-  path: /v1/ready # ntfy's readiness: 503 while draining or passive
-  interval: 5s
-  timeout: 3s
-  fails: 3        # Failed probes in a row before an upstream leaves the rotation
-  passes: 2       # Good probes in a row before it comes back
-
-# Long-lived streams (a request expression; bodyless requests only): they take the low-memory
-# stream path, a draining load balancer turns new ones away, and drains close them at a pace. The
-# default is ntfy's subscriptions minus polls; set your own for another backend, or 'false'.
-# streams:
-#   match: method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")
-
 # What identifies a client for sticky routing, rate limits and bans: its IP, shortened to a prefix
 # (like ntfy's visitor-prefix-bits-ipv4/-ipv6, so a client's limits stay on one node). Changing
 # this re-routes clients, so keep it equal on all load balancers.
@@ -78,29 +62,20 @@ client-key:
   ipv4-prefix-bits: 32
   ipv6-prefix-bits: 64
 
-# Clients are hashed to upstream NAMES, so every load balancer with the same names routes a client
-# to the same node. An address may be a port range, one address per port; each address holds up
-# to ~63k connections from one source IP. Example addresses:
-upstreams:
-  - name: app1
-    addresses: ["10.108.0.11:25010-25017"]
-  - name: app3
-    addresses: ["10.108.0.13:25010-25017"]
-  - name: app5
-    addresses: ["10.108.0.15:25010-25017"]
-
-# Bans: rules add strikes per client key; a client with threshold strikes within window gets one
-# line in file ("<time> <ip> <prefix> <rule>"), which CrowdSec (or fail2ban) turns into a ban.
-# Strikes are not shared between load balancers; the ban tool shares the bans.
+# Bans: rules add strikes per client key; a client with more than threshold strikes within window
+# gets one line in file ("<time> <ip> <prefix> <rule>"), which CrowdSec (or fail2ban) turns into a
+# ban. A rule with a strike above the threshold bans on the first match. Strikes are not shared
+# between load balancers; the ban tool shares the bans.
 bans:
-  file: /var/log/ntfy-lb/ban.log
+  file: /var/log/ntlb/ban.log
   window: 10m
   threshold: 100
 
-# Rules. Request rules are checked in order before a request is proxied; the first block, allow,
-# redirect or static whose match is true decides, and so does a limit that is exceeded. Anything
-# no rule decides is proxied. Response rules ("on: response") are all checked when a request
-# ended, and only add strikes. A rule without match matches every request.
+# Rules. Request rules are checked in order before a request is proxied: these global rules first,
+# then the site's own. The first block, allow, redirect or static whose match is true decides, and
+# so does a limit that is exceeded. Anything no rule decides is proxied. Response rules ("on: response") are all checked when a request ended,
+# and only add strikes. A rule without match matches every request. A site's rules are named
+# "<site>/<name>" in logs and metrics.
 #
 #   action: block      answer status (default 403)
 #   action: limit      a token bucket per client key: rate (per s, m or h) plus burst at once,
@@ -112,44 +87,22 @@ bans:
 #                      no file, like nginx's try_files $uri <fallback>
 #   strike: N          strikes per match (block; limit: per limited request; response rules)
 rules:
-  # Web pages to HTTPS, the docs to docs.ntfy.sh, and the website
-  - name: https-redirect
-    match: scheme == "http" && method == "GET" && path matches "^/($|[-_a-z0-9]{0,64}$|docs/|static/|_next|_site)"
-    action: redirect
-    location: '"https://" + host + uri'
-  - name: docs-redirect
-    match: path == "/docs" || path startsWith "/docs/"
-    action: redirect
-    location: '"https://docs.ntfy.sh/" + trimPrefix(path, "/docs/")'
-  - name: website
-    match: method == "GET" && (path == "/" || path matches "^/(_site|_next)/")
-    action: static
-    root: /var/www/website/html
-    fallback: /index.html
-
-  # Abusive topics and clients: blocked, and banned if they keep coming
+  # Abusive clients, for every site: blocked, and banned if they keep coming
   - name: abuse
-    match: path matches "^/(spam-|my-bets($|/))" || header("User-Agent") matches "(?i)ntfy-spy" || ipIn(ip, "192.0.2.0/24", "2001:db8:bad::/48")
+    match: header("User-Agent") matches "(?i)ntfy-spy" || ipIn(ip, "192.0.2.0/24", "2001:db8:bad::/48")
     action: block
     strike: 20
-  - name: abuse-topic-count # Subscribing to 150+ topics at once
-    match: path matches "^/[^/]*(,[^/,]*){150,}"
-    action: block
-    strike: 20
-
-  # A request limit for everyone except a few known heavy users
-  - name: limit-exempt
-    match: ipIn(ip, "198.51.100.7", "203.0.113.0/24")
-    action: allow
-  - name: limit
-    action: limit
-    rate: 45/m
-    burst: 1000
-    status: 503 # What nginx's limit_req answers by default
-    strike: 1
 
   # Clients that keep sending requests the load balancer cannot even parse
   - name: bad-requests
     on: response
     match: status == 400 && upstream_status == 0
     strike: 1
+
+# Sites: the hosts a site serves, its certificate, health checks, streams, upstreams and rules.
+# A request goes to the site whose hosts match its Host header (exact names, then the longest
+# "*.name" wildcard), else to the one site without hosts; with none, it gets a 404. Sites can be
+# listed here under "sites:", or one per file in the include globs (relative to this file's
+# directory; the file name is the site name unless it sets one). Adding, changing or removing a
+# site file applies on reload.
+include: [sites.d/*.yml]

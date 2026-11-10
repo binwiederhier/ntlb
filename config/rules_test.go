@@ -6,11 +6,11 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/match"
 )
 
 const (
-	rulesTestBase = "listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]\n"
+	rulesTestBase = "listen-http: ':80'\nsites: [{name: s, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
 	rulesTestBans = "bans: {file: /tmp/ban.log, threshold: 10}\n"
 )
 
@@ -127,7 +127,7 @@ func TestParse_RulesInvalid(t *testing.T) {
 		"response with header()":    rulesTestBans + "rules: [{name: a, on: response, match: 'header(\"X\") == \"\"', strike: 1}]",
 		"empty rule":                "rules: [null]",
 		"unknown field":             "rules: [{name: a, action: block, path: ['x']}]",
-		"rules-file is gone":        "rules-file: /etc/ntfy-lb/rules.yml",
+		"rules-file is gone":        "rules-file: /etc/ntlb/rules.yml",
 		"log is gone":               "rules: [{name: a, action: block, log: /tmp/x.log}]",
 	}
 	for name, rules := range tests {
@@ -149,14 +149,18 @@ func TestLoad_PackagingExampleRules(t *testing.T) {
 	c, err := Load("../packaging/config.yml")
 	require.NoError(t, err)
 	byName := make(map[string]*Rule)
-	for _, r := range c.Rules {
-		byName[r.Name] = r
+	for _, r := range append(c.Rules, c.Sites[0].Rules...) {
+		byName[r.ID] = r
 	}
 	topics := func(n int) *match.Env {
 		return match.NewEnv(httptest.NewRequest("GET", "/"+strings.Repeat("a,", n)+"a/json", nil))
 	}
-	require.True(t, byName["abuse-topic-count"].Program.Match(topics(150)))
-	require.False(t, byName["abuse-topic-count"].Program.Match(topics(149)))
-	require.Equal(t, ActionAllow, byName["limit-exempt"].Action)
-	require.Equal(t, 503, byName["limit"].Status)
+	require.True(t, byName["ntfy/abuse-topic-count"].Program.Match(topics(150)))
+	require.False(t, byName["ntfy/abuse-topic-count"].Program.Match(topics(149)))
+	require.Equal(t, ActionAllow, byName["ntfy/limit-exempt"].Action)
+	require.Equal(t, 503, byName["ntfy/limit"].Status)
+	require.True(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/a,my-bets/json", nil))))
+	require.False(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/my-bets2/json", nil))))
+	require.Greater(t, byName["ntfy/abuse-topics"].Strike, c.Bans.Threshold) // Bans on the first request
+	require.Equal(t, OnResponse, byName["bad-requests"].On)
 }

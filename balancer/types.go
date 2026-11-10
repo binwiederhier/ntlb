@@ -23,6 +23,9 @@ var (
 
 	// ErrUpstreamNotFound is returned for an unknown (or removed) upstream name
 	ErrUpstreamNotFound = errors.New("upstream not found")
+
+	// ErrUpstreamAmbiguous is returned for an upstream name that several sites have
+	ErrUpstreamAmbiguous = errors.New("several sites have an upstream of this name, use site/name")
 )
 
 // Status is a snapshot of the load balancer's state, as served by the admin API
@@ -38,6 +41,7 @@ type Status struct {
 
 // UpstreamStatus is a snapshot of one upstream
 type UpstreamStatus struct {
+	Site          string     `json:"site"`
 	Name          string     `json:"name"`
 	State         State      `json:"state"`
 	Healthy       bool       `json:"healthy"`

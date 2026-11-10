@@ -1,4 +1,4 @@
-# ntfy-lb
+# ntlb
 
 A small load balancer built for [ntfy](https://ntfy.sh): sticky routing by client IP that every
 load balancer instance agrees on, active health checks, long-lived streams (JSON/SSE/raw, WebSocket,
@@ -8,7 +8,8 @@ service never makes tens of thousands of clients reconnect at the same second.
 It is built for ntfy, but nothing in it is ntfy-only: which requests are long-lived streams
 (`streams` in the config; default: ntfy's subscriptions), the health check path and the client
 key (`client-key`) are configurable, so it fits any HTTP backend with long-lived streams (SSE, long
-polling, WebSockets).
+polling, WebSockets). One instance can serve several **sites** (virtual hosts), each with its own
+hosts, certificate, upstreams, health checks and rules, in the main file or one file per site.
 
 It is meant to replace the nginx + lbagent pair on the ntfy.sh load balancers (see
 `ntfy/ansible/roles/nginx` and `roles/lbagent`). What it does and does not take over from that
@@ -41,12 +42,16 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
 - **TCP keepalives** towards clients and upstreams, configurable (idle, interval, count).
 - **Several addresses per upstream** (e.g. one node's ports), each good for ~63k connections from
   one source IP; new streams go to the address with the fewest.
-- **Reload without cutting streams** (`SIGHUP`, `systemctl reload`, `ntfy-lb reload`): upstreams,
-  health checks, timeouts, drain durations, streams, the client key, rules, bans, the TLS
-  certificate and the log files. Streams to upstreams that stay are untouched. Listener addresses and client
+- **Sites**: a request goes to the site whose `hosts` match its `Host` header (names and
+  `*.name` wildcards), else to the one site without hosts, else gets a 404. HTTPS picks the
+  certificate by SNI. Sites can live in their own files (`include: [sites.d/*.yml]`, like
+  `sshd_config.d`), and adding or removing a file applies on reload. Upstream names are per site.
+- **Reload without cutting streams** (`SIGHUP`, `systemctl reload`, `ntlb reload`): sites,
+  upstreams, health checks, timeouts, drain durations, streams, the client key, rules, bans, the
+  TLS certificates and the log files. Streams to upstreams that stay are untouched. Listener addresses and client
   keepalives need a restart; a reload says so. A broken config (or certificate, or log path) is
   rejected as a whole.
-- **Rules, changed live**: block, rate limit, allow, redirect or serve from disk the requests a
+- **Rules, changed live** (global ones for every site, then the site's own): block, rate limit, allow, redirect or serve from disk the requests a
   boolean expression matches (method, path, query, host, scheme, client IP and networks, headers;
   `&&`, `||`, `!`, regexes): abusive topics or user agents, a per-IP request limit like nginx's
   `limit_req` and exemptions from it, the HTTP -> HTTPS redirect, a static website. Expressions
@@ -64,7 +69,7 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
   go to another load balancer instead of coming back to be drained again) but keeps serving
   publishes.
 - **`/v1/health` and `/v1/ready`** like ntfy's, plus a status API, Prometheus metrics (requests by
-  upstream/code/kind, durations, streams by protocol, retries, drains, rule matches, bans, Go and
+  site/upstream/code/kind, durations, streams by protocol, retries, drains, rule matches, bans, Go and
   process metrics) on the admin listener and, for Prometheus on a private network, on a separate
   `/metrics`-only listener, pprof, and a CLI on top.
 
@@ -84,13 +89,13 @@ two load balancers, through drains, reloads, a load balancer restart and a `kill
 
 Same load against both (40,000 streams, 150 publishes/s, 430 polls/s, production protocol mix,
 nginx with the production LB config): both delivered every message with no errors. Memory is
-about even (1.99 vs 2.04 GiB; nginx has ~630 MiB fixed, ntfy-lb more per stream). ntfy-lb uses
+about even (1.99 vs 2.04 GiB; nginx has ~630 MiB fixed, ntlb more per stream). ntlb uses
 ~2x the CPU (0.75 vs 0.35 cores) and has a higher p99 (6-8 ms vs ~4 ms), with p50 equal at
 ~1 ms. Details in [docs/design.md](docs/design.md#nginx-comparison-2026-11-05).
 
 ### Lab results
 
-Two Proxmox VMs on box13: three independent (unclustered) ntfy nodes, and two ntfy-lb instances
+Two Proxmox VMs on box13: three independent (unclustered) ntfy nodes, and two ntlb instances
 with the same upstream names in a different order. A load generator held 2000 JSON subscriptions
 from 200 source IPs and published to each topic. Since the nodes are not clustered, a message
 only arrives if the subscribe and the publish hit the same node, which makes every routing mistake
@@ -156,45 +161,63 @@ cannot be hijacked.
 ## Quick start
 
 ```bash
-make                                   # fmt-check, vet, tests, build/ntfy-lb
-sudo install -m 755 build/ntfy-lb /usr/bin/ntfy-lb
-sudo install -D -m 644 packaging/config.yml /etc/ntfy-lb/config.yml   # then edit it
-sudo install -m 644 packaging/ntfy-lb.service /etc/systemd/system/
-ntfy-lb check-config
-sudo systemctl enable --now ntfy-lb
-ntfy-lb status
+make                                   # fmt-check, vet, tests, build/ntlb
+sudo install -m 755 build/ntlb /usr/bin/ntlb
+sudo install -D -m 644 packaging/config.yml /etc/ntlb/config.yml   # then edit them
+sudo install -D -m 644 packaging/sites.d/ntfy.yml /etc/ntlb/sites.d/ntfy.yml
+sudo install -m 644 packaging/ntlb.service /etc/systemd/system/
+ntlb check-config
+sudo systemctl enable --now ntlb
+ntlb status
 ```
 
 ## Configuration
 
-See [packaging/config.yml](packaging/config.yml), which documents every option with its default,
-the expression language, and example rules. The essentials:
+See [packaging/config.yml](packaging/config.yml) (global settings) and
+[packaging/sites.d/ntfy.yml](packaging/sites.d/ntfy.yml) (the ntfy.sh site), which document every
+option with its default, the expression language, and example rules. The essentials:
 
 ```yaml
+# /etc/ntlb/config.yml
 listen-http: ":80"
-listen-https: ":443"
-cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
-key-file: /etc/letsencrypt/live/ntfy.sh/privkey.pem
+listen-https: ":443"                  # certificate by SNI, from the sites
 listen-admin: "127.0.0.1:2590"        # admin API: no auth, keep it local
 listen-metrics: "10.108.0.2:25031"    # only /metrics, for Prometheus
 access-logs:
   - {file: /var/log/nginx/access.log, match: status < 400}
   - {file: /var/log/nginx/access_error.log}
+bans: {file: /var/log/ntlb/ban.log, window: 10m, threshold: 100}
+rules:                                # global: checked first, for every site
+  - name: abuse
+    match: ipIn(ip, "203.0.113.0/24", "198.51.100.7") || header("User-Agent") matches "(?i)spy"
+    action: block                     # 403
+    strike: 20                        # towards a ban (more than threshold within window)
+  - name: bad-requests
+    on: response                      # sees status, upstream_status and rule; only strikes
+    match: status == 400 && upstream_status == 0
+    strike: 1
+include: [sites.d/*.yml]              # one site per file, named after the file
+```
+
+```yaml
+# /etc/ntlb/sites.d/ntfy.yml
+hosts: [ntfy.sh, "*.ntfy.sh"]         # leave out: every host no other site serves
+cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
+key-file: /etc/letsencrypt/live/ntfy.sh/privkey.pem
 upstreams:
   - name: app1                        # the NAME is what clients hash to: keep names equal on all LBs
     addresses: ["10.108.0.11:25010-25017"]
   - name: app3
     addresses: ["10.108.0.13:25010-25017"]
-bans: {file: /var/log/ntfy-lb/ban.log, window: 10m, threshold: 100}
-rules:
+rules:                                # after the global rules; logged as "ntfy/<name>"
   - name: https-redirect
     match: scheme == "http" && method == "GET" && path == "/"
     action: redirect
     location: '"https://" + host + uri'
-  - name: abuse
-    match: method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7") || path matches "^/nz_")
-    action: block                     # 403
-    strike: 20                        # towards a ban
+  - name: spam-topic
+    match: path matches "(^/|,)spam-topic(,|/|$)"   # also inside "/a,b/json"
+    action: block
+    strike: 101                       # over the threshold: banned on the first request
   - name: limit-exempt
     match: ipIn(ip, "116.203.112.46", "176.126.240.0/24")
     action: allow                     # stops checking: these skip the limit below
@@ -203,16 +226,13 @@ rules:
     rate: 45/m
     burst: 1000
     strike: 1                         # per limited request
-  - name: bad-requests
-    on: response                      # sees status, upstream_status and rule; only strikes
-    match: status == 400 && upstream_status == 0
-    strike: 1
 ```
 
-A reload applies everything except `listen-*` and `client-keepalive`, which need a restart
-(`ntfy-lb reload` lists them if they changed). Unknown keys are an error.
+Sites can also be listed in the main file under `sites:` (each with a `name`). A reload applies
+everything except `listen-*` and `client-keepalive`, which need a restart (`ntlb reload` lists
+them if they changed). Unknown keys are an error.
 
-For a backend other than ntfy, set which requests are long-lived streams, and the health path:
+For a backend other than ntfy, set the site's long-lived streams and health path:
 
 ```yaml
 streams:
@@ -224,26 +244,27 @@ health-check:
 ## CLI
 
 Flags go anywhere on the command line. The CLI finds the admin API from `--admin-url`, else from
-`listen-admin` in `--config` (default `/etc/ntfy-lb/config.yml`).
+`listen-admin` in `--config` (default `/etc/ntlb/config.yml`).
 
 ```
-ntfy-lb serve                              run (SIGHUP reloads, SIGTERM drains then exits)
-ntfy-lb check-config [-c FILE]             validate a config file
-ntfy-lb status [--json]                    load balancer + upstream state, streams, counters
-ntfy-lb reload                             re-read the config file
-ntfy-lb drain [-d 10m] / undrain           drain the load balancer itself
-ntfy-lb upstream drain NAME [-d 10m]       take a node out of rotation, close its streams over 10m
-ntfy-lb upstream undrain NAME              put it back
+ntlb serve                              run (SIGHUP reloads, SIGTERM drains then exits)
+ntlb check-config [-c FILE]             validate a config file
+ntlb status [--json]                    load balancer + upstream state, streams, counters
+ntlb reload                             re-read the config file
+ntlb drain [-d 10m] / undrain           drain the load balancer itself
+ntlb upstream drain NAME [-d 10m]       take a node out of rotation, close its streams over 10m
+                                        (SITE/NAME if several sites have an upstream NAME)
+ntlb upstream undrain NAME              put it back
 ```
 
 ```
-$ ntfy-lb status
+$ ntlb status
 Load balancer: ready, 2000 stream(s)
 
-UPSTREAM  STATE     STREAMS  REQUESTS  FAILURES  ADDRESSES                            NOTE
-app1      healthy   724      1136      0         192.168.1.48:2186,192.168.1.48:3186
-app2      draining  359      789       0         192.168.1.48:2286                    drained in 18s (02:16:41)
-app3      healthy   864      1353      0         192.168.1.48:2386
+SITE  UPSTREAM  STATE     STREAMS  REQUESTS  FAILURES  ADDRESSES                            NOTE
+ntfy  app1      healthy   724      1136      0         192.168.1.48:2186,192.168.1.48:3186
+ntfy  app2      draining  359      789       0         192.168.1.48:2286                    drained in 18s (02:16:41)
+ntfy  app3      healthy   864      1353      0         192.168.1.48:2386
 ```
 
 Without `-d`, drains use `drain-duration` from the config (default 5m). A drain started by command
@@ -257,24 +278,24 @@ On `listen-admin` only (the public listeners proxy everything, including ntfy's 
 |---|---|
 | `GET /v1/health` | `{"healthy":true}`; 200 if at least one upstream in rotation is healthy, else 503 |
 | `GET /v1/ready` | `{"ready":true,"draining":false}`; 200 if healthy and not draining, else 503 |
-| `GET /v1/status` | full status (JSON), what `ntfy-lb status` shows |
+| `GET /v1/status` | full status (JSON), what `ntlb status` shows |
 | `POST /v1/reload` | re-read the config; 400 with `{"error":...}` if it is invalid (nothing changes); `restart_required` lists changed settings that need a restart |
 | `POST /v1/drain`, `DELETE /v1/drain` | drain / undrain the load balancer; optional body `{"duration":"10m"}` |
-| `POST /v1/upstreams/{name}/drain`, `DELETE ...` | drain / undrain one upstream; same body |
+| `POST /v1/upstreams/{name}/drain`, `DELETE ...` | drain / undrain one upstream (`site%2Fname` if several sites have one of that name: 400 otherwise); same body |
 | `GET /metrics` | Prometheus, see [docs/design.md](docs/design.md#metrics-servermetricsgo) |
 | `GET /debug/pprof/` | Go profiles |
 
 ## Operating it
 
-- **Take a node out**: `ntfy-lb upstream drain app3 -d 10m` on every load balancer (or remove it
+- **Take a node out**: `ntlb upstream drain app3 -d 10m` on every load balancer (or remove it
   from the config and reload). Its clients move to their next node in hash order, about
   `streams / 600` per second.
-- **Take a load balancer out**: `ntfy-lb drain -d 10m` (or `systemctl stop`, which uses
+- **Take a load balancer out**: `ntlb drain -d 10m` (or `systemctl stop`, which uses
   `shutdown-drain-duration`). `/v1/ready` fails right away; streams close evenly over the duration;
   new subscriptions get 503 + `Connection: close`; publishes are served until the end.
-- **Certificate renewal**: a certbot deploy hook of `systemctl reload ntfy-lb`. Unlike an nginx
+- **Certificate renewal**: a certbot deploy hook of `systemctl reload ntlb`. Unlike an nginx
   reload, this never cuts a stream.
-- **Log rotation** (access logs, ban file): `postrotate systemctl reload ntfy-lb`.
+- **Log rotation** (access logs, ban file): `postrotate systemctl reload ntlb`.
 - **Kernel**: Go listens with a backlog of `net.core.somaxconn`, so set that to 4096 or more
   (nginx used `backlog=4096`), and widen `net.ipv4.ip_local_port_range` for upstream connections.
 - **systemd**: `TimeoutStopSec` must exceed `shutdown-drain-duration` (the unit uses 5m).

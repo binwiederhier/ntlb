@@ -94,13 +94,16 @@ func newAccessLogEntry(r *http.Request, start time.Time) *accessLogEntry {
 
 func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest, status int) {
 	bytes := pr.bytes
-	upstream, upstreamStatus := "-", "-"
+	site, upstream, upstreamStatus := "-", "-", "-"
+	if pr.site != "" {
+		site = pr.site
+	}
 	if pr.upstream != "" {
 		upstream, upstreamStatus = pr.upstream, fmt.Sprint(pr.upstreamStatus)
 	}
-	line := fmt.Sprintf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s request_time=%.3f upstream=%s upstream_status=%s",
+	line := fmt.Sprintf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s site=%s request_time=%.3f upstream=%s upstream_status=%s",
 		e.remoteAddr, e.start.Format(accessLogTimeFormat), e.request, status, bytes,
-		escape(e.referer), escape(e.userAgent), escape(e.host), time.Since(e.start).Seconds(), upstream, upstreamStatus)
+		escape(e.referer), escape(e.userAgent), escape(e.host), site, time.Since(e.start).Seconds(), upstream, upstreamStatus)
 	if pr.rule != "" {
 		line += " rule=" + pr.rule
 	}

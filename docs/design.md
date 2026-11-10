@@ -1,13 +1,13 @@
-# ntfy-lb design
+# ntlb design
 
-How ntfy-lb works inside, the invariants the code relies on, and how it was tested. User-facing
+How ntlb works inside, the invariants the code relies on, and how it was tested. User-facing
 docs are in the [README](../README.md).
 
 ## Packages
 
 | Package | Role |
 |---|---|
-| `config` | YAML config: parse, default, validate. `Parse` is all-or-nothing (unknown keys, null entries and non-positive durations are errors), so a reload with a broken file changes nothing. |
+| `config` | YAML config and the site files it includes: parse, default, validate, find the site for a host. `Parse` is all-or-nothing (unknown keys, null entries and non-positive durations are errors), so a reload with a broken file changes nothing. |
 | `balancer` | The state: upstreams, their health, the open sessions (streams), drains. No HTTP serving. |
 | `server` | Listeners (HTTP, HTTPS, admin), the proxy (`proxy.go`), the admin API, the access log, cert reloads. |
 | `client` | Admin API client used by the CLI. |
@@ -17,7 +17,7 @@ docs are in the [README](../README.md).
 
 `rank(key, names)` scores every upstream name with `splitmix64(fnv1a(key || 0xff || name))` and
 sorts by score (name as tie-break). The key is the client IP shortened to `client-key.ipv4-prefix-bits`
-(default 32) or `hash.ipv6-prefix-bits` (default 64), masked and cut to whole bytes
+(default 32) or `client-key.ipv6-prefix-bits` (default 64), masked and cut to whole bytes
 (`ClientKey`); with the defaults that is 4 or 8 bytes. `TestRank_Golden` pins the hash.
 Properties the tests pin down: the order does not depend on config order or process; removing a
 name only moves keys that ranked it first; adding one only moves keys to it; distribution is
@@ -172,12 +172,38 @@ request: the outermost handler (`finishUnlessDetached`), or the stream goroutine
 not reference the `ResponseWriter` or the request (the access log copies what it needs into an
 `accessLogEntry` upfront), or they pin the very server state the detach frees.
 
+## Sites (`config/sites.go`, `server/certs.go`)
+
+A site is a set of hosts with its own certificate, health check, streams, upstreams and rules.
+`Config.SiteFor` maps a `Host` header (lowercased, port and trailing dot stripped) to a site:
+exact names, then the longest `*.name` wildcard suffix (any depth, like nginx), then the one site
+without hosts. No site means 404 (global rules still run first, so abuse is still blocked and
+struck). Sites come from `sites:` in the main file and from the `include` globs (relative to the
+main file, sorted per glob, one site per file, named after the file unless it sets `name`), so a
+deploy can drop a file into `sites.d/` and reload.
+
+There is still one `Balancer`: upstreams are keyed by `site/name`, `Pick(site, key)` ranks only
+the site's upstreams, and it hashes the bare names, so a site's name does not move clients. Drains
+take `site/name`, or the bare name if only one site has it (`ErrUpstreamAmbiguous` otherwise).
+The load balancer drain, sessions and readiness stay global. Each upstream carries its site's
+health check; the health loop wakes at the shortest interval and probes the upstreams whose
+interval (minus half a round) has passed.
+
+The HTTPS listener has one certificate store for all sites: on each handshake it picks the first
+certificate that `ClientHelloInfo.SupportsCertificate` accepts for the SNI name (SANs, not CN),
+else the first site's, like nginx's default server. A reload loads all of them first, so an
+unreadable one rejects the reload.
+
+Rules have an ID: the name for global rules, `site/name` for a site's, used for limit buckets,
+access logs (`rule=`), metrics and ban lines. `site` is an expression field (request and
+response), so global rules and access logs can tell sites apart.
+
 ## Rules and bans (`rules/`, `match/`, `config/rules.go`, `server/rules.go`)
 
 All expressions in the config (rule and stream `match`, access log `match`, redirect `location`)
 are [expr](https://expr-lang.org) (`match/`), compiled and type-checked when the config loads, so a
 typo or a bad regex rejects the reload. There are three kinds: request booleans (`Env`: method,
-path, query, uri, host, scheme, ip, `header()`, `flag()`, `ipIn()`), response booleans
+path, query, uri, host, scheme, ip, site, `header()`, `flag()`, `ipIn()`), response booleans
 (`ResponseEnv`: the same request fields without `header()`/`flag()`, plus status,
 upstream_status and rule), and strings over the request (redirect locations). Response
 expressions get no header access on purpose: they run when a request ends, which for a stream is
@@ -190,11 +216,11 @@ or a parser of our own, it is what CrowdSec's filters use, and it has no side ef
 (`streams.match`) share it. The proxy drops it right after the stream decision, because
 `header()` holds the request.
 
-`rules.Engine` holds one generation of rules in an atomic pointer. `Check` walks the request
-rules in order: `allow`, `block`, `redirect` and `static` decide, a `limit` decides only when the
+`rules.Engine` holds one generation of rules in an atomic pointer. `Check` walks the global
+request rules, then the request's site's, in order: `allow`, `block`, `redirect` and `static` decide, a `limit` decides only when the
 client's bucket is empty, and a request no rule decides is proxied. `CheckResponse` runs every
-matching response rule when a request ended. Decided requests never reach an upstream; they get an
-access log line with `rule=<name>`, `ntfy_lb_rule_matches_total{rule}`, and the answer from
+matching response rule (global and the site's) when a request ended. Decided requests never reach an upstream; they get an
+access log line with `rule=<name>`, `ntlb_rule_matches_total{rule}`, and the answer from
 `Server.answer`: an error page, a redirect, or a file (`static`: the cleaned path under root, else
 the fallback, like `try_files $uri /index.html`; `http.ServeContent` does types, ranges and
 conditional requests).
@@ -204,13 +230,14 @@ Limits are token buckets per client key (`balancer.ClientKey`, the same prefix a
 
 Bans work like ntfy's `ban.Service`: strikes (from a deciding `block`, from each request a `limit`
 turns away, from matching response rules) go into a leaky bucket per client prefix that holds
-`threshold` strikes and leaks `threshold` per `window`. The strike that overflows it writes one
+`threshold` strikes and leaks `threshold` per `window`. The strike that overflows it (more than
+`threshold`; a rule whose strike is above the threshold bans on the first match) writes one
 line, `<RFC 3339 time> <ip> <prefix> <rule>`, at most once per window per client, to the ban file;
 CrowdSec reads only that (a trigger scenario, like ntfy's ban feed) and does the banning, the
 sharing across load balancers and the escalation. Strikes are counted per load balancer.
 
 Limit buckets and strike buckets are swept inline (at most once a minute, in the request that
-notices), so there is no goroutine. On `Update`, a limit rule with the same name, rate and burst
+notices), so there is no goroutine. On `Update`, a limit rule with the same ID, rate and burst
 keeps its buckets, and the strikes stay if the bans settings and the client key are unchanged, so
 a reload for an unrelated change resets nobody.
 
@@ -231,14 +258,15 @@ building the `Env`), about 0.1% of a core at ntfy.sh's ~720 requests/s.
 Prometheus client on the admin listener's `/metrics`. Request outcomes are recorded by the same
 finisher as the access log (`Server.observe`), so detached streams are counted when they end:
 
-- `ntfy_lb_requests_total{upstream,code,kind}` (kind: request, stream, websocket; upstream empty
-  if none answered; code 499 if the client left before a response)
-- `ntfy_lb_request_duration_seconds{kind="request"}`, `ntfy_lb_stream_duration_seconds`
-- `ntfy_lb_streams{protocol}` (http1, http2, websocket), `ntfy_lb_open_requests`
-- `ntfy_lb_retries_total{reason}` (connect, error, 503), `ntfy_lb_refused_total`,
-  `ntfy_lb_streams_closed_total{reason}` (drained, read_timeout)
-- `ntfy_lb_rule_matches_total{rule}`: requests a rule decided; `ntfy_lb_bans_total`: ban lines
-- `ntfy_lb_ready`, `ntfy_lb_draining`, `ntfy_lb_upstream_{healthy,draining,streams,requests_total,failures_total}`
+- `ntlb_requests_total{site,upstream,code,kind}` (kind: request, stream, websocket; site empty if
+  none serves the host; upstream empty if none answered; code 499 if the client left before a
+  response)
+- `ntlb_request_duration_seconds{kind="request"}`, `ntlb_stream_duration_seconds`
+- `ntlb_streams{protocol}` (http1, http2, websocket), `ntlb_open_requests`
+- `ntlb_retries_total{reason}` (connect, error, 503), `ntlb_refused_total`,
+  `ntlb_streams_closed_total{reason}` (drained, read_timeout)
+- `ntlb_rule_matches_total{rule}`: requests a rule decided; `ntlb_bans_total`: ban lines
+- `ntlb_ready`, `ntlb_draining`, `ntlb_upstream_{healthy,draining,streams,requests_total,failures_total}{site,upstream}`
 - the Go and process collectors (`go_*`, `process_*`: memory, goroutines, fds)
 
 ## Memory
@@ -259,7 +287,7 @@ TLS (~32 KiB) but costs a TCP+TLS connection per subscription request instead of
 ## Lab test (2026-11-04)
 
 Proxmox VMs on box13: `ntfylb-up` (vmid 960, 3 independent ntfy nodes from main @ 05109571, app1
-also on a second port via a NAT redirect) and `ntfylb-lb` (vmid 961, two ntfy-lb instances with the
+also on a second port via a NAT redirect) and `ntfylb-lb` (vmid 961, two ntlb instances with the
 same upstream names in a different order, HTTPS on one). A load generator opened 2000 JSON
 subscriptions from 200 loopback source IPs (`127.0.x.y`) and published to each topic from the same
 IP. The nodes are not clustered, so a message only arrives if subscribe and publish hit the same
@@ -309,7 +337,7 @@ KiB RSS (~17 KiB live heap); the rest is GC headroom, which `GOMEMLIMIT` can tra
 
 ## nginx comparison (2026-11-05)
 
-The same load, 35 minutes each, against ntfy-lb and against nginx 1.28 running the production
+The same load, 35 minutes each, against ntlb and against nginx 1.28 running the production
 LB config (`roles/nginx` with `nginx_lb`: `hash $binary_remote_addr`, HTTP/2, the same TLS and
 proxy settings, access log on; without the abuse maps, `limit_req` and the website). One load
 balancer at a time, publishing through the same one, fresh ntfy nodes for each run (app1 on one
@@ -317,7 +345,7 @@ VM, app2 and app3 on another). Load: 40,000 streams from 4,000 IPs with the prod
 mix, 150 publishes/s (3x the soak, ~1.4x lb-2), 430 polls/s (lb-2), 30 bad requests/s. Memory is
 PSS summed over the unit's processes, CPU is the unit's cgroup usage.
 
-| | ntfy-lb | nginx |
+| | ntlb | nginx |
 |---|---|---|
 | Published / lost | 292,568 / 0 | 292,880 / 0 |
 | Errors (subscribe, publish, poll) | 0 | 0 |
@@ -330,7 +358,7 @@ PSS summed over the unit's processes, CPU is the unit's cgroup usage.
 | Memory per stream | ~52 KB | ~37 KB |
 | Extrapolated to 85k streams (lb-2) | ~4.4 GB | ~3.8 GB |
 
-Where ntfy-lb's CPU goes (60s profile at 40k streams): scheduler and futex wakeups ~25%, write
+Where ntlb's CPU goes (60s profile at 40k streams): scheduler and futex wakeups ~25%, write
 syscalls ~13% (the HTTP/2 server flushes each frame on its own, nginx batches), GC ~11%, TLS
 handshakes ~6%, and `drainTick` ~2%: it walks every session under the balancer lock once a
 second even when nothing drains. Live heap is ~700 MB of the ~2 GB; the rest is GC headroom.

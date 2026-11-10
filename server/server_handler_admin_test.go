@@ -3,14 +3,17 @@ package server
 import (
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/balancer"
+	"heckel.io/ntlb/balancer"
 )
 
 func adminDo(t *testing.T, s *Server, method, path, body string) (int, string) {
@@ -81,6 +84,33 @@ func TestAdmin_DrainUpstream(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, code)
 	code, _ = adminDo(t, s, http.MethodPost, "/v1/upstreams/app1/drain", `{"duration":"banana"}`)
 	require.Equal(t, http.StatusBadRequest, code)
+
+	// By site/name, escaped
+	code, _ = adminDo(t, s, http.MethodPost, "/v1/upstreams/s%2Fapp2/drain", "")
+	require.Equal(t, http.StatusOK, code)
+	require.Equal(t, balancer.StateDraining, adminStatus(t, s).Upstreams[1].State)
+	code, _ = adminDo(t, s, http.MethodDelete, "/v1/upstreams/s%2Fapp2/drain", "")
+	require.Equal(t, http.StatusOK, code)
+	code, _ = adminDo(t, s, http.MethodPost, "/v1/upstreams/x%2Fapp2/drain", "")
+	require.Equal(t, http.StatusNotFound, code)
+}
+
+func TestAdmin_DrainUpstreamAmbiguous(t *testing.T) {
+	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
+listen-http: '127.0.0.1:0'
+listen-admin: '127.0.0.1:0'
+sites:
+  - {name: a, hosts: [a.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: b, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+`, a1.addr(), b1.addr())), 0600))
+	s := startTestServer(t, filename)
+	code, body := adminDo(t, s, http.MethodPost, "/v1/upstreams/app1/drain", "")
+	require.Equal(t, http.StatusBadRequest, code)
+	require.Contains(t, body, "site/name")
+	code, _ = adminDo(t, s, http.MethodDelete, "/v1/upstreams/app1/drain", "")
+	require.Equal(t, http.StatusBadRequest, code)
 }
 
 func TestAdmin_DrainDefaultDuration(t *testing.T) {
@@ -128,21 +158,21 @@ func TestAdmin_Metrics(t *testing.T) {
 	code, body := adminDo(t, s, http.MethodGet, "/metrics", "")
 	require.Equal(t, http.StatusOK, code)
 	for _, want := range []string{
-		"ntfy_lb_ready 0\n",
-		"ntfy_lb_draining 1\n",
-		`ntfy_lb_upstream_healthy{upstream="app1"} 1`,
-		`ntfy_lb_upstream_draining{upstream="app1"} 1`,
-		`ntfy_lb_upstream_streams{upstream="app2"} 0`,
-		`ntfy_lb_requests_total{code="200",kind="request",upstream="app1"} 1`,
-		`ntfy_lb_requests_total{code="503",kind="request",upstream="app2"} 1`,
-		`ntfy_lb_requests_total{code="200",kind="stream",upstream="app1"} 1`,
-		`ntfy_lb_requests_total{code="503",kind="stream",upstream=""} 1`,
-		`ntfy_lb_retries_total{reason="503"} 1`,
-		`ntfy_lb_refused_total 1`,
-		`ntfy_lb_streams_closed_total{reason="drained"} 1`,
-		`ntfy_lb_streams{protocol="http1"} 0`,
-		`ntfy_lb_request_duration_seconds_count{kind="request"} 2`,
-		`ntfy_lb_stream_duration_seconds_count 1`,
+		"ntlb_ready 0\n",
+		"ntlb_draining 1\n",
+		`ntlb_upstream_healthy{site="s",upstream="app1"} 1`,
+		`ntlb_upstream_draining{site="s",upstream="app1"} 1`,
+		`ntlb_upstream_streams{site="s",upstream="app2"} 0`,
+		`ntlb_requests_total{code="200",kind="request",site="s",upstream="app1"} 1`,
+		`ntlb_requests_total{code="503",kind="request",site="s",upstream="app2"} 1`,
+		`ntlb_requests_total{code="200",kind="stream",site="s",upstream="app1"} 1`,
+		`ntlb_requests_total{code="503",kind="stream",site="s",upstream=""} 1`,
+		`ntlb_retries_total{reason="503"} 1`,
+		`ntlb_refused_total 1`,
+		`ntlb_streams_closed_total{reason="drained"} 1`,
+		`ntlb_streams{protocol="http1"} 0`,
+		`ntlb_request_duration_seconds_count{kind="request"} 2`,
+		`ntlb_stream_duration_seconds_count 1`,
 		"go_goroutines ",
 		"process_resident_memory_bytes ",
 	} {
@@ -162,6 +192,6 @@ func TestAdmin_MetricsStreamsByProtocol(t *testing.T) {
 	openSubscription(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
 	openSubscription(t, h2, "https://"+s.HTTPSAddr()+"/mytopic/json")
 	_, body := adminDo(t, s, http.MethodGet, "/metrics", "")
-	require.Contains(t, body, `ntfy_lb_streams{protocol="http1"} 1`)
-	require.Contains(t, body, `ntfy_lb_streams{protocol="http2"} 1`)
+	require.Contains(t, body, `ntlb_streams{protocol="http1"} 1`)
+	require.Contains(t, body, `ntlb_streams{protocol="http2"} 1`)
 }

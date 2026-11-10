@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/match"
 )
 
 // Rule phases
@@ -55,13 +55,14 @@ type Rule struct {
 	Fallback string  `yaml:"fallback"` // static: the file (relative to root) for paths that are no file
 	Strike   float64 `yaml:"strike"`   // Strikes per match (block; limit: per limited request; response rules), see bans
 
+	ID              string         `yaml:"-"` // Name, or site/name for a site's rule
 	Program         *match.Program `yaml:"-"` // Compiled Match; nil matches every request
 	LocationProgram *match.Program `yaml:"-"`
 	RatePerSecond   float64        `yaml:"-"`
 }
 
-func (c *Config) applyRuleDefaults() {
-	for _, r := range c.Rules {
+func applyRuleDefaults(rules []*Rule) {
+	for _, r := range rules {
 		if r == nil {
 			continue
 		}
@@ -81,9 +82,10 @@ func (c *Config) applyRuleDefaults() {
 	}
 }
 
-func (c *Config) validateRules() error {
+// validateRules checks and compiles rules; site is "" for the global rules
+func validateRules(rules []*Rule, site string, bans *Bans) error {
 	names := make(map[string]bool)
-	for i, r := range c.Rules {
+	for i, r := range rules {
 		if r == nil {
 			return fmt.Errorf("rules[%d] is empty", i)
 		} else if !ruleNameRegex.MatchString(r.Name) {
@@ -92,10 +94,14 @@ func (c *Config) validateRules() error {
 			return fmt.Errorf("duplicate rule name %q", r.Name)
 		}
 		names[r.Name] = true
+		r.ID = r.Name
+		if site != "" {
+			r.ID = site + "/" + r.Name
+		}
 		if err := r.compile(); err != nil {
-			return fmt.Errorf("rule %s: %w", r.Name, err)
-		} else if r.Strike > 0 && c.Bans == nil {
-			return fmt.Errorf("rule %s: strike needs a bans section", r.Name)
+			return fmt.Errorf("rule %s: %w", r.ID, err)
+		} else if r.Strike > 0 && bans == nil {
+			return fmt.Errorf("rule %s: strike needs a bans section", r.ID)
 		}
 	}
 	return nil

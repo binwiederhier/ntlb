@@ -12,7 +12,7 @@ import (
 func newReloadCommand() *cli.Command {
 	return &cli.Command{
 		Name:   "reload",
-		Usage:  "Re-read the config file (upstreams, health checks, timeouts, certificate)",
+		Usage:  "Re-read the config file and its site files (sites, upstreams, rules, certificates, ...)",
 		Action: execReload,
 	}
 }
@@ -23,7 +23,7 @@ func newDrainCommand() *cli.Command {
 		Usage: "Drain the load balancer: turn unready and close all streams, oldest first",
 		Description: `Makes /v1/ready fail right away, then closes the open streams a few at a time, so that
 the last one closes after --duration. New requests are still served until then, and turned away
-with 503 after. "ntfy-lb undrain" ends it.`,
+with 503 after. "ntlb undrain" ends it.`,
 		Flags:  []cli.Flag{newDurationFlag()},
 		Action: execDrain,
 	}
@@ -45,17 +45,18 @@ func newUpstreamCommand() *cli.Command {
 			{
 				Name:      "drain",
 				Usage:     "Take an upstream out of rotation and close its streams, oldest first",
-				ArgsUsage: "NAME",
+				ArgsUsage: "[SITE/]NAME",
 				Description: `Sends no new clients to the upstream, and closes its open streams a few at a time, so that
 the last one closes after --duration. The clients reconnect and land on the next upstream in their
-hash order. Lasts until "ntfy-lb upstream undrain", also across reloads.`,
+hash order. Lasts until "ntlb upstream undrain", also across reloads. NAME is the upstream's name,
+or SITE/NAME if several sites have an upstream of that name.`,
 				Flags:  []cli.Flag{newDurationFlag()},
 				Action: execUpstreamDrain,
 			},
 			{
 				Name:      "undrain",
 				Usage:     "Put a drained upstream back into rotation",
-				ArgsUsage: "NAME",
+				ArgsUsage: "[SITE/]NAME",
 				Action:    execUpstreamUndrain,
 			},
 		},

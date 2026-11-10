@@ -16,9 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"heckel.io/ntfy-lb/balancer"
-	"heckel.io/ntfy-lb/config"
-	"heckel.io/ntfy-lb/match"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/match"
 )
 
 const (
@@ -63,6 +63,7 @@ type proxyRequest struct {
 	session        *balancer.Session
 	cancel         context.CancelCauseFunc
 	env            *match.Env // The request as expressions see it, if Server.observe made one
+	site           string     // The site serving the request, "" if none does
 	rule           string     // The rule that decided the request, if any
 	upstream       string     // Set once an upstream answered
 	upstreamStatus int
@@ -327,7 +328,14 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if env == nil {
 		env = match.NewEnv(r)
 	}
-	subscription := isSubscription(env, conf.Streams)
+	site := conf.SiteFor(r.Host)
+	if site == nil {
+		pr.env, pr.kind = nil, kindRequest
+		http.Error(w, "no site for this host", http.StatusNotFound)
+		return
+	}
+	pr.site = site.Name
+	subscription := isSubscription(env, site.Streams)
 	pr.env = nil                                                                    // Its header() holds the whole request, which a detached stream must not keep
 	stream := subscription && r.Header.Get("Upgrade") == "" && r.ContentLength == 0 // WebSockets and requests with a body stay on the reverse proxy
 	switch {
@@ -433,7 +441,7 @@ func (p *proxy) closeAll(ctx context.Context) error {
 // A request whose body was partly sent is never resent, as there is no copy of it.
 func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	pr := proxyRequestFromContext(req.Context())
-	candidates := p.balancer.Pick(pr.key)
+	candidates := p.balancer.Pick(pr.site, pr.key)
 	if len(candidates) == 0 {
 		return nil, errNoUpstream
 	}
