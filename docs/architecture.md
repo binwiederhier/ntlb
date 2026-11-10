@@ -383,7 +383,7 @@ followed). The ntfy site probes `/v1/ready`, which is 503 while a node drains.
 ### An upstream goes bad
 
 What clients see depends on how the node breaks. The README's
-[health check section](../README.md#health-checks-and-what-happens-when-one-goes-bad) has the
+[health check section](configuration.md#health-checks-and-what-happens-when-one-goes-bad) has the
 timings; these are the paths.
 
 **The node dies** (connections refused or reset). Requests notice before the health checks do:
