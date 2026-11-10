@@ -15,7 +15,7 @@ import (
 // Request kinds, the "kind" label
 const (
 	kindRequest    = "request"     // Anything that is not a subscription
-	kindStream     = "stream"      // A subscription on the stream path
+	kindStream     = "stream"      // A subscription that is no WebSocket (bodyless GETs on the stream path)
 	kindWebSocket  = "websocket"   // A subscription upgraded to a WebSocket
 	kindBadRequest = "bad_request" // Rejected before the handler (malformed, oversized, cut off)
 )

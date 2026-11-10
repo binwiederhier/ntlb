@@ -385,7 +385,11 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			http.Error(sw, "Bad Request", http.StatusBadRequest)
 			return
 		}
-		w = newGzipWriter(sw, r, conf.GzipFor(site), pr)
+		var out http.ResponseWriter = sw
+		if rule != nil {
+			out = boundAnswer(sw, r, site)
+		}
+		w = newGzipWriter(out, r, conf.GzipFor(site), pr)
 		if gw, ok := w.(*gzipWriter); ok {
 			defer gw.close() // Runs before the deferred finish above, which reads sw
 		}
@@ -395,6 +399,27 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(withProxyRequest(r.Context(), pr)))
 	})
+}
+
+// boundAnswer prepares the answer of a rule like a proxied response: every write to the client is
+// bounded by the site's read timeout, so a client that stops reading (say, a large static file)
+// is cut instead of holding the handler, the file and a compressor; and a request body is not
+// waited for: the connection closes after the answer instead of reading the rest of the body.
+func boundAnswer(sw *statusWriter, r *http.Request, site *config.Site) http.ResponseWriter {
+	timeout := config.DefaultUpstreamReadTimeout
+	if site != nil {
+		timeout = site.Upstream.Timeouts.Read
+	}
+	if r.ContentLength != 0 {
+		sw.Header().Set(headerConnection, connectionClose)
+	}
+	return &deadlineWriter{
+		ResponseWriter: sw,
+		conn: &clientConn{
+			ctrl: http.NewResponseController(sw),
+		},
+		timeout: timeout,
+	}
 }
 
 // writeAccessLog writes the request to the first access log of its site whose match is true. The
@@ -600,8 +625,10 @@ func newHTTPServer(name string, handler http.Handler) *http.Server {
 	}
 }
 
+// WriteHeader records the first final status: an informational one (100 Continue, 103 Early
+// Hints) is followed by the real one, except 101, which ends the response as an upgrade
 func (w *statusWriter) WriteHeader(status int) {
-	if w.status == 0 {
+	if w.status == 0 && (status >= 200 || status == http.StatusSwitchingProtocols) {
 		w.status = status
 	}
 	w.ResponseWriter.WriteHeader(status)

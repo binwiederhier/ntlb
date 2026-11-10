@@ -1204,3 +1204,26 @@ sites:
 	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
 	require.Contains(t, metrics, `ntlb_retries_total{reason="connect"} 1`)
 }
+
+func TestServer_InformationalResponseIsNotTheStatus(t *testing.T) {
+	// A 103 Early Hints before the final 404: metrics, the access log and response rules see 404
+	app1 := newRawUpstream(t, "app1", func(conn net.Conn) {
+		head, _ := readRequestHead(conn)
+		if answerReady(conn, head) {
+			return
+		}
+		io.WriteString(conn, "HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nno!")
+	})
+	accessLog := filepath.Join(t.TempDir(), "access.log")
+	s, _ := newTestServer(t, "access-logs: [{file: "+accessLog+", match: 'status == 404'}]", app1)
+	status, body := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/missing")
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, "no!", body)
+	waitFor(t, func() bool {
+		b, _ := os.ReadFile(accessLog)
+		return strings.Contains(string(b), `"GET /missing HTTP/1.1" 404 3`)
+	})
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_requests_total{code="404",kind="request",site="s",upstream="app1"} 1`)
+	require.NotContains(t, metrics, `code="103"`)
+}

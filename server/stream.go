@@ -107,7 +107,16 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, pr *proxyReq
 			return
 		}
 	}
-	if err := copyStreamHTTP2(w, us, pr); err != nil {
+	cc := &clientConn{
+		ctrl: http.NewResponseController(w),
+	}
+	stopClient := context.AfterFunc(r.Context(), func() {
+		safely("stream cancel", cc.interrupt) // A drain must not wait for a write blocked on the client's window
+	})
+	err = copyStreamHTTP2(w, us, cc, pr)
+	stopClient()
+	cc.end()
+	if err != nil {
 		panic(http.ErrAbortHandler) // Resets the stream: a cut must not look like a complete response
 	}
 }
@@ -251,8 +260,8 @@ func copyStreamHTTP1(client net.Conn, us *upstreamStream, head []byte, pr *proxy
 
 // copyStreamHTTP2 writes the response through the ResponseWriter, flushing every write. It
 // returns an error if the stream did not end cleanly (upstream cut, read timeout, drain).
-func copyStreamHTTP2(w http.ResponseWriter, us *upstreamStream, pr *proxyRequest) error {
-	rc := http.NewResponseController(w)
+func copyStreamHTTP2(w http.ResponseWriter, us *upstreamStream, cc *clientConn, pr *proxyRequest) error {
+	rc := cc.ctrl
 	header := us.resp.Header.Clone()
 	removeHopHeaders(header)
 	for k, v := range header {
@@ -263,7 +272,7 @@ func copyStreamHTTP2(w http.ResponseWriter, us *upstreamStream, pr *proxyRequest
 		return err
 	}
 	write := func(b []byte) error {
-		rc.SetWriteDeadline(time.Now().Add(pr.readTimeout))
+		cc.setWriteDeadline(time.Now().Add(pr.readTimeout))
 		n, err := w.Write(b)
 		pr.bytes += int64(n)
 		if err != nil {

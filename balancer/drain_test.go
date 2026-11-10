@@ -344,10 +344,30 @@ func TestBalancer_AttachWhileUpstreamDraining(t *testing.T) {
 	require.Equal(t, 4, countCanceled(old))
 	require.Equal(t, 4, countCanceled(late))
 
-	// And after the deadline, a stream attaching to the drained upstream is closed on the next tick
+	// And after the deadline, a stream attaching to the drained upstream is closed right away: no
+	// tick scans the sessions for a drain that is done
+	b.drainTick(start.Add(11 * time.Second)) // Past the deadline (DrainUpstream started a bit after start)
 	s := newTestSession(b, "app1")
-	b.drainTick(start.Add(11 * time.Second))
 	require.True(t, s.canceled())
+}
+
+func TestBalancer_FinishedDrainDoesNotScan(t *testing.T) {
+	// A drained upstream that stays drained (until undrain) costs the drain tick nothing, also with
+	// many streams on the other upstreams: at 85k sessions a scan holds the lock for milliseconds
+	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
+	b := newTestBalancer(t, app1, app2)
+	for range 1000 {
+		newTestSession(b, "app1")
+	}
+	start := time.Now()
+	idle := testing.AllocsPerRun(10, func() {
+		b.drainTickVictims(start)
+	})
+	require.NoError(t, b.DrainUpstream("app2", 0))
+	b.drainTick(start) // The deadline tick: finished, nothing to close
+	require.Zero(t, testing.AllocsPerRun(10, func() {
+		b.drainTickVictims(start.Add(time.Second))
+	})-idle)
 }
 
 func TestBalancer_AttachToRemovedUpstream(t *testing.T) {

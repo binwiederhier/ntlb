@@ -192,8 +192,8 @@ func (b *Balancer) Attach(s *Session, u *Upstream, addr string) {
 	}
 }
 
-// attach records the session, and reports whether its upstream was forgotten, so that the
-// caller cancels it (outside the lock)
+// attach records the session, and reports whether its upstream was forgotten or is drained, so
+// that the caller cancels it (outside the lock)
 func (b *Balancer) attach(s *Session, u *Upstream, addr string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -205,11 +205,12 @@ func (b *Balancer) attach(s *Session, u *Upstream, addr string) bool {
 	delete(u.addrFails, addr)
 	delete(u.addrRetry, addr)
 	u.mu.Unlock()
-	forgotten := b.upstreams[u.id] != u && !s.canceled
-	if forgotten {
+	late := b.upstreams[u.id] != u || (u.drain != nil && u.drain.finished) // Forgotten, or drained: no tick closes it
+	if late && !s.canceled {
 		s.canceled = true
+		return true
 	}
-	return forgotten
+	return false
 }
 
 // Close unregisters a session

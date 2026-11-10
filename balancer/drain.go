@@ -77,20 +77,23 @@ func (b *Balancer) drainTick(now time.Time) {
 }
 
 // drainTickVictims picks this tick's streams to close. It scans the sessions only while a drain
-// runs: at ~100k streams the scan holds the lock for milliseconds, every tick. (A session that
-// attaches to a forgotten upstream is closed by Attach.)
+// runs: at ~100k streams the scan holds the lock for milliseconds, every tick. A drained upstream
+// (finished, with no stream left) does not count: it may stay drained for days. (A session that
+// attaches to a forgotten or drained upstream is closed by Attach.)
 func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var victims []*Session
 	if b.drain != nil || b.upstreamDrainingNoLock() {
-		var all []*Session
+		var all []*Session // Only for the load balancer's drain
 		byUpstream := make(map[*Upstream][]*Session)
 		for _, s := range b.sessions {
 			if s.canceled {
 				continue
 			}
-			all = append(all, s)
+			if b.drain != nil {
+				all = append(all, s)
+			}
 			if s.upstream != nil && s.upstream.drain != nil {
 				byUpstream[s.upstream] = append(byUpstream[s.upstream], s)
 			}
@@ -120,10 +123,11 @@ func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 	return victims
 }
 
-// upstreamDrainingNoLock reports whether any upstream is draining (removed, or by command)
+// upstreamDrainingNoLock reports whether any upstream is draining (removed, or by command) and
+// has something left to do: its deadline tick, or streams to close
 func (b *Balancer) upstreamDrainingNoLock() bool {
 	for _, u := range b.upstreams {
-		if u.drain != nil {
+		if u.drain != nil && (!u.drain.finished || u.streamCount() > 0) {
 			return true
 		}
 	}

@@ -699,3 +699,64 @@ func TestStream_HTTP2InvalidPathRejected(t *testing.T) {
 	require.Equal(t, "Bad Request\n", string(body)) // Our answer, not the upstream's parser ("400 Bad Request")
 	require.Equal(t, int64(0), app1.hits.Load())
 }
+
+func TestStream_OnlyGETTakesTheStreamPath(t *testing.T) {
+	// A streams.match that matches other methods: they are proxied as they are (the stream path
+	// writes a GET), and still count as streams
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/events", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, "%s %s", r.Method, body)
+	})
+	s, _ := newTestServer(t, `streams: {match: 'path == "/events"'}`, app1)
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodGet} {
+		req, err := http.NewRequest(method, "http://"+s.HTTPAddr()+"/events", nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.Equal(t, method+" ", string(body))
+	}
+	resp, err := http.Post("http://"+s.HTTPAddr()+"/events", "text/plain", strings.NewReader("with body"))
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, "POST with body", string(body))
+	waitFor(t, func() bool {
+		_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+		return strings.Contains(metrics, `ntlb_requests_total{code="200",kind="stream",site="s",upstream="app1"} 5`)
+	})
+}
+
+func TestStream_HTTP2DrainInterruptsBlockedWrite(t *testing.T) {
+	// An HTTP/2 client that stops reading fills its flow-control window, and the handler blocks in
+	// a write; a drain must still end the stream right away, not after the write timeout
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/flood/json", func(w http.ResponseWriter, r *http.Request) {
+		chunk := strings.Repeat("x", 64*1024)
+		for r.Context().Err() == nil {
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+	})
+	s := newTLSTestServer(t, "timeouts: {read: 1h}", app1)
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		ForceAttemptHTTP2: true,
+	}
+	defer transport.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: transport}).Get("https://" + s.HTTPSAddr() + "/flood/json")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, 2, resp.ProtoMajor)
+	time.Sleep(300 * time.Millisecond) // The window fills up: the client reads nothing
+	require.NoError(t, s.balancer.DrainUpstream("app1", 0))
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 0
+	})
+}

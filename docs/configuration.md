@@ -185,7 +185,7 @@ upstream:
 |---|---|---|
 | `balance` | `round-robin` | Which server a request goes to, see below. |
 | `timeouts.connect` | `5s` | A server address that does not accept within this is down for the request; the next one is tried. |
-| `timeouts.read` | `60s` | Cut a response (or a WebSocket) after this long without a byte. Streams need their server to send keepalives within it. Also bounds a client that stops reading; a stalled upload is cut after 60s, or this if shorter. |
+| `timeouts.read` | `60s` | Cut a response (or a WebSocket) after this long without a byte. Streams need their server to send keepalives within it. Also bounds a client that stops reading, also one of the site's own answers (static files, blocks, redirects); a stalled upload is cut after 60s, or this if shorter. |
 | `keepalive` | `{idle: 1m, interval: 15s, count: 4}` | TCP keepalive towards the servers; a dead peer is noticed after `idle + interval * count`. `{disable: true}` turns it off. |
 | `health-check` | `{path: /, interval: 5s, timeout: 3s, fails: 3, passes: 2}` | See [Health checks](#health-checks-and-what-happens-when-one-goes-bad). |
 | `servers` | required | The backend nodes: a `name`, one or more `addresses`, and optionally a `weight` (1 to 1000, default 1) and `backup: true`. Names are per site. At least one server must not be a backup. |

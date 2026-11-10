@@ -149,13 +149,16 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	pr.site = site.Name
 	subscription := isSubscription(env, site.Streams)
-	pr.env = nil                                                                    // Its header() holds the whole request, which a detached stream must not keep
-	stream := subscription && r.Header.Get("Upgrade") == "" && r.ContentLength == 0 // WebSockets and requests with a body stay on the reverse proxy
+	pr.env = nil // Its header() holds the whole request, which a detached stream must not keep
+	upgrade := r.Header.Get("Upgrade") != ""
+	// Only bodyless GETs take the stream path, which writes a GET; WebSockets, other methods and
+	// requests with a body stay on the reverse proxy
+	stream := subscription && r.Method == http.MethodGet && !upgrade && r.ContentLength == 0
 	switch {
-	case stream:
-		pr.kind = kindStream
-	case subscription:
+	case subscription && upgrade:
 		pr.kind = kindWebSocket
+	case subscription:
+		pr.kind = kindStream
 	default:
 		pr.kind = kindRequest
 	}
@@ -530,16 +533,17 @@ func (b *clientBody) Close() error {
 // handler returned; after that, the ResponseWriter must not be touched (an HTTP/2 one panics),
 // so the handler's end and every deadline change are serialized.
 type clientConn struct {
-	ctrl     *http.ResponseController
-	upgraded net.Conn // The hijacked connection of an upgrade (WebSocket), once there is one
-	done     bool
-	mu       sync.Mutex // Protects upgraded and done, and serializes ctrl calls with the handler's end
+	ctrl        *http.ResponseController
+	upgraded    net.Conn // The hijacked connection of an upgrade (WebSocket), once there is one
+	interrupted bool     // Deadlines are not extended any more
+	done        bool
+	mu          sync.Mutex // Protects upgraded, interrupted and done, and serializes ctrl calls with the handler's end
 }
 
 func (c *clientConn) setReadDeadline(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.done {
+	if !c.done && !c.interrupted {
 		c.ctrl.SetReadDeadline(t)
 	}
 }
@@ -547,16 +551,17 @@ func (c *clientConn) setReadDeadline(t time.Time) {
 func (c *clientConn) setWriteDeadline(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.done {
+	if !c.done && !c.interrupted {
 		c.ctrl.SetWriteDeadline(t)
 	}
 }
 
 // interrupt makes blocked reads and writes on the client connection fail right away, also on a
-// hijacked one, which the upgrade copy then closes
+// hijacked one, which the upgrade copy then closes. Later deadlines do not undo it.
 func (c *clientConn) interrupt() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.interrupted = true
 	if c.upgraded != nil {
 		c.upgraded.SetDeadline(time.Now())
 	} else if !c.done {

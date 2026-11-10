@@ -222,6 +222,8 @@ cannot be hijacked.
   spaces in the unquoted fields), caps each field at 4 KiB, and redacts `auth=` query values (the
   web app's credentials), which nginx logged verbatim.
 - HTTP/2 `:path` and `:authority` are checked like Go's HTTP/1 parser does it (400 otherwise).
+- A request a rule answers (block, limit, redirect, static) is answered without reading its body,
+  and its connection closes after the answer if it had one (nginx reads and discards the body).
 - An upgraded connection (WebSocket) ends when the upstream ends it or after
   `upstream.timeouts.read` without traffic either way; drains close it without a close frame (the
   ntfy clients do not reconnect after one).

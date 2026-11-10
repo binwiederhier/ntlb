@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bufio"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -592,4 +594,54 @@ sites:
 	require.NotContains(t, string(b), "site=b")
 	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
 	require.Contains(t, metrics, `ntlb_rule_matches_total{rule="a/block-x"} 1`)
+}
+
+func TestServer_RuleAnswerToNonReadingClientIsCut(t *testing.T) {
+	// A client that stops reading a large static file (here gzipped) is cut after the read timeout,
+	// like a proxied response, instead of holding the file, the compressor and the connection
+	dir := t.TempDir()
+	file := filepath.Join(dir, "large.txt")
+	data := make([]byte, 8<<20)
+	rng := rand.New(rand.NewPCG(1, 2))
+	for i := range data {
+		data[i] = byte(32 + rng.IntN(95)) // Random text: compresses badly, so it fills every buffer
+	}
+	require.NoError(t, os.WriteFile(file, data, 0600))
+	s, _ := newTestServer(t, testGzip+"timeouts: {read: 100ms}\nrules: [{name: static, action: static, root: "+dir+"}]", newTestUpstream(t, "app1"))
+	conn, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer conn.Close()
+	conn.(*net.TCPConn).SetReadBuffer(4096)
+	fmt.Fprint(conn, "GET /large.txt HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n")
+	open := func() bool {
+		entries, _ := os.ReadDir("/proc/self/fd")
+		for _, e := range entries {
+			if target, _ := os.Readlink("/proc/self/fd/" + e.Name()); target == file {
+				return true
+			}
+		}
+		return false
+	}
+	waitFor(t, open)
+	waitFor(t, func() bool {
+		return !open()
+	})
+}
+
+func TestServer_RuleAnswerDoesNotWaitForTheBody(t *testing.T) {
+	// A rule answers without the request body, and does not wait for one that never comes
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0600))
+	s, _ := newTestServer(t, "rules: [{name: static, action: static, root: "+dir+"}, {name: blocked, match: 'path == \"/blocked\"', action: block}]", newTestUpstream(t, "app1"))
+	for _, target := range []string{"/a.txt", "/blocked"} {
+		conn, err := net.Dial("tcp", s.HTTPAddr())
+		require.NoError(t, err)
+		fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nx", target)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		require.NoError(t, err, target)
+		resp.Body.Close()
+		require.True(t, resp.Close, target) // The rest of the body is not read: the connection ends
+		conn.Close()
+	}
 }
