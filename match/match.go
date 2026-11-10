@@ -1,6 +1,7 @@
-// Package match compiles and evaluates the match expressions of rules: boolean expressions in the
-// expr language (github.com/expr-lang/expr) over a request's method, path, query, host, client IP
-// and headers, e.g. method in ["GET", "POST"] && (ipIn(ip, "10.0.0.0/8") || path matches "^/x").
+// Package match compiles and evaluates the expressions of the config, in the expr language
+// (github.com/expr-lang/expr): booleans over a request (rules, streams), booleans over a request
+// and its outcome (response rules, access logs), and strings (redirect locations), e.g.
+// method in ["GET", "POST"] && (ipIn(ip, "10.0.0.0/8") || path matches "^/x").
 package match
 
 import (
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -27,14 +29,43 @@ var vmPool = sync.Pool{
 	},
 }
 
-// Env is what an expression sees of a request
+// Kind is what an expression is compiled for
+type Kind int
+
+// Expression kinds
+const (
+	Request  Kind = iota // A boolean over the request (Env)
+	Response             // A boolean over the request and its outcome (ResponseEnv)
+	String               // A string over the request (Env), e.g. a redirect location
+)
+
+// Env is what a request expression sees
 type Env struct {
-	Method string                   `expr:"method"`
-	Path   string                   `expr:"path"`  // Decoded, without the query
-	Query  string                   `expr:"query"` // Raw query string
-	Host   string                   `expr:"host"`
-	IP     string                   `expr:"ip"`     // Client address; IPv4-mapped IPv6 as IPv4
-	Header func(name string) string `expr:"header"` // First value of a header, "" if missing
+	Method string                     `expr:"method"`
+	Path   string                     `expr:"path"`   // Decoded, without the query
+	Query  string                     `expr:"query"`  // Raw query string
+	URI    string                     `expr:"uri"`    // Path (escaped as sent) and query
+	Host   string                     `expr:"host"`   // The Host header
+	Scheme string                     `expr:"scheme"` // "http" or "https"
+	IP     string                     `expr:"ip"`     // Client address; IPv4-mapped IPv6 as IPv4
+	Header func(name string) string   `expr:"header"` // First value of a header, "" if missing
+	Flag   func(names ...string) bool `expr:"flag"`   // See flag
+}
+
+// ResponseEnv is what a response expression sees when a request ended: the request without its
+// headers (a stream may end hours later, and keeping its headers for that costs memory), and the
+// outcome
+type ResponseEnv struct {
+	Method         string `expr:"method"`
+	Path           string `expr:"path"`
+	Query          string `expr:"query"`
+	URI            string `expr:"uri"`
+	Host           string `expr:"host"`
+	Scheme         string `expr:"scheme"`
+	IP             string `expr:"ip"`
+	Status         int    `expr:"status"`          // Status sent to the client (499: it left before one)
+	UpstreamStatus int    `expr:"upstream_status"` // Status of the upstream that answered, 0 if none did
+	Rule           string `expr:"rule"`            // The rule that decided the request, "" if none did
 }
 
 // Program is a compiled match expression
@@ -48,20 +79,27 @@ type networks struct {
 	err      error
 }
 
-// Compile compiles and type-checks an expression, which must be boolean
-func Compile(expression string) (*Program, error) {
+// Compile compiles and type-checks an expression of a kind
+func Compile(expression string, kind Kind) (*Program, error) {
 	if strings.TrimSpace(expression) == "" {
 		return nil, errors.New("empty expression")
 	}
 	nets := &networks{
 		prefixes: make(map[string]netip.Prefix),
 	}
-	program, err := expr.Compile(expression,
-		expr.Env(Env{}),
-		expr.AsBool(),
+	opts := []expr.Option{
 		expr.Patch(nets),
 		expr.Function(ipInFunc, nets.ipIn, new(func(string, ...string) bool)),
-	)
+	}
+	switch kind {
+	case Request:
+		opts = append(opts, expr.Env(Env{}), expr.AsBool())
+	case Response:
+		opts = append(opts, expr.Env(ResponseEnv{}), expr.AsBool())
+	default:
+		opts = append(opts, expr.Env(Env{}), expr.AsKind(reflect.String))
+	}
+	program, err := expr.Compile(expression, opts...)
 	if err != nil {
 		return nil, err
 	} else if nets.err != nil {
@@ -72,28 +110,62 @@ func Compile(expression string) (*Program, error) {
 	}, nil
 }
 
-// NewEnv takes what expressions see from a request, once for all rules
+// NewEnv takes what expressions see from a request, once for all expressions
 func NewEnv(r *http.Request) *Env {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
 	return &Env{
 		Method: r.Method,
 		Path:   r.URL.Path,
 		Query:  r.URL.RawQuery,
+		URI:    r.URL.RequestURI(),
 		Host:   r.Host,
+		Scheme: scheme,
 		IP:     clientIP(r.RemoteAddr),
 		Header: r.Header.Get,
+		Flag: func(names ...string) bool {
+			return flag(r, names)
+		},
 	}
 }
 
-// Match evaluates the expression; an expression that fails at runtime does not match
-func (p *Program) Match(env *Env) bool {
+// NewResponseEnv takes the request part of a response expression's view, so that the request
+// itself can be let go; the caller fills in the outcome when the request ends
+func NewResponseEnv(env *Env) *ResponseEnv {
+	return &ResponseEnv{
+		Method: env.Method,
+		Path:   env.Path,
+		Query:  env.Query,
+		URI:    env.URI,
+		Host:   env.Host,
+		Scheme: env.Scheme,
+		IP:     env.IP,
+	}
+}
+
+// Match evaluates a boolean expression with an *Env or *ResponseEnv; an expression that fails at
+// runtime does not match
+func (p *Program) Match(env any) bool {
+	matched, _ := p.run(env).(bool)
+	return matched
+}
+
+// String evaluates a string expression; one that fails at runtime is ""
+func (p *Program) String(env *Env) string {
+	s, _ := p.run(env).(string)
+	return s
+}
+
+func (p *Program) run(env any) any {
 	v := vmPool.Get().(*vm.VM)
 	defer vmPool.Put(v)
 	out, err := v.Run(p.program, env)
 	if err != nil {
-		return false
+		return nil
 	}
-	matched, _ := out.(bool)
-	return matched
+	return out
 }
 
 // Visit checks and parses the networks of every ipIn call; the first error fails the compile
@@ -157,6 +229,31 @@ func parsePrefix(s string) (netip.Prefix, error) {
 		return netip.Prefix{}, fmt.Errorf("invalid network %q: %w", s, err)
 	}
 	return netip.PrefixFrom(addr, addr.BitLen()), nil
+}
+
+// flag is flag(name...), like ntfy's readParam for a boolean: the first of the names that is set
+// as a header, else the first set as a query parameter, decides; it is true if 1, yes or true
+func flag(r *http.Request, names []string) bool {
+	for _, name := range names {
+		if v := strings.TrimSpace(r.Header.Get(name)); v != "" {
+			return isTrue(v)
+		}
+	}
+	query := r.URL.Query()
+	for _, name := range names {
+		if v := strings.TrimSpace(query.Get(name)); v != "" {
+			return isTrue(v)
+		}
+	}
+	return false
+}
+
+func isTrue(s string) bool {
+	switch strings.ToLower(s) {
+	case "1", "yes", "true":
+		return true
+	}
+	return false
 }
 
 // clientIP is the address part of a remote address, IPv4-mapped IPv6 as IPv4, "" if unparseable

@@ -512,12 +512,12 @@ func TestServer_ReloadAppliesStreamsAndHash(t *testing.T) {
 	_, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
 	closeStream()
 	require.Equal(t, "HTTP/1.0", app1.lastProto.Load())
-	writeConfig(t, filename, "streams: {disable: true}\nhash: {ipv4-prefix-bits: 8}", app1)
+	writeConfig(t, filename, "streams: {match: 'false'}\nclient-key: {ipv4-prefix-bits: 8}", app1)
 	requireReload(t, s)
 	_, closeStream = openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
 	closeStream()
 	require.Equal(t, "HTTP/1.1", app1.lastProto.Load())
-	require.Equal(t, 8, s.config.Load().Hash.IPv4PrefixBits)
+	require.Equal(t, 8, s.config.Load().ClientKey.IPv4PrefixBits)
 }
 
 // newRawUpstream is an upstream that hands every connection to handle, for malformed or
@@ -609,7 +609,7 @@ func TestServer_NewFailureLeaksNothing(t *testing.T) {
 	require.NoError(t, err)
 	defer busy.Close()
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	conf := fmt.Sprintf("listen-http: '127.0.0.1:0'\nlisten-admin: %q\naccess-log: %s\n%s", busy.Addr().String(), filepath.Join(t.TempDir(), "access.log"), upstreamsYAML(app1))
+	conf := fmt.Sprintf("listen-http: '127.0.0.1:0'\nlisten-admin: %q\naccess-logs: [{file: %s}]\n%s", busy.Addr().String(), filepath.Join(t.TempDir(), "access.log"), upstreamsYAML(app1))
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	before := runtime.NumGoroutine()
 	for i := 0; i < 10; i++ {

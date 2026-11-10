@@ -1,20 +1,42 @@
-# ntfy-lb config. Reload with "systemctl reload ntfy-lb" (SIGHUP) or "ntfy-lb reload":
-# everything but the listen addresses and client-keepalive applies without cutting a stream (a
-# reload says which changed settings need a restart). Unknown keys are an error.
+# ntfy-lb config. Reload with "systemctl reload ntfy-lb" (SIGHUP) or "ntfy-lb reload": everything
+# but the listen addresses and client-keepalive applies without cutting a stream (a reload says
+# which changed settings need a restart). A config with an error is rejected as a whole, and the
+# old one stays. Unknown keys are an error. Check a file with "ntfy-lb check-config".
+#
+# Expressions (match, location) are in the expr language (https://expr-lang.org, also used by
+# CrowdSec's filters) and are checked when the config loads:
+#
+#   method, path, query, uri, host, scheme ("http"/"https"), ip   the request (path is decoded,
+#                                       uri is the path and query as sent)
+#   header("Name")                      the first value of a header, "" if missing
+#   flag("name", ...)                   whether the first of these set (headers first, then
+#                                       query parameters) is 1, yes or true, like ntfy's params
+#   ipIn(ip, "net", ...)                ip in any of these CIDR prefixes or addresses (literals)
+#   status, upstream_status, rule       response expressions only (access-logs, response rules):
+#                                       the status sent, the upstream's (0: none answered), and
+#                                       the rule that decided the request ("" if none did)
+#   == != < > && || ! in matches (RE2) startsWith endsWith contains + ( ), lower(), trimPrefix(), ...
 
-# Public listeners. HTTPS serves HTTP/2 and HTTP/1.1; the certificate is re-read on reload,
-# so a certbot deploy hook can just run "systemctl reload ntfy-lb".
+# Public listeners. HTTPS serves HTTP/2 and HTTP/1.1; the certificate is re-read on reload, so a
+# certbot deploy hook can just run "systemctl reload ntfy-lb".
 listen-http: ":80"
 listen-https: ":443"
 cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
 key-file: /etc/letsencrypt/live/ntfy.sh/privkey.pem
 
-# Admin API, /v1/health, /v1/ready and /metrics. No auth: keep it on localhost or a private IP.
+# Admin API (reload, drain, status), /metrics and pprof. No auth: keep it on localhost.
 listen-admin: "127.0.0.1:2590"
 
-# Access log in nginx "combined" format plus key=value fields. A reload reopens it (logrotate),
-# moves it, or turns it on or off.
-# access-log: /var/log/ntfy-lb/access.log
+# Only /metrics, e.g. for Prometheus on a private network (optional)
+# listen-metrics: "10.108.0.2:25031"
+
+# Access logs, in nginx's "combined" format plus key=value fields. A request goes to the first
+# file whose match (a response expression) is true; one without match takes the rest. A reload
+# reopens the files (logrotate). No access-logs: no access log.
+access-logs:
+  - file: /var/log/ntfy-lb/access.log
+    match: status < 400
+  - file: /var/log/ntfy-lb/access_error.log
 
 # TCP keepalive probes towards the clients and towards the upstreams. Dead peers are detected
 # after idle + interval*count. Set "disable: true" to turn them off.
@@ -43,33 +65,91 @@ health-check:
   fails: 3        # Failed probes in a row before an upstream leaves the rotation
   passes: 2       # Good probes in a row before it comes back
 
-# Long-lived streams: GET requests whose path matches, unless the first of the exclude params that
-# is set (headers first, then query parameters, in list order, like ntfy's readParam) is 1, yes or
-# true. Streams take the low-memory stream path, and a draining load balancer turns new ones away.
-# The defaults are ntfy's subscriptions; for another backend, set your own (or disable: true).
-streams:
-  path: '^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$'
-  exclude-params: [x-poll, poll, po]
+# Long-lived streams (a request expression; bodyless requests only): they take the low-memory
+# stream path, a draining load balancer turns new ones away, and drains close them at a pace. The
+# default is ntfy's subscriptions minus polls; set your own for another backend, or 'false'.
+# streams:
+#   match: method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")
 
-# The client key for sticky routing: the client IP shortened to a prefix (like ntfy's
-# visitor-prefix-bits-ipv4/-ipv6, so a client's rate limits stay on one node). Changing this
-# re-routes clients, so keep it equal on all load balancers.
-hash:
+# What identifies a client for sticky routing, rate limits and bans: its IP, shortened to a prefix
+# (like ntfy's visitor-prefix-bits-ipv4/-ipv6, so a client's limits stay on one node). Changing
+# this re-routes clients, so keep it equal on all load balancers.
+client-key:
   ipv4-prefix-bits: 32
   ipv6-prefix-bits: 64
 
-# Rules that block, rate limit or allow requests by path, query, method, IP and headers, e.g. for
-# abusive clients; see rules.yml for the format. Reloaded with the config, open streams untouched.
-# rules-file: /etc/ntfy-lb/rules.yml
-
-# Clients are hashed to upstream NAMES (rendezvous hashing over their IP, IPv6 by /64), so every
-# load balancer with the same names routes a client to the same node. Several addresses per
-# upstream (e.g. one node's ports) each hold up to ~63k connections from one source IP.
-# Example addresses
+# Clients are hashed to upstream NAMES, so every load balancer with the same names routes a client
+# to the same node. An address may be a port range, one address per port; each address holds up
+# to ~63k connections from one source IP. Example addresses:
 upstreams:
   - name: app1
-    addresses: ["10.108.0.11:2586", "10.108.0.11:2587"]
+    addresses: ["10.108.0.11:25010-25017"]
   - name: app3
-    addresses: ["10.108.0.13:2586", "10.108.0.13:2587"]
+    addresses: ["10.108.0.13:25010-25017"]
   - name: app5
-    addresses: ["10.108.0.15:2586", "10.108.0.15:2587"]
+    addresses: ["10.108.0.15:25010-25017"]
+
+# Bans: rules add strikes per client key; a client with threshold strikes within window gets one
+# line in file ("<time> <ip> <prefix> <rule>"), which CrowdSec (or fail2ban) turns into a ban.
+# Strikes are not shared between load balancers; the ban tool shares the bans.
+bans:
+  file: /var/log/ntfy-lb/ban.log
+  window: 10m
+  threshold: 100
+
+# Rules. Request rules are checked in order before a request is proxied; the first block, allow,
+# redirect or static whose match is true decides, and so does a limit that is exceeded. Anything
+# no rule decides is proxied. Response rules ("on: response") are all checked when a request
+# ended, and only add strikes. A rule without match matches every request.
+#
+#   action: block      answer status (default 403)
+#   action: limit      a token bucket per client key: rate (per s, m or h) plus burst at once,
+#                      like nginx's limit_req burst=N nodelay; over it, answer status (default
+#                      429); under it, check the next rules
+#   action: allow      stop checking and proxy, e.g. to exempt clients from a limit
+#   action: redirect   answer status (default 302) with location, a string expression
+#   action: static     serve a file from root, or fallback (relative to root) for paths that are
+#                      no file, like nginx's try_files $uri <fallback>
+#   strike: N          strikes per match (block; limit: per limited request; response rules)
+rules:
+  # Web pages to HTTPS, the docs to docs.ntfy.sh, and the website
+  - name: https-redirect
+    match: scheme == "http" && method == "GET" && path matches "^/($|[-_a-z0-9]{0,64}$|docs/|static/|_next|_site)"
+    action: redirect
+    location: '"https://" + host + uri'
+  - name: docs-redirect
+    match: path == "/docs" || path startsWith "/docs/"
+    action: redirect
+    location: '"https://docs.ntfy.sh/" + trimPrefix(path, "/docs/")'
+  - name: website
+    match: method == "GET" && (path == "/" || path matches "^/(_site|_next)/")
+    action: static
+    root: /var/www/website/html
+    fallback: /index.html
+
+  # Abusive topics and clients: blocked, and banned if they keep coming
+  - name: abuse
+    match: path matches "^/(spam-|my-bets($|/))" || header("User-Agent") matches "(?i)ntfy-spy" || ipIn(ip, "192.0.2.0/24", "2001:db8:bad::/48")
+    action: block
+    strike: 20
+  - name: abuse-topic-count # Subscribing to 150+ topics at once
+    match: path matches "^/[^/]*(,[^/,]*){150,}"
+    action: block
+    strike: 20
+
+  # A request limit for everyone except a few known heavy users
+  - name: limit-exempt
+    match: ipIn(ip, "198.51.100.7", "203.0.113.0/24")
+    action: allow
+  - name: limit
+    action: limit
+    rate: 45/m
+    burst: 1000
+    status: 503 # What nginx's limit_req answers by default
+    strike: 1
+
+  # Clients that keep sending requests the load balancer cannot even parse
+  - name: bad-requests
+    on: response
+    match: status == 400 && upstream_status == 0
+    strike: 1

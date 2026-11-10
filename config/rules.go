@@ -1,32 +1,36 @@
 package config
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"gopkg.in/yaml.v3"
 	"heckel.io/ntfy-lb/match"
+)
+
+// Rule phases
+const (
+	OnRequest  = "request"  // Before the request is proxied: the rule may decide what happens to it
+	OnResponse = "response" // When the request ended: the rule may only add strikes
 )
 
 // Rule actions
 const (
-	ActionBlock = "block" // Answer with the rule's status (default 403)
-	ActionLimit = "limit" // Rate limit per client key; over the limit, answer with the status (default 429)
-	ActionAllow = "allow" // Stop evaluating rules, e.g. to exempt clients from a limit below
+	ActionBlock    = "block"    // Answer with status (default 403)
+	ActionLimit    = "limit"    // Rate limit per client key; over the limit, answer with status (default 429)
+	ActionAllow    = "allow"    // Stop checking rules and proxy the request, e.g. to exempt clients from a limit
+	ActionRedirect = "redirect" // Answer with a redirect to location (default 302)
+	ActionStatic   = "static"   // Serve a file from root, or fallback if there is none
 )
 
 // Rule defaults
 const (
-	DefaultBlockStatus = http.StatusForbidden
-	DefaultLimitStatus = http.StatusTooManyRequests
+	DefaultBlockStatus    = http.StatusForbidden
+	DefaultLimitStatus    = http.StatusTooManyRequests
+	DefaultRedirectStatus = http.StatusFound
 )
 
 var (
@@ -34,49 +38,26 @@ var (
 	ratePeriods   = map[string]float64{"s": 1, "m": 60, "h": 3600}
 )
 
-// Rule blocks, limits or allows the requests its match expression matches (see package match);
-// a rule without one matches every request. Rules are checked in order; the first block or allow,
-// or a limit that is exceeded, decides.
+// Rule is one rule. Request rules are checked in order before a request is proxied: the first
+// block, allow, redirect or static whose match is true decides, and so does a limit that is
+// exceeded; a request no rule decides is proxied. Response rules are checked when a request
+// ended, all of them, and only add strikes. A rule without match matches every request.
 type Rule struct {
-	Name   string `yaml:"name"`
-	Match  string `yaml:"match"`
-	Action string `yaml:"action"`
-	Status int    `yaml:"status"`
-	Rate   string `yaml:"rate"`  // Limit only: requests per period, e.g. 45/m (s, m, h)
-	Burst  int    `yaml:"burst"` // Limit only: extra requests allowed at once (like limit_req burst, nodelay)
-	Log    string `yaml:"log"`   // Requests the rule blocks or limits, in the access log format
+	Name     string  `yaml:"name"`
+	On       string  `yaml:"on"`       // request (default) or response
+	Match    string  `yaml:"match"`    // A request or response expression, see package match
+	Action   string  `yaml:"action"`   // Request rules only, required
+	Status   int     `yaml:"status"`   // block, limit, redirect
+	Rate     string  `yaml:"rate"`     // limit: requests per period, e.g. 45/m (s, m, h)
+	Burst    int     `yaml:"burst"`    // limit: extra requests allowed at once (like limit_req burst, nodelay)
+	Location string  `yaml:"location"` // redirect: a string expression, e.g. '"https://" + host + uri'
+	Root     string  `yaml:"root"`     // static: the directory to serve
+	Fallback string  `yaml:"fallback"` // static: the file (relative to root) for paths that are no file
+	Strike   float64 `yaml:"strike"`   // Strikes per match (block; limit: per limited request; response rules), see bans
 
-	Program       *match.Program `yaml:"-"` // Compiled Match; nil matches every request
-	RatePerSecond float64        `yaml:"-"`
-}
-
-// rulesFile is the format of the rules-file, the same as the rules section of the config
-type rulesFile struct {
-	Rules []*Rule `yaml:"rules"`
-}
-
-// loadRulesFile appends the rules of the rules-file, if any. A relative path is relative to dir,
-// the config file's directory.
-func (c *Config) loadRulesFile(dir string) error {
-	if c.RulesFile == "" {
-		return nil
-	}
-	filename := c.RulesFile
-	if !filepath.IsAbs(filename) && dir != "" {
-		filename = filepath.Join(dir, filename)
-	}
-	b, err := os.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("cannot read rules-file: %w", err)
-	}
-	f := &rulesFile{}
-	dec := yaml.NewDecoder(bytes.NewReader(b))
-	dec.KnownFields(true)
-	if err := dec.Decode(f); err != nil && !errors.Is(err, io.EOF) { // EOF: empty file
-		return fmt.Errorf("rules-file %s: %w", filename, err)
-	}
-	c.Rules = append(c.Rules, f.Rules...)
-	return nil
+	Program         *match.Program `yaml:"-"` // Compiled Match; nil matches every request
+	LocationProgram *match.Program `yaml:"-"`
+	RatePerSecond   float64        `yaml:"-"`
 }
 
 func (c *Config) applyRuleDefaults() {
@@ -84,8 +65,8 @@ func (c *Config) applyRuleDefaults() {
 		if r == nil {
 			continue
 		}
-		if r.Action == "" {
-			r.Action = ActionBlock
+		if r.On == "" {
+			r.On = OnRequest
 		}
 		if r.Status == 0 {
 			switch r.Action {
@@ -93,6 +74,8 @@ func (c *Config) applyRuleDefaults() {
 				r.Status = DefaultBlockStatus
 			case ActionLimit:
 				r.Status = DefaultLimitStatus
+			case ActionRedirect:
+				r.Status = DefaultRedirectStatus
 			}
 		}
 	}
@@ -111,6 +94,8 @@ func (c *Config) validateRules() error {
 		names[r.Name] = true
 		if err := r.compile(); err != nil {
 			return fmt.Errorf("rule %s: %w", r.Name, err)
+		} else if r.Strike > 0 && c.Bans == nil {
+			return fmt.Errorf("rule %s: strike needs a bans section", r.Name)
 		}
 	}
 	return nil
@@ -118,20 +103,48 @@ func (c *Config) validateRules() error {
 
 // compile validates the rule and fills in its compiled fields
 func (r *Rule) compile() error {
-	// Action and the settings that belong to it
-	switch r.Action {
-	case ActionBlock, ActionLimit:
-		if r.Status < 100 || r.Status > 599 {
-			return fmt.Errorf("invalid status %d", r.Status)
+	if r.Strike < 0 {
+		return errors.New("strike must not be negative")
+	}
+	kind := match.Request
+	switch r.On {
+	case OnRequest:
+		if err := r.compileAction(); err != nil {
+			return err
 		}
-	case ActionAllow:
-		if r.Status != 0 || r.Log != "" {
-			return errors.New("an allow rule takes no status or log")
+	case OnResponse:
+		kind = match.Response
+		if r.Action != "" || r.Status != 0 || r.Rate != "" || r.Burst != 0 || r.Location != "" || r.Root != "" || r.Fallback != "" {
+			return errors.New("a response rule takes match and strike only")
+		} else if r.Strike == 0 {
+			return errors.New("a response rule needs a strike")
 		}
 	default:
-		return fmt.Errorf("unknown action %q, expected block, limit or allow", r.Action)
+		return fmt.Errorf("unknown on %q, expected request or response", r.On)
 	}
-	if r.Action == ActionLimit {
+	if r.Match != "" {
+		program, err := match.Compile(r.Match, kind)
+		if err != nil {
+			return fmt.Errorf("invalid match: %w", err)
+		}
+		r.Program = program
+	}
+	return nil
+}
+
+// compileAction checks that a request rule has an action and only the settings of its action
+func (r *Rule) compileAction() error {
+	hasRate := r.Rate != "" || r.Burst != 0
+	hasStatic := r.Root != "" || r.Fallback != ""
+	switch r.Action {
+	case ActionBlock:
+		if hasRate || r.Location != "" || hasStatic {
+			return errors.New("block takes status and strike only")
+		}
+	case ActionLimit:
+		if r.Location != "" || hasStatic {
+			return errors.New("limit takes rate, burst, status and strike only")
+		}
 		perSecond, err := parseRate(r.Rate)
 		if err != nil {
 			return err
@@ -139,17 +152,38 @@ func (r *Rule) compile() error {
 			return errors.New("burst must not be negative")
 		}
 		r.RatePerSecond = perSecond
-	} else if r.Rate != "" || r.Burst != 0 {
-		return errors.New("rate and burst are for limit rules only")
-	}
-
-	// Match expression
-	if r.Match != "" {
-		program, err := match.Compile(r.Match)
-		if err != nil {
-			return fmt.Errorf("invalid match: %w", err)
+	case ActionAllow:
+		if r.Status != 0 || hasRate || r.Location != "" || hasStatic || r.Strike != 0 {
+			return errors.New("allow takes no settings")
 		}
-		r.Program = program
+	case ActionRedirect:
+		if hasRate || hasStatic || r.Strike != 0 {
+			return errors.New("redirect takes location and status only")
+		} else if r.Location == "" {
+			return errors.New("redirect needs a location")
+		} else if r.Status < 300 || r.Status > 399 {
+			return fmt.Errorf("invalid redirect status %d", r.Status)
+		}
+		program, err := match.Compile(r.Location, match.String)
+		if err != nil {
+			return fmt.Errorf("invalid location: %w", err)
+		}
+		r.LocationProgram = program
+	case ActionStatic:
+		if r.Status != 0 || hasRate || r.Location != "" || r.Strike != 0 {
+			return errors.New("static takes root and fallback only")
+		} else if r.Root == "" {
+			return errors.New("static needs a root")
+		} else if r.Fallback != "" && !strings.HasPrefix(r.Fallback, "/") {
+			return errors.New("fallback must start with /")
+		}
+	case "":
+		return errors.New("action is required (block, limit, allow, redirect or static)")
+	default:
+		return fmt.Errorf("unknown action %q, expected block, limit, allow, redirect or static", r.Action)
+	}
+	if r.Status != 0 && (r.Status < 100 || r.Status > 599) {
+		return fmt.Errorf("invalid status %d", r.Status)
 	}
 	return nil
 }

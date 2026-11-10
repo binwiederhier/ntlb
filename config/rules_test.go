@@ -2,8 +2,6 @@ package config
 
 import (
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,14 +9,18 @@ import (
 	"heckel.io/ntfy-lb/match"
 )
 
-const rulesTestBase = "listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]\n"
+const (
+	rulesTestBase = "listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]\n"
+	rulesTestBans = "bans: {file: /tmp/ban.log, threshold: 10}\n"
+)
 
 func TestParse_Rules(t *testing.T) {
-	c, err := Parse([]byte(rulesTestBase + `
+	c, err := Parse([]byte(rulesTestBase + rulesTestBans + `
 rules:
   - name: abuse
     match: method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24") || path matches "^/nz_")
-    log: /var/log/ntfy-lb/abuse.log
+    action: block
+    strike: 20
   - name: exempt
     match: ipIn(ip, "116.203.112.46", "176.126.240.0/24")
     action: allow
@@ -26,18 +28,30 @@ rules:
     action: limit
     rate: 45/m
     burst: 1000
+    strike: 0.5
+  - name: docs
+    match: path startsWith "/docs/"
+    action: redirect
+    location: '"https://docs.ntfy.sh/" + trimPrefix(path, "/docs/")'
+  - name: website
+    match: path == "/"
+    action: static
+    root: /var/www/website/html
+    fallback: /index.html
+  - name: bad-requests
+    on: response
+    match: status == 400 && upstream_status == 0
+    strike: 1
 `))
 	require.NoError(t, err)
-	require.Len(t, c.Rules, 3)
+	require.Len(t, c.Rules, 6)
 
-	// Block is the default action, 403 its default status; the expression is compiled
+	// Block: 403 by default; the expression is compiled
 	r := c.Rules[0]
-	require.Equal(t, ActionBlock, r.Action)
+	require.Equal(t, OnRequest, r.On)
 	require.Equal(t, 403, r.Status)
-	require.Equal(t, "/var/log/ntfy-lb/abuse.log", r.Log)
-	require.NotNil(t, r.Program)
-	req := httptest.NewRequest("GET", "/nz_x", nil)
-	require.True(t, r.Program.Match(match.NewEnv(req)))
+	require.Equal(t, 20.0, r.Strike)
+	require.True(t, r.Program.Match(match.NewEnv(httptest.NewRequest("GET", "/nz_x", nil))))
 	require.Zero(t, c.Rules[1].Status)
 
 	// Limit: 429 by default, rate parsed; no match means every request
@@ -46,6 +60,20 @@ rules:
 	require.InDelta(t, 0.75, l.RatePerSecond, 1e-9)
 	require.Equal(t, 1000, l.Burst)
 	require.Nil(t, l.Program)
+
+	// Redirect: 302 by default, location compiled as a string
+	d := c.Rules[3]
+	require.Equal(t, 302, d.Status)
+	require.Equal(t, "https://docs.ntfy.sh/publish/", d.LocationProgram.String(match.NewEnv(httptest.NewRequest("GET", "/docs/publish/", nil))))
+
+	// Static
+	require.Equal(t, "/var/www/website/html", c.Rules[4].Root)
+	require.Equal(t, "/index.html", c.Rules[4].Fallback)
+
+	// Response rules see the outcome
+	b := c.Rules[5]
+	require.Equal(t, OnResponse, b.On)
+	require.True(t, b.Program.Match(&match.ResponseEnv{Status: 400}))
 }
 
 func TestParse_RuleRates(t *testing.T) {
@@ -58,36 +86,52 @@ func TestParse_RuleRates(t *testing.T) {
 
 func TestParse_RulesInvalid(t *testing.T) {
 	tests := map[string]string{
-		"no name":                 "rules: [{match: 'path == \"/x\"'}]",
-		"bad name":                "rules: [{name: 'a b'}]",
-		"duplicate name":          "rules: [{name: a}, {name: a}]",
-		"unknown action":          "rules: [{name: a, action: drop}]",
-		"bad expression":          "rules: [{name: a, match: 'path =='}]",
-		"unknown identifier":      "rules: [{name: a, match: 'agent == \"x\"'}]",
-		"not boolean":             "rules: [{name: a, match: 'path'}]",
-		"bad network":             "rules: [{name: a, match: 'ipIn(ip, \"1.2.3\")'}]",
-		"bad status":              "rules: [{name: a, status: 99}]",
-		"limit without rate":      "rules: [{name: a, action: limit}]",
-		"bad rate":                "rules: [{name: a, action: limit, rate: '45'}]",
-		"bad rate unit":           "rules: [{name: a, action: limit, rate: '45/d'}]",
-		"zero rate":               "rules: [{name: a, action: limit, rate: '0/m'}]",
-		"negative burst":          "rules: [{name: a, action: limit, rate: '1/s', burst: -1}]",
-		"rate on block":           "rules: [{name: a, rate: '1/s'}]",
-		"burst on block":          "rules: [{name: a, burst: 5}]",
-		"status on allow":         "rules: [{name: a, action: allow, status: 403}]",
-		"log on allow":            "rules: [{name: a, action: allow, log: /tmp/x.log}]",
-		"empty rule":              "rules: [null]",
-		"unknown field":           "rules: [{name: a, path: ['x']}]",
-		"missing rules-file":      "rules-file: /nonexistent/rules.yml",
-		"rules-file unknown keys": "", // Filled in below
+		"no name":                   "rules: [{action: block}]",
+		"bad name":                  "rules: [{name: 'a b', action: block}]",
+		"duplicate name":            "rules: [{name: a, action: block}, {name: a, action: block}]",
+		"no action":                 "rules: [{name: a, match: 'path == \"/x\"'}]",
+		"unknown action":            "rules: [{name: a, action: drop}]",
+		"unknown on":                "rules: [{name: a, on: later, action: block}]",
+		"bad expression":            "rules: [{name: a, action: block, match: 'path =='}]",
+		"unknown identifier":        "rules: [{name: a, action: block, match: 'agent == \"x\"'}]",
+		"status in request rule":    "rules: [{name: a, action: block, match: 'status == 400'}]",
+		"not boolean":               "rules: [{name: a, action: block, match: 'path'}]",
+		"bad network":               "rules: [{name: a, action: block, match: 'ipIn(ip, \"1.2.3\")'}]",
+		"bad status":                "rules: [{name: a, action: block, status: 99}]",
+		"limit without rate":        "rules: [{name: a, action: limit}]",
+		"bad rate":                  "rules: [{name: a, action: limit, rate: '45'}]",
+		"bad rate unit":             "rules: [{name: a, action: limit, rate: '45/d'}]",
+		"zero rate":                 "rules: [{name: a, action: limit, rate: '0/m'}]",
+		"negative burst":            "rules: [{name: a, action: limit, rate: '1/s', burst: -1}]",
+		"rate on block":             "rules: [{name: a, action: block, rate: '1/s'}]",
+		"burst on block":            "rules: [{name: a, action: block, burst: 5}]",
+		"status on allow":           "rules: [{name: a, action: allow, status: 403}]",
+		"strike on allow":           "rules: [{name: a, action: allow, strike: 1}]",
+		"strike without bans":       "rules: [{name: a, action: block, strike: 1}]",
+		"negative strike":           "rules: [{name: a, action: block, strike: -1}]",
+		"redirect without location": "rules: [{name: a, action: redirect}]",
+		"redirect bad location":     "rules: [{name: a, action: redirect, location: 'path == \"/\"'}]",
+		"redirect non-3xx":          "rules: [{name: a, action: redirect, location: '\"/x\"', status: 200}]",
+		"location on block":         "rules: [{name: a, action: block, location: '\"/x\"'}]",
+		"static without root":       "rules: [{name: a, action: static}]",
+		"static relative fallback":  "rules: [{name: a, action: static, root: /srv, fallback: index.html}]",
+		"static with status":        "rules: [{name: a, action: static, root: /srv, status: 200}]",
+		"root on block":             "rules: [{name: a, action: block, root: /srv}]",
+		"location on limit":         "rules: [{name: a, action: limit, rate: 1/s, location: '\"/x\"'}]",
+		"rate on redirect":          "rules: [{name: a, action: redirect, location: '\"/x\"', rate: 1/s}]",
+		"strike on redirect":        rulesTestBans + "rules: [{name: a, action: redirect, location: '\"/x\"', strike: 1}]",
+		"location on static":        "rules: [{name: a, action: static, root: /srv, location: '\"/x\"'}]",
+		"strike on static":          rulesTestBans + "rules: [{name: a, action: static, root: /srv, strike: 1}]",
+		"response with action":      rulesTestBans + "rules: [{name: a, on: response, action: block, strike: 1}]",
+		"response without strike":   rulesTestBans + "rules: [{name: a, on: response, match: 'status == 400'}]",
+		"response with header()":    rulesTestBans + "rules: [{name: a, on: response, match: 'header(\"X\") == \"\"', strike: 1}]",
+		"empty rule":                "rules: [null]",
+		"unknown field":             "rules: [{name: a, action: block, path: ['x']}]",
+		"rules-file is gone":        "rules-file: /etc/ntfy-lb/rules.yml",
+		"log is gone":               "rules: [{name: a, action: block, log: /tmp/x.log}]",
 	}
 	for name, rules := range tests {
 		t.Run(name, func(t *testing.T) {
-			if name == "rules-file unknown keys" {
-				filename := filepath.Join(t.TempDir(), "rules.yml")
-				require.NoError(t, os.WriteFile(filename, []byte("rule: []"), 0600))
-				rules = "rules-file: " + filename
-			}
 			_, err := Parse([]byte(rulesTestBase + rules))
 			require.Error(t, err)
 			require.ErrorContains(t, err, "invalid config")
@@ -96,49 +140,23 @@ func TestParse_RulesInvalid(t *testing.T) {
 }
 
 func TestParse_RuleErrorNamesTheRule(t *testing.T) {
-	_, err := Parse([]byte(rulesTestBase + "rules: [{name: spy, match: 'header(\"User-Agent\") matches \"(\"'}]"))
+	_, err := Parse([]byte(rulesTestBase + "rules: [{name: spy, action: block, match: 'header(\"User-Agent\") matches \"(\"'}]"))
 	require.ErrorContains(t, err, "rule spy")
 }
 
-func TestLoad_RulesFile(t *testing.T) {
-	dir := t.TempDir()
-	rules := "rules:\n  - name: from-file\n    match: path startsWith \"/nz_\"\n"
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "rules.yml"), []byte(rules), 0600))
-
-	// A relative rules-file is relative to the config file; its rules come after the inline ones
-	conf := rulesTestBase + "rules-file: rules.yml\nrules: [{name: inline}]\n"
-	filename := filepath.Join(dir, "config.yml")
-	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
-	c, err := Load(filename)
+func TestLoad_PackagingExampleRules(t *testing.T) {
+	// The shipped example's rules do what their comments say
+	c, err := Load("../packaging/config.yml")
 	require.NoError(t, err)
-	require.Len(t, c.Rules, 2)
-	require.Equal(t, "inline", c.Rules[0].Name)
-	require.Equal(t, "from-file", c.Rules[1].Name)
-	require.NotNil(t, c.Rules[1].Program)
-
-	// Names must be unique across both
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "rules.yml"), []byte("rules: [{name: inline}]"), 0600))
-	_, err = Load(filename)
-	require.ErrorContains(t, err, "duplicate rule name")
-
-	// An empty rules-file is fine
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "rules.yml"), nil, 0600))
-	c, err = Load(filename)
-	require.NoError(t, err)
-	require.Len(t, c.Rules, 1)
-}
-
-func TestLoad_PackagingRulesExample(t *testing.T) {
-	// The shipped example must always parse, also with unknown fields rejected
-	conf := rulesTestBase + "rules-file: " + filepath.Join("..", "packaging", "rules.yml")
-	c, err := Parse([]byte(conf))
-	require.NoError(t, err)
-	require.Len(t, c.Rules, 5)
-	require.Equal(t, ActionAllow, c.Rules[3].Action)
-	require.Equal(t, 503, c.Rules[4].Status)
+	byName := make(map[string]*Rule)
+	for _, r := range c.Rules {
+		byName[r.Name] = r
+	}
 	topics := func(n int) *match.Env {
 		return match.NewEnv(httptest.NewRequest("GET", "/"+strings.Repeat("a,", n)+"a/json", nil))
 	}
-	require.True(t, c.Rules[2].Program.Match(topics(150)))
-	require.False(t, c.Rules[2].Program.Match(topics(149)))
+	require.True(t, byName["abuse-topic-count"].Program.Match(topics(150)))
+	require.False(t, byName["abuse-topic-count"].Program.Match(topics(149)))
+	require.Equal(t, ActionAllow, byName["limit-exempt"].Action)
+	require.Equal(t, 503, byName["limit"].Status)
 }

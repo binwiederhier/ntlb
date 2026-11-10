@@ -19,7 +19,7 @@ func testRequest(method, target, remoteAddr string, headers ...string) *http.Req
 
 func matches(t *testing.T, expression string, r *http.Request) bool {
 	t.Helper()
-	p, err := Compile(expression)
+	p, err := Compile(expression, Request)
 	require.NoError(t, err)
 	return p.Match(NewEnv(r))
 }
@@ -31,6 +31,8 @@ func TestNewEnv(t *testing.T) {
 	require.Equal(t, "/nz_x/json", env.Path) // Decoded
 	require.Equal(t, "since=10m&poll=1", env.Query)
 	require.Equal(t, "ntfy.sh", env.Host)
+	require.Equal(t, "/%6Ez_x/json?since=10m&poll=1", env.URI) // As sent
+	require.Equal(t, "http", env.Scheme)
 	require.Equal(t, "203.0.113.9", env.IP) // Unmapped
 	require.Equal(t, "ntfy/1.0", env.Header("user-agent"))
 	require.Equal(t, "", env.Header("X-Missing"))
@@ -105,23 +107,23 @@ func TestCompile_Invalid(t *testing.T) {
 		"assignment-like syntax": `method = "GET"`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := Compile(expression)
+			_, err := Compile(expression, Request)
 			require.Error(t, err)
 		})
 	}
 }
 
 func TestMatch_RuntimeErrorDoesNotMatch(t *testing.T) {
-	p, err := Compile(`len(path) % (len(path) - len(path)) == 0`) // Modulo by zero
+	p, err := Compile(`len(path) % (len(path) - len(path)) == 0`, Request) // Modulo by zero
 	require.NoError(t, err)
 	require.False(t, p.Match(NewEnv(testRequest("GET", "/x", "192.0.2.1:1"))))
 }
 
 func TestMatch_ProgramsAreIndependent(t *testing.T) {
 	// Each program has its own networks
-	a, err := Compile(`ipIn(ip, "10.0.0.0/8")`)
+	a, err := Compile(`ipIn(ip, "10.0.0.0/8")`, Request)
 	require.NoError(t, err)
-	b, err := Compile(`ipIn(ip, "192.0.2.0/24")`)
+	b, err := Compile(`ipIn(ip, "192.0.2.0/24")`, Request)
 	require.NoError(t, err)
 	env := NewEnv(testRequest("GET", "/", "10.1.2.3:1"))
 	require.True(t, a.Match(env))
@@ -129,7 +131,7 @@ func TestMatch_ProgramsAreIndependent(t *testing.T) {
 }
 
 func BenchmarkMatch(b *testing.B) {
-	p, err := Compile(`method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7", "2001:db8::/48") || path matches "^/(nz_|nezha|my-bets($|/))")`)
+	p, err := Compile(`method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7", "2001:db8::/48") || path matches "^/(nz_|nezha|my-bets($|/))")`, Request)
 	require.NoError(b, err)
 	env := NewEnv(testRequest("GET", "/mytopic/json", "192.0.2.1:1", "User-Agent", "ntfy/1.0"))
 	b.ReportAllocs()
@@ -138,4 +140,77 @@ func BenchmarkMatch(b *testing.B) {
 			b.Fatal("unexpected match")
 		}
 	}
+}
+
+func TestNewEnv_Scheme(t *testing.T) {
+	r := testRequest("GET", "https://ntfy.sh/x", "192.0.2.1:1")
+	require.NotNil(t, r.TLS)
+	require.Equal(t, "https", NewEnv(r).Scheme)
+}
+
+func TestFlag(t *testing.T) {
+	// Like ntfy's readParam: headers first, then the query, each in list order; the first one set
+	// decides, and it is true if it is 1, yes or true
+	tests := []struct {
+		name    string
+		target  string
+		headers []string
+		want    bool
+	}{
+		{"none set", "/x/json", nil, false},
+		{"query", "/x/json?poll=1", nil, true},
+		{"query short", "/x/json?po=yes", nil, true},
+		{"query false", "/x/json?poll=0", nil, false},
+		{"query first name wins", "/x/json?poll=0&po=1", nil, false},
+		{"header", "/x/json", []string{"X-Poll", "true"}, true},
+		{"header before query", "/x/json?poll=1", []string{"X-Poll", "no"}, false},
+		{"case-insensitive value", "/x/json?poll=TRUE", nil, true},
+		{"whitespace", "/x/json?poll=%201%20", nil, true},
+		{"empty value is unset", "/x/json?poll=&po=1", nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := testRequest("GET", tt.target, "192.0.2.1:1", tt.headers...)
+			require.Equal(t, tt.want, matches(t, `flag("x-poll", "poll", "po")`, r))
+		})
+	}
+}
+
+func TestCompile_Kinds(t *testing.T) {
+	// Response expressions see the outcome, but no headers: they run when a request ends, which for
+	// a stream is long after the request could have been let go
+	_, err := Compile(`status >= 400 && upstream_status == 0 && rule == "" && path startsWith "/x" && ip != ""`, Response)
+	require.NoError(t, err)
+	_, err = Compile(`header("User-Agent") == ""`, Response)
+	require.Error(t, err)
+	_, err = Compile(`flag("poll")`, Response)
+	require.Error(t, err)
+	_, err = Compile(`status == 200`, Request)
+	require.Error(t, err)
+
+	// Strings, for redirect locations
+	p, err := Compile(`"https://docs.ntfy.sh/" + trimPrefix(path, "/docs/")`, String)
+	require.NoError(t, err)
+	require.Equal(t, "https://docs.ntfy.sh/publish/", p.String(NewEnv(testRequest("GET", "/docs/publish/", "192.0.2.1:1"))))
+	_, err = Compile(`path == "/"`, String)
+	require.Error(t, err)
+	_, err = Compile(`"x"`, Request)
+	require.Error(t, err)
+}
+
+func TestResponseEnv(t *testing.T) {
+	r := testRequest("POST", "https://ntfy.sh/mytopic?x=1", "192.0.2.1:1")
+	env := NewResponseEnv(NewEnv(r))
+	env.Status, env.UpstreamStatus, env.Rule = 503, 0, "limit"
+	require.Equal(t, "/mytopic", env.Path)
+	require.Equal(t, "https", env.Scheme)
+	p, err := Compile(`status == 503 && upstream_status == 0 && rule == "limit" && method == "POST" && query == "x=1" && host == "ntfy.sh" && uri == "/mytopic?x=1"`, Response)
+	require.NoError(t, err)
+	require.True(t, p.Match(env))
+}
+
+func TestString_RuntimeError(t *testing.T) {
+	p, err := Compile(`string(len(path) % (len(path) - len(path)))`, String)
+	require.NoError(t, err)
+	require.Equal(t, "", p.String(NewEnv(testRequest("GET", "/x", "192.0.2.1:1"))))
 }

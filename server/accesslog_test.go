@@ -16,7 +16,7 @@ import (
 func TestAccessLog_AccessLog(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	logFile := filepath.Join(t.TempDir(), "access.log")
-	s, _ := newTestServer(t, "access-log: "+logFile, app1)
+	s, _ := newTestServer(t, "access-logs: [{file: "+logFile+"}]", app1)
 	req, _ := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+"/name", nil)
 	req.Header.Set("User-Agent", "ntfy-test")
 	resp, err := http.DefaultClient.Do(req)
@@ -33,7 +33,7 @@ func TestAccessLog_AbortedStream(t *testing.T) {
 	// A stream that ends because the client went away (the proxy aborts the handler) is logged too
 	app1 := newTestUpstream(t, "app1")
 	logFile := filepath.Join(t.TempDir(), "access.log")
-	s, _ := newTestServer(t, "access-log: "+logFile, app1)
+	s, _ := newTestServer(t, "access-logs: [{file: "+logFile+"}]", app1)
 	_, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/stream")
 	closeStream()
 	waitFor(t, func() bool {
@@ -59,14 +59,14 @@ func TestAccessLog_ReloadChangesFile(t *testing.T) {
 
 	// Off -> on
 	getPath("/name?0")
-	writeConfig(t, filename, "access-log: "+first, app1)
+	writeConfig(t, filename, "access-logs: [{file: "+first+"}]", app1)
 	_, err := s.Reload()
 	require.NoError(t, err)
 	getPath("/name?1")
 	waitFor(t, func() bool { return logged(first, "/name?1") })
 
 	// Moved
-	writeConfig(t, filename, "access-log: "+second, app1)
+	writeConfig(t, filename, "access-logs: [{file: "+second+"}]", app1)
 	_, err = s.Reload()
 	require.NoError(t, err)
 	getPath("/name?2")
@@ -87,8 +87,8 @@ func TestAccessLog_ReloadChangesFile(t *testing.T) {
 func TestAccessLog_ReloadBadPathKeepsOld(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	logFile := filepath.Join(t.TempDir(), "access.log")
-	s, filename := newTestServer(t, "access-log: "+logFile, app1)
-	writeConfig(t, filename, "access-log: /nonexistent/dir/access.log\ndrain-duration: 1m", app1)
+	s, filename := newTestServer(t, "access-logs: [{file: "+logFile+"}]", app1)
+	writeConfig(t, filename, "access-logs: [{file: /nonexistent/dir/access.log}]\ndrain-duration: 1m", app1)
 	_, err := s.Reload()
 	require.Error(t, err)
 	require.Equal(t, config.DefaultDrainDuration, s.config.Load().DrainDuration) // Nothing applied

@@ -1,5 +1,6 @@
-// Package rules checks requests against the configured rules: block, rate limit or allow the
-// requests their match expressions (package match) match. Rules are replaced atomically on reload; rate
+// Package rules checks requests against the configured rules (block, rate limit, allow, redirect
+// or serve them, by their match expressions, see package match) and counts the rules' strikes per
+// client into ban lines. Rules are replaced atomically on reload; rate
 // limit state survives a reload for rules that did not change.
 package rules
 
@@ -21,12 +22,14 @@ const sweepInterval = time.Minute
 // Engine checks requests against the current rules
 type Engine struct {
 	state atomic.Pointer[state]
+	onBan func(line string)
 	now   func() time.Time
 }
 
 // state is one generation of rules, swapped as a whole on Update
 type state struct {
 	rules          []*rule
+	bans           *bans
 	ipv4PrefixBits int
 	ipv6PrefixBits int
 }
@@ -50,10 +53,11 @@ type bucket struct {
 	last   time.Time
 }
 
-// New creates an engine with the config's rules
-func New(conf *config.Config) *Engine {
+// New creates an engine with the config's rules; onBan gets the ban lines (may be nil without bans)
+func New(conf *config.Config, onBan func(line string)) *Engine {
 	e := &Engine{
-		now: time.Now,
+		now:   time.Now,
+		onBan: onBan,
 	}
 	e.Update(conf)
 	return e
@@ -64,8 +68,8 @@ func New(conf *config.Config) *Engine {
 func (e *Engine) Update(conf *config.Config) {
 	old := e.state.Load()
 	next := &state{
-		ipv4PrefixBits: conf.Hash.IPv4PrefixBits,
-		ipv6PrefixBits: conf.Hash.IPv6PrefixBits,
+		ipv4PrefixBits: conf.ClientKey.IPv4PrefixBits,
+		ipv6PrefixBits: conf.ClientKey.IPv6PrefixBits,
 	}
 	for _, c := range conf.Rules {
 		r := &rule{
@@ -83,36 +87,38 @@ func (e *Engine) Update(conf *config.Config) {
 		}
 		next.rules = append(next.rules, r)
 	}
+	if conf.Bans != nil {
+		if old != nil && old.bans != nil && old.bans.sameAs(conf.Bans, conf.ClientKey) {
+			next.bans = old.bans
+		} else {
+			next.bans = newBans(conf.Bans, conf.ClientKey)
+		}
+	}
 	e.state.Store(next)
 }
 
 // Check returns the rule that blocks or limits the request, or nil if it may pass
-func (e *Engine) Check(r *http.Request) *config.Rule {
+func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 	s := e.state.Load()
-	if len(s.rules) == 0 {
-		return nil
-	}
-	var env *match.Env // Taken from the request once, for the first rule that needs it
 	var key string
 	for _, rl := range s.rules {
-		if rl.conf.Program != nil {
-			if env == nil {
-				env = match.NewEnv(r)
-			}
-			if !rl.conf.Program.Match(env) {
-				continue
-			}
+		if rl.conf.On != config.OnRequest || (rl.conf.Program != nil && !rl.conf.Program.Match(env)) {
+			continue
 		}
 		switch rl.conf.Action {
 		case config.ActionAllow:
 			return nil
 		case config.ActionBlock:
+			e.strike(s, remoteAddr(r), rl.conf)
+			return rl.conf
+		case config.ActionRedirect, config.ActionStatic:
 			return rl.conf
 		case config.ActionLimit:
 			if key == "" {
 				key = string(balancer.ClientKey(remoteAddr(r), s.ipv4PrefixBits, s.ipv6PrefixBits))
 			}
 			if !rl.limiter.take(key, e.now()) {
+				e.strike(s, remoteAddr(r), rl.conf)
 				return rl.conf
 			}
 		}
@@ -179,4 +185,32 @@ func (b *bucket) refill(now time.Time, perSecond, capacity float64) {
 func remoteAddr(r *http.Request) netip.Addr {
 	ap, _ := netip.ParseAddrPort(r.RemoteAddr)
 	return ap.Addr().Unmap()
+}
+
+// CheckResponse adds the strikes of the response rules that match a request that ended
+func (e *Engine) CheckResponse(env *match.ResponseEnv) {
+	s := e.state.Load()
+	if s.bans == nil {
+		return
+	}
+	var addr netip.Addr
+	for _, rl := range s.rules {
+		if rl.conf.On != config.OnResponse || (rl.conf.Program != nil && !rl.conf.Program.Match(env)) {
+			continue
+		}
+		if !addr.IsValid() {
+			addr, _ = netip.ParseAddr(env.IP)
+		}
+		e.strike(s, addr, rl.conf)
+	}
+}
+
+// strike adds a rule's strikes for a client, and hands the ban line on if that reports it
+func (e *Engine) strike(s *state, addr netip.Addr, rule *config.Rule) {
+	if s.bans == nil || rule.Strike == 0 {
+		return
+	}
+	if line, ok := s.bans.strike(addr, rule.Strike, rule.Name, e.now()); ok && e.onBan != nil {
+		e.onBan(line)
+	}
 }

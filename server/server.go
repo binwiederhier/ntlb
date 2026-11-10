@@ -16,6 +16,7 @@ import (
 
 	"heckel.io/ntfy-lb/balancer"
 	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntfy-lb/match"
 	"heckel.io/ntfy-lb/rules"
 )
 
@@ -35,11 +36,11 @@ type Server struct {
 	proxy      *proxy
 	rules      *rules.Engine
 	certs      *certStore
-	accessLog  *accessLog
-	ruleLogs   *ruleLogs
+	files      *logFiles // Access logs and the ban file
 	metrics    *metrics
 	servers    []*http.Server // Proxying servers (HTTP, HTTPS)
 	admin      *http.Server
+	metricsSrv *http.Server // listen-metrics, if set
 	listeners  map[string]net.Listener
 	reloadMu   sync.Mutex // Serializes reloads
 	stopOnce   sync.Once
@@ -56,12 +57,12 @@ func New(configFile string) (*Server, error) {
 	s := &Server{
 		configFile: configFile,
 		balancer:   balancer.New(conf),
-		rules:      rules.New(conf),
-		ruleLogs:   newRuleLogs(),
+		files:      newLogFiles(),
 		listeners:  make(map[string]net.Listener),
 		stopped:    make(chan struct{}),
 	}
 	s.config.Store(conf)
+	s.rules = rules.New(conf, s.writeBan)
 	s.metrics = newMetrics(s.balancer)
 	s.proxy = newProxy(s.balancer, s.metrics, conf)
 	if conf.ListenHTTPS != "" {
@@ -70,19 +71,14 @@ func New(configFile string) (*Server, error) {
 			return nil, err
 		}
 	}
-	if s.accessLog, err = newAccessLog(conf.AccessLog); err != nil {
-		return nil, err
-	}
-	ruleFiles, err := openRuleLogFiles(conf)
+	files, err := openLogFiles(logPaths(conf))
 	if err != nil {
-		s.accessLog.close()
 		return nil, err
 	}
-	s.ruleLogs.swap(ruleFiles)
+	s.files.swap(files)
 	if err := s.listen(conf); err != nil {
 		s.closeListeners()
-		s.accessLog.close()
-		s.ruleLogs.close()
+		s.files.close()
 		return nil, err
 	}
 	return s, nil
@@ -109,6 +105,9 @@ func (s *Server) Serve(ctx context.Context) error {
 		go serve(srv.Addr, srv, s.listeners[srv.Addr], srv.TLSConfig != nil)
 	}
 	go serve(listenerAdmin, s.admin, s.listeners[listenerAdmin], false)
+	if s.metricsSrv != nil {
+		go serve(listenerMetrics, s.metricsSrv, s.listeners[listenerMetrics], false)
+	}
 	select {
 	case err := <-errChan:
 		s.Shutdown(0)
@@ -119,7 +118,7 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 // Reload re-reads the config file and applies it: upstreams, health checks, timeouts, drain
-// durations, streams, hashing, the rules and their logs, the certificate and the access log. A broken config (or a
+// durations, streams, the client key, rules, bans, the certificate and the log files. A broken config (or a
 // certificate or log file that cannot be opened) is rejected as a whole. It returns the changed
 // settings that only a restart applies: listener addresses and client keepalives.
 func (s *Server) Reload() ([]string, error) {
@@ -142,22 +141,14 @@ func (s *Server) Reload() ([]string, error) {
 			return nil, err
 		}
 	}
-	logFile, err := openAccessLog(conf.AccessLog)
+	files, err := openLogFiles(logPaths(conf))
 	if err != nil {
-		return nil, err
-	}
-	ruleFiles, err := openRuleLogFiles(conf)
-	if err != nil {
-		if logFile != nil {
-			logFile.Close()
-		}
 		return nil, err
 	}
 	if cert != nil {
 		s.certs.cert.Store(cert)
 	}
-	s.accessLog.swap(logFile)
-	s.ruleLogs.swap(ruleFiles)
+	s.files.swap(files)
 	s.rules.Update(conf)
 	s.balancer.Update(conf)
 	s.proxy.update(conf)
@@ -185,7 +176,11 @@ func (s *Server) Shutdown(d time.Duration) {
 			slog.Warn("Requests still open after closing them", "error", err)
 		}
 		var wg sync.WaitGroup
-		for _, srv := range append(s.servers, s.admin) {
+		others := []*http.Server{s.admin}
+		if s.metricsSrv != nil {
+			others = append(others, s.metricsSrv)
+		}
+		for _, srv := range append(s.servers, others...) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -195,41 +190,40 @@ func (s *Server) Shutdown(d time.Duration) {
 			}()
 		}
 		wg.Wait()
-		s.accessLog.close()
-		s.ruleLogs.close()
+		s.files.close()
 		close(s.stopped)
 	})
 }
 
-// observe wraps the proxy to see every request's outcome, for the access log and the metrics,
-// and answers the requests that a rule blocks or limits itself. The outcome is recorded by a
-// finisher, when the request ends, which for a detached stream is after the handler returned.
+// observe wraps the proxy to see every request's outcome, for the access logs, the response rules
+// and the metrics, and answers the requests that a rule decides itself. The outcome is recorded
+// by a finisher, when the request ends, which for a detached stream is after the handler returned.
 func (s *Server) observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		entry := s.accessLog.entry(r, start)
-		pr := &proxyRequest{}
+		conf := s.config.Load()
+		env := match.NewEnv(r)
+		respEnv := match.NewResponseEnv(env) // Strings only, so the request can be let go
+		var entry *accessLogEntry
+		if len(conf.AccessLogs) > 0 {
+			entry = newAccessLogEntry(r, start)
+		}
+		pr := &proxyRequest{
+			env: env,
+		}
 		sw := &statusWriter{ResponseWriter: w}
-		rule := s.rules.Check(r)
-		var ruleLog *accessLog
-		var ruleEntry *accessLogEntry
+		rule := s.rules.Check(r, env)
 		if rule != nil {
 			pr.rule, pr.kind = rule.Name, kindRequest
 			s.metrics.ruleMatches.WithLabelValues(rule.Name).Inc()
-			if rule.Log != "" {
-				if ruleLog, ruleEntry = s.ruleLogs.get(rule.Log), entry; ruleEntry == nil {
-					ruleEntry = newAccessLogEntry(r, start)
-				}
-			}
 		}
 		pr.onFinish(func() {
 			status := pr.finalStatus() // Must not use sw: it references the server's connection state
+			respEnv.Status, respEnv.UpstreamStatus, respEnv.Rule = status, pr.upstreamStatus, pr.rule
 			if entry != nil {
-				s.accessLog.write(entry, pr, status)
+				s.writeAccessLog(entry, pr, respEnv)
 			}
-			if ruleLog != nil {
-				ruleLog.write(ruleEntry, pr, status)
-			}
+			s.rules.CheckResponse(respEnv)
 			s.metrics.observe(pr, status, start)
 		})
 		defer func() { // Deferred: a stream cut short ends in a http.ErrAbortHandler panic
@@ -241,11 +235,33 @@ func (s *Server) observe(next http.Handler) http.Handler {
 			}
 		}()
 		if rule != nil {
-			http.Error(sw, http.StatusText(rule.Status), rule.Status)
+			s.answer(sw, r, env, rule)
 			return
 		}
 		next.ServeHTTP(sw, r.WithContext(withProxyRequest(r.Context(), pr)))
 	})
+}
+
+// writeAccessLog writes the request to the first access log whose match is true
+func (s *Server) writeAccessLog(entry *accessLogEntry, pr *proxyRequest, env *match.ResponseEnv) {
+	for _, l := range s.config.Load().AccessLogs {
+		if l.Program == nil || l.Program.Match(env) {
+			if log := s.files.get(l.File); log != nil {
+				log.write(entry, pr, env.Status)
+			}
+			return
+		}
+	}
+}
+
+// writeBan writes a ban line to the ban file
+func (s *Server) writeBan(line string) {
+	s.metrics.bans.Inc()
+	if bans := s.config.Load().Bans; bans != nil {
+		if log := s.files.get(bans.File); log != nil {
+			log.writeLine(line + "\n")
+		}
+	}
 }
 
 // HTTPAddr returns the address the HTTP listener is bound to, or "" if there is none
@@ -258,6 +274,11 @@ func (s *Server) HTTPSAddr() string {
 	return s.listenerAddr(listenerHTTPS)
 }
 
+// MetricsAddr returns the address the metrics listener is bound to, or "" if there is none
+func (s *Server) MetricsAddr() string {
+	return s.listenerAddr(listenerMetrics)
+}
+
 // AdminAddr returns the address the admin listener is bound to
 func (s *Server) AdminAddr() string {
 	return s.listenerAddr(listenerAdmin)
@@ -265,9 +286,10 @@ func (s *Server) AdminAddr() string {
 
 // Listener names, also the http.Server.Addr of each server
 const (
-	listenerHTTP  = "http"
-	listenerHTTPS = "https"
-	listenerAdmin = "admin"
+	listenerHTTP    = "http"
+	listenerHTTPS   = "https"
+	listenerAdmin   = "admin"
+	listenerMetrics = "metrics"
 )
 
 func (s *Server) listen(conf *config.Config) error {
@@ -309,6 +331,16 @@ func (s *Server) listen(conf *config.Config) error {
 	}
 	s.listeners[listenerAdmin] = ln
 	s.admin = newHTTPServer(listenerAdmin, s.adminHandler())
+
+	// Metrics listener
+	if conf.ListenMetrics != "" {
+		ln, err := net.Listen("tcp", conf.ListenMetrics)
+		if err != nil {
+			return err
+		}
+		s.listeners[listenerMetrics] = ln
+		s.metricsSrv = newHTTPServer(listenerMetrics, s.metricsHandler())
+	}
 	return nil
 }
 

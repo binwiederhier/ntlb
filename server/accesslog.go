@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -18,15 +17,14 @@ const (
 	accessLogTimeFormat    = "02/Jan/2006:15:04:05 -0700" // nginx's $time_local
 )
 
-// accessLog writes one line per request in the format of the nginx log_format "combined_ssl" on
-// ntfy.sh (combined, then key=value fields), so the existing log parsers keep working. A reload
-// reopens it (for logrotate), moves it, or turns it on or off; with no file, nothing is logged.
+// accessLog is a buffered log file that a reload can swap for a reopened one (for logrotate). As
+// an access log it writes one line per request in the format of the nginx log_format
+// "combined_ssl" on ntfy.sh (combined, then key=value fields), so the existing parsers keep working.
 type accessLog struct {
-	enabled atomic.Bool
-	file    *os.File
-	w       *bufio.Writer
-	done    chan struct{}
-	mu      sync.Mutex // Protects file and w
+	file *os.File
+	w    *bufio.Writer
+	done chan struct{}
+	mu   sync.Mutex // Protects file and w
 }
 
 // statusWriter records the status and body size of a response. Unwrap lets
@@ -57,14 +55,6 @@ func (w *statusWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-func newAccessLog(filename string) (*accessLog, error) {
-	file, err := openAccessLog(filename)
-	if err != nil {
-		return nil, err
-	}
-	return newAccessLogFile(file), nil
-}
-
 // newAccessLogFile creates a log that writes to an opened file (nil: off)
 func newAccessLogFile(file *os.File) *accessLog {
 	l := &accessLog{
@@ -86,14 +76,7 @@ type accessLogEntry struct {
 	host       string
 }
 
-// entry takes what a log line needs from the request, or returns nil if logging is off
-func (l *accessLog) entry(r *http.Request, start time.Time) *accessLogEntry {
-	if !l.enabled.Load() {
-		return nil
-	}
-	return newAccessLogEntry(r, start)
-}
-
+// newAccessLogEntry takes what a log line needs from the request
 func newAccessLogEntry(r *http.Request, start time.Time) *accessLogEntry {
 	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -122,23 +105,16 @@ func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest, status int) {
 		line += " rule=" + pr.rule
 	}
 	line += "\n"
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.w != nil { // Turned off while the request ran
-		l.w.WriteString(line)
-	}
+	l.writeLine(line)
 }
 
-// openAccessLog opens (or creates) the log file for appending; nil if filename is empty
-func openAccessLog(filename string) (*os.File, error) {
-	if filename == "" {
-		return nil, nil
+// writeLine writes a line that ends in a newline
+func (l *accessLog) writeLine(line string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.w != nil { // Closed while the request ran
+		l.w.WriteString(line)
 	}
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open access log: %w", err)
-	}
-	return file, nil
 }
 
 // swap makes file the log file (nil turns logging off), flushing and closing the old one. It
@@ -154,7 +130,6 @@ func (l *accessLog) swap(file *os.File) {
 	if file != nil {
 		l.w = bufio.NewWriterSize(file, 64*1024)
 	}
-	l.enabled.Store(file != nil)
 }
 
 func (l *accessLog) close() {

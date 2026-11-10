@@ -18,6 +18,7 @@ import (
 
 	"heckel.io/ntfy-lb/balancer"
 	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntfy-lb/match"
 )
 
 const (
@@ -61,8 +62,9 @@ type proxyRequest struct {
 	kind           string // kindRequest, kindStream or kindWebSocket
 	session        *balancer.Session
 	cancel         context.CancelCauseFunc
-	rule           string // The rule that blocked or limited the request, if any
-	upstream       string // Set once an upstream answered
+	env            *match.Env // The request as expressions see it, if Server.observe made one
+	rule           string     // The rule that decided the request, if any
+	upstream       string     // Set once an upstream answered
 	upstreamStatus int
 	status         int   // Set by the stream path, which may bypass the ResponseWriter
 	bytes          int64 // Body bytes written by the stream path
@@ -321,7 +323,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		pr = &proxyRequest{}
 		defer pr.finishUnlessDetached()
 	}
-	subscription := isSubscription(r, conf.Streams)
+	env := pr.env
+	if env == nil {
+		env = match.NewEnv(r)
+	}
+	subscription := isSubscription(env, conf.Streams)
+	pr.env = nil                                                                    // Its header() holds the whole request, which a detached stream must not keep
 	stream := subscription && r.Header.Get("Upgrade") == "" && r.ContentLength == 0 // WebSockets and requests with a body stay on the reverse proxy
 	switch {
 	case stream:
@@ -342,7 +349,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		parent = context.WithoutCancel(parent) // Detached from the handler, see serveStream
 	}
 	ctx, cancel := context.WithCancelCause(parent)
-	pr.key, pr.cancel = clientKey(r.RemoteAddr, conf.Hash), cancel
+	pr.key, pr.cancel = clientKey(r.RemoteAddr, conf.ClientKey), cancel
 	pr.readTimeout = conf.UpstreamReadTimeout
 	pr.session = p.balancer.NewSession(cancel)
 	if subscription {
@@ -565,45 +572,17 @@ func proxyRequestFromContext(ctx context.Context) *proxyRequest {
 	return pr
 }
 
-func clientKey(remoteAddr string, hash *config.Hash) []byte {
+func clientKey(remoteAddr string, key *config.ClientKey) []byte {
 	addrPort, err := netip.ParseAddrPort(remoteAddr)
 	if err != nil {
 		return []byte(remoteAddr)
 	}
-	return balancer.ClientKey(addrPort.Addr(), hash.IPv4PrefixBits, hash.IPv6PrefixBits)
+	return balancer.ClientKey(addrPort.Addr(), key.IPv4PrefixBits, key.IPv6PrefixBits)
 }
 
-// isSubscription returns true for a long-lived stream (see config.Streams): a GET whose path
-// matches, unless the first exclude param that is set (headers first, then query parameters,
-// each in list order, like ntfy's readParam) is 1, yes or true. With the defaults, that is an
-// ntfy subscription (GET /<topics>/json|sse|raw|ws) that does not poll.
-func isSubscription(r *http.Request, streams *config.Streams) bool {
-	if streams.Disable || r.Method != http.MethodGet || !streams.PathRegex.MatchString(r.URL.Path) {
-		return false
-	}
-	for _, param := range streams.ExcludeParams {
-		if value := strings.TrimSpace(r.Header.Get(param)); value != "" {
-			return !isTrue(value)
-		}
-	}
-	if len(streams.ExcludeParams) == 0 {
-		return true
-	}
-	query := r.URL.Query()
-	for _, param := range streams.ExcludeParams {
-		if value := strings.TrimSpace(query.Get(param)); value != "" {
-			return !isTrue(value)
-		}
-	}
-	return true
-}
-
-func isTrue(s string) bool {
-	switch strings.ToLower(s) {
-	case "1", "yes", "true":
-		return true
-	}
-	return false
+// isSubscription returns true for a long-lived stream, see config.Streams
+func isSubscription(env *match.Env, streams *config.Streams) bool {
+	return streams.Program.Match(env)
 }
 
 // retryable returns true if a request whose body was not touched may go to the next upstream

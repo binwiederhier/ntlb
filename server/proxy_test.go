@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"heckel.io/ntfy-lb/balancer"
 	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntfy-lb/match"
 )
 
 func TestProxy_StreamsResponse(t *testing.T) {
@@ -203,9 +204,9 @@ func TestProxy_DrainingRefusesNewSubscriptions(t *testing.T) {
 func TestIsSubscription(t *testing.T) {
 	ntfy, err := config.Parse([]byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
 	require.NoError(t, err)
-	custom, err := config.Parse([]byte("listen-http: ':80'\nstreams: {path: '^/events$', exclude-params: [once]}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+	custom, err := config.Parse([]byte("listen-http: ':80'\nstreams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
 	require.NoError(t, err)
-	disabled, err := config.Parse([]byte("listen-http: ':80'\nstreams: {disable: true}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+	disabled, err := config.Parse([]byte("listen-http: ':80'\nstreams: {match: 'false'}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
 	require.NoError(t, err)
 	tests := []struct {
 		name    string
@@ -249,7 +250,7 @@ func TestIsSubscription(t *testing.T) {
 				name, value, _ := strings.Cut(tt.header, ": ")
 				r.Header.Set(name, value)
 			}
-			require.Equal(t, tt.want, isSubscription(r, tt.streams))
+			require.Equal(t, tt.want, isSubscription(match.NewEnv(r), tt.streams))
 		})
 	}
 }
@@ -258,7 +259,7 @@ func TestProxy_CustomStreams(t *testing.T) {
 	// A non-ntfy backend: /stream is a stream (so it takes the stream path, with an HTTP/1.0
 	// upstream request), ntfy's subscription paths are ordinary requests
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "streams: {path: '^/stream$'}", app1)
+	s, _ := newTestServer(t, "streams: {match: 'path == \"/stream\"'}", app1)
 	_, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/stream")
 	closeStream()
 	require.Equal(t, "HTTP/1.0", app1.lastProto.Load())
@@ -269,7 +270,7 @@ func TestProxy_CustomStreams(t *testing.T) {
 
 func TestProxy_StreamsDisabled(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "streams: {disable: true}", app1)
+	s, _ := newTestServer(t, "streams: {match: 'false'}", app1)
 	_, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
 	closeStream()
 	require.Equal(t, "HTTP/1.1", app1.lastProto.Load())
@@ -281,7 +282,7 @@ func TestProxy_StreamsDisabled(t *testing.T) {
 func TestProxy_HashPrefix(t *testing.T) {
 	// With an IPv4 /8 key, every loopback client is the same client
 	app1, app2, app3 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2"), newTestUpstream(t, "app3")
-	s, _ := newTestServer(t, "hash: {ipv4-prefix-bits: 8}", app1, app2, app3)
+	s, _ := newTestServer(t, "client-key: {ipv4-prefix-bits: 8}", app1, app2, app3)
 	seen := make(map[string]bool)
 	for i := 1; i <= 20; i++ {
 		_, name := get(t, clientFrom(fmt.Sprintf("127.0.0.%d", i)), "http://"+s.HTTPAddr()+"/name")
@@ -588,7 +589,7 @@ func TestProxy_ReloadUnderLoad(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 20; i++ {
-		writeConfig(t, filename, fmt.Sprintf("upstream-read-timeout: %dm\nstreams: {disable: %t}", i+1, i%2 == 0), app1, app2)
+		writeConfig(t, filename, fmt.Sprintf("upstream-read-timeout: %dm\nstreams: {match: %q}", i+1, streamsToggle(i)), app1, app2)
 		requireReload(t, s)
 	}
 	close(stop)
@@ -600,7 +601,7 @@ func TestProxy_ReloadUnderLoad(t *testing.T) {
 func clientForRank(t *testing.T, s *Server, names ...string) *http.Client {
 	for i := 1; i < 250; i++ {
 		ip := fmt.Sprintf("127.0.2.%d", i)
-		candidates := s.balancer.Pick(clientKey(ip+":1", s.config.Load().Hash))
+		candidates := s.balancer.Pick(clientKey(ip+":1", s.config.Load().ClientKey))
 		ok := len(candidates) >= len(names)
 		for j := 0; ok && j < len(names); j++ {
 			ok = candidates[j].Name() == names[j]
@@ -785,4 +786,12 @@ func TestSafely(t *testing.T) {
 			panic(http.ErrAbortHandler) // Our own way to cut a stream: not an error
 		})
 	})
+}
+
+// streamsToggle turns streams off on even reloads and back to the default on odd ones
+func streamsToggle(i int) string {
+	if i%2 == 0 {
+		return "false"
+	}
+	return config.DefaultStreamsMatch
 }

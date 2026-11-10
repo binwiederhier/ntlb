@@ -4,12 +4,14 @@ import (
 	"errors"
 	"io/fs"
 	"net"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"heckel.io/ntfy-lb/match"
 )
 
 func TestParse_Defaults(t *testing.T) {
@@ -106,19 +108,19 @@ func TestParse_Invalid(t *testing.T) {
 			errMsg: "health-check.timeout",
 		},
 		{
-			name:   "bad streams regex",
-			config: "listen-http: ':80'\nstreams: {path: '(['}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
-			errMsg: "streams.path",
+			name:   "bad streams expression",
+			config: "listen-http: ':80'\nstreams: {match: 'path =='}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
+			errMsg: "streams.match",
 		},
 		{
 			name:   "ipv4 prefix too long",
-			config: "listen-http: ':80'\nhash: {ipv4-prefix-bits: 33}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
-			errMsg: "hash.ipv4-prefix-bits",
+			config: "listen-http: ':80'\nclient-key: {ipv4-prefix-bits: 33}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
+			errMsg: "client-key.ipv4-prefix-bits",
 		},
 		{
 			name:   "ipv6 prefix negative",
-			config: "listen-http: ':80'\nhash: {ipv6-prefix-bits: -1}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
-			errMsg: "hash.ipv6-prefix-bits",
+			config: "listen-http: ':80'\nclient-key: {ipv6-prefix-bits: -1}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
+			errMsg: "client-key.ipv6-prefix-bits",
 		},
 		{
 			name:   "negative drain",
@@ -142,13 +144,13 @@ func TestParse_Invalid(t *testing.T) {
 		},
 		{
 			name:   "ipv4 prefix negative",
-			config: "listen-http: ':80'\nhash: {ipv4-prefix-bits: -1}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
-			errMsg: "hash.ipv4-prefix-bits",
+			config: "listen-http: ':80'\nclient-key: {ipv4-prefix-bits: -1}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
+			errMsg: "client-key.ipv4-prefix-bits",
 		},
 		{
 			name:   "ipv6 prefix too long",
-			config: "listen-http: ':80'\nhash: {ipv6-prefix-bits: 129}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
-			errMsg: "hash.ipv6-prefix-bits",
+			config: "listen-http: ':80'\nclient-key: {ipv6-prefix-bits: 129}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]",
+			errMsg: "client-key.ipv6-prefix-bits",
 		},
 		{
 			name:   "name too long",
@@ -278,46 +280,102 @@ func TestParse_Invalid(t *testing.T) {
 func TestParse_StreamsDefaults(t *testing.T) {
 	c, err := Parse([]byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
 	require.NoError(t, err)
-	require.False(t, c.Streams.Disable)
-	require.Equal(t, DefaultStreamsPath, c.Streams.Path)
-	require.Equal(t, DefaultStreamsExcludeParams, c.Streams.ExcludeParams)
-	require.Equal(t, []string{"x-poll", "poll", "po"}, c.Streams.ExcludeParams) // Precedence order, like ntfy's readParam
-	require.True(t, c.Streams.PathRegex.MatchString("/mytopic/json"))
-	require.True(t, c.Streams.PathRegex.MatchString("/a,b_c-d/sse"))
-	require.False(t, c.Streams.PathRegex.MatchString("/a/b/json"))
-	require.False(t, c.Streams.PathRegex.MatchString("/mytopic"))
+	require.Equal(t, DefaultStreamsMatch, c.Streams.Match)
+	for _, target := range []string{"/mytopic/json", "/a,b_c-d/sse", "/t/raw", "/t/ws", "/t/json?since=10m"} {
+		require.True(t, isStream(c, "GET", target), target)
+	}
+	for _, target := range []string{"/a/b/json", "/mytopic", "/t/json/x", "/t/xml", "//json", "/a,/json", "/v1/health", "/t/json?poll=1", "/t/json?po=1"} {
+		require.False(t, isStream(c, "GET", target), target)
+	}
+	require.False(t, isStream(c, "POST", "/mytopic/json"))
 }
 
 func TestParse_StreamsCustom(t *testing.T) {
 	c, err := Parse([]byte(`
 listen-http: ":80"
 streams:
-  path: "^/events(/.*)?$"
-  exclude-params: [once]
+  match: method == "GET" && path matches "^/events(/.*)?$" && !flag("once")
 upstreams: [{name: a, addresses: ['1.2.3.4:80']}]
 `))
 	require.NoError(t, err)
-	require.True(t, c.Streams.PathRegex.MatchString("/events/foo"))
-	require.False(t, c.Streams.PathRegex.MatchString("/mytopic/json"))
-	require.Equal(t, []string{"once"}, c.Streams.ExcludeParams)
+	require.True(t, isStream(c, "GET", "/events/foo"))
+	require.False(t, isStream(c, "GET", "/events/foo?once=1"))
+	require.False(t, isStream(c, "GET", "/mytopic/json"))
 }
 
-func TestParse_StreamsExcludeParamsEmpty(t *testing.T) {
-	// An explicitly empty list means "no exclusions", not the default
-	c, err := Parse([]byte("listen-http: ':80'\nstreams: {exclude-params: []}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+func TestParse_StreamsOff(t *testing.T) {
+	c, err := Parse([]byte("listen-http: ':80'\nstreams: {match: 'false'}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
 	require.NoError(t, err)
-	require.Empty(t, c.Streams.ExcludeParams)
+	require.False(t, isStream(c, "GET", "/mytopic/json"))
 }
 
-func TestParse_HashDefaultsAndOverrides(t *testing.T) {
+func isStream(c *Config, method, target string) bool {
+	return c.Streams.Program.Match(match.NewEnv(httptest.NewRequest(method, target, nil)))
+}
+
+func TestParse_ClientKeyDefaultsAndOverrides(t *testing.T) {
 	c, err := Parse([]byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
 	require.NoError(t, err)
-	require.Equal(t, DefaultHashIPv4PrefixBits, c.Hash.IPv4PrefixBits)
-	require.Equal(t, DefaultHashIPv6PrefixBits, c.Hash.IPv6PrefixBits)
-	c, err = Parse([]byte("listen-http: ':80'\nhash: {ipv4-prefix-bits: 24, ipv6-prefix-bits: 128}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+	require.Equal(t, DefaultClientKeyIPv4PrefixBits, c.ClientKey.IPv4PrefixBits)
+	require.Equal(t, DefaultClientKeyIPv6PrefixBits, c.ClientKey.IPv6PrefixBits)
+	c, err = Parse([]byte("listen-http: ':80'\nclient-key: {ipv4-prefix-bits: 24, ipv6-prefix-bits: 128}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
 	require.NoError(t, err)
-	require.Equal(t, 24, c.Hash.IPv4PrefixBits)
-	require.Equal(t, 128, c.Hash.IPv6PrefixBits)
+	require.Equal(t, 24, c.ClientKey.IPv4PrefixBits)
+	require.Equal(t, 128, c.ClientKey.IPv6PrefixBits)
+}
+
+func TestParse_PortRanges(t *testing.T) {
+	c, err := Parse([]byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['10.0.0.1:2586-2588', '[fd00::1]:9000-9001', 'node:80']}]"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.1:2586", "10.0.0.1:2587", "10.0.0.1:2588", "[fd00::1]:9000", "[fd00::1]:9001", "node:80"}, c.Upstreams[0].Addresses)
+	for _, bad := range []string{"10.0.0.1:2588-2586", "10.0.0.1:1-x", "10.0.0.1:0-5", "10.0.0.1:65535-65536", "10.0.0.1:1000-3000"} {
+		_, err := Parse([]byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['" + bad + "']}]"))
+		require.ErrorContains(t, err, "invalid address", bad)
+	}
+}
+
+func TestParse_DuplicateAddress(t *testing.T) {
+	_, err := Parse([]byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['10.0.0.1:2586-2587', '10.0.0.1:2587']}]"))
+	require.ErrorContains(t, err, "duplicate address")
+}
+
+func TestParse_AccessLogs(t *testing.T) {
+	c, err := Parse([]byte(`
+listen-http: ":80"
+access-logs:
+  - {file: /var/log/nginx/access.log, match: status < 400}
+  - {file: /var/log/nginx/access_error.log}
+upstreams: [{name: a, addresses: ['1.2.3.4:80']}]
+`))
+	require.NoError(t, err)
+	require.Len(t, c.AccessLogs, 2)
+	env := &match.ResponseEnv{Status: 200}
+	require.True(t, c.AccessLogs[0].Program.Match(env))
+	require.Nil(t, c.AccessLogs[1].Program) // Everything that gets here
+	for name, logs := range map[string]string{
+		"no file":           "access-logs: [{match: status < 400}]",
+		"request-only name": "access-logs: [{file: /x, match: 'header(\"X\") == \"\"'}]",
+		"not boolean":       "access-logs: [{file: /x, match: status}]",
+	} {
+		_, err := Parse([]byte("listen-http: ':80'\n" + logs + "\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+		require.ErrorContains(t, err, "access-logs", name)
+	}
+}
+
+func TestParse_Bans(t *testing.T) {
+	c, err := Parse([]byte("listen-http: ':80'\nbans: {file: /var/log/ntfy-lb/ban.log, threshold: 100}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+	require.NoError(t, err)
+	require.Equal(t, DefaultBansWindow, c.Bans.Window)
+	require.Equal(t, 100.0, c.Bans.Threshold)
+	for name, bans := range map[string]string{
+		"no file":            "bans: {threshold: 100}",
+		"no threshold":       "bans: {file: /x}",
+		"negative threshold": "bans: {file: /x, threshold: -1}",
+		"negative window":    "bans: {file: /x, threshold: 1, window: -1m}",
+	} {
+		_, err := Parse([]byte("listen-http: ':80'\n" + bans + "\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
+		require.ErrorContains(t, err, "bans", name)
+	}
 }
 
 func TestRestartRequired(t *testing.T) {
@@ -381,16 +439,16 @@ client-keepalive: ~
 upstream-keepalive: null
 health-check: null
 streams: null
-hash: ~
+client-key: ~
 upstreams: [{name: a, addresses: ['1.2.3.4:80']}]
 `))
 	require.NoError(t, err)
 	require.Equal(t, DefaultKeepaliveIdle, c.ClientKeepalive.Idle)
 	require.Equal(t, DefaultKeepaliveCount, c.UpstreamKeepalive.Count)
 	require.Equal(t, DefaultHealthPath, c.HealthCheck.Path)
-	require.Equal(t, DefaultStreamsPath, c.Streams.Path)
-	require.NotNil(t, c.Streams.PathRegex)
-	require.Equal(t, DefaultHashIPv6PrefixBits, c.Hash.IPv6PrefixBits)
+	require.Equal(t, DefaultStreamsMatch, c.Streams.Match)
+	require.NotNil(t, c.Streams.Program)
+	require.Equal(t, DefaultClientKeyIPv6PrefixBits, c.ClientKey.IPv6PrefixBits)
 }
 
 func TestParse_AllDefaults(t *testing.T) {
@@ -414,7 +472,9 @@ func TestParse_AllDefaults(t *testing.T) {
 	}
 	require.Equal(t, defaultKeepalive, c.ClientKeepalive)
 	require.Equal(t, defaultKeepalive, c.UpstreamKeepalive)
-	require.Empty(t, c.AccessLog)
+	require.Empty(t, c.AccessLogs)
+	require.Empty(t, c.ListenMetrics)
+	require.Nil(t, c.Bans)
 	require.Empty(t, c.ListenHTTPS)
 }
 
@@ -444,26 +504,6 @@ func TestKeepAliveConfig_Disable(t *testing.T) {
 	require.True(t, c.UpstreamKeepalive.KeepAliveConfig().Enable)
 }
 
-// Streams and hashing
-
-func TestParse_StreamsDisable(t *testing.T) {
-	c, err := Parse([]byte("listen-http: ':80'\nstreams: {disable: true}\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
-	require.NoError(t, err)
-	require.True(t, c.Streams.Disable)
-	require.NotNil(t, c.Streams.PathRegex) // Still compiled, so that a reload can turn it back on
-}
-
-func TestParse_StreamsDefaultPathMatches(t *testing.T) {
-	c, err := Parse([]byte("listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]"))
-	require.NoError(t, err)
-	for _, path := range []string{"/t/json", "/t/sse", "/t/raw", "/t/ws", "/a,b/json"} {
-		require.True(t, c.Streams.PathRegex.MatchString(path), path)
-	}
-	for _, path := range []string{"/t/json/x", "/t/xml", "/t/", "//json", "/a,/json", "/v1/health"} {
-		require.False(t, c.Streams.PathRegex.MatchString(path), path)
-	}
-}
-
 // Settings a reload cannot apply
 
 func TestRestartRequired_Each(t *testing.T) {
@@ -479,6 +519,11 @@ func TestRestartRequired_Each(t *testing.T) {
 			name:     "listen-http",
 			config:   "listen-http: ':81'\n",
 			settings: []string{"listen-http"},
+		},
+		{
+			name:     "listen-metrics",
+			config:   "listen-http: ':80'\nlisten-metrics: '10.0.0.1:9090'\n",
+			settings: []string{"listen-metrics"},
 		},
 		{
 			name:     "listen-admin",
@@ -497,7 +542,7 @@ func TestRestartRequired_Each(t *testing.T) {
 		},
 		{
 			name:   "reloadable settings only",
-			config: "listen-http: ':80'\nupstream-keepalive: {disable: true}\nhealth-check: {interval: 9s}\nhash: {ipv4-prefix-bits: 24}\nupstream-read-timeout: 1m\naccess-log: /tmp/x\n",
+			config: "listen-http: ':80'\nupstream-keepalive: {disable: true}\nhealth-check: {interval: 9s}\nclient-key: {ipv4-prefix-bits: 24}\nupstream-read-timeout: 1m\naccess-logs: [{file: /tmp/x}]\n",
 		},
 		{
 			name:   "same keepalive written out",

@@ -181,7 +181,7 @@ func TestStream_UpstreamReadTimeout(t *testing.T) {
 func TestStream_AccessLog(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	logFile := filepath.Join(t.TempDir(), "access.log")
-	s, _ := newTestServer(t, "access-log: "+logFile, app1)
+	s, _ := newTestServer(t, "access-logs: [{file: "+logFile+"}]", app1)
 	resp, r := openSubscription(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
 	app1.push <- "hello"
 	readLine(t, r)

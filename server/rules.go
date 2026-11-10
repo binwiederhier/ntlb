@@ -1,70 +1,63 @@
 package server
 
 import (
-	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
-	"sync/atomic"
+	"path"
+	"path/filepath"
 
 	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntfy-lb/match"
 )
 
-// ruleLogs are the open log files of the rules, by path; rules that share a path share the file
-type ruleLogs struct {
-	logs atomic.Pointer[map[string]*accessLog]
+// answer answers a request that a rule decided: blocked, limited, redirected or served from disk
+func (s *Server) answer(w http.ResponseWriter, r *http.Request, env *match.Env, rule *config.Rule) {
+	switch rule.Action {
+	case config.ActionRedirect:
+		location := rule.LocationProgram.String(env)
+		if location == "" {
+			slog.Warn("Redirect rule has no location for a request", "rule", rule.Name, "uri", env.URI)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Location", location)
+		w.WriteHeader(rule.Status)
+	case config.ActionStatic:
+		serveStatic(w, r, rule.Root, rule.Fallback)
+	default:
+		http.Error(w, http.StatusText(rule.Status), rule.Status)
+	}
 }
 
-func newRuleLogs() *ruleLogs {
-	l := &ruleLogs{}
-	l.logs.Store(&map[string]*accessLog{})
-	return l
-}
-
-// openRuleLogFiles opens the log file of every rule, once per path, so that New and Reload can
-// fail before they change anything
-func openRuleLogFiles(conf *config.Config) (map[string]*os.File, error) {
-	files := make(map[string]*os.File)
-	for _, r := range conf.Rules {
-		if r.Log == "" || files[r.Log] != nil {
+// serveStatic serves the file at the request path under root, like nginx's try_files $uri
+// <fallback>: a path that is no regular file (missing, a directory) gets the fallback, or a 404
+// without one. The path is cleaned first, so it cannot leave root.
+func serveStatic(w http.ResponseWriter, r *http.Request, root, fallback string) {
+	for _, p := range []string{r.URL.Path, fallback} {
+		if p == "" {
 			continue
 		}
-		file, err := openAccessLog(r.Log)
-		if err != nil {
-			for _, f := range files {
-				f.Close()
-			}
-			return nil, fmt.Errorf("rule %s: %w", r.Name, err)
+		file, info := openStatic(root, p)
+		if file == nil {
+			continue
 		}
-		files[r.Log] = file
+		defer file.Close()
+		http.ServeContent(w, r, info.Name(), info.ModTime(), file)
+		return
 	}
-	return files, nil
+	http.NotFound(w, r)
 }
 
-// swap makes files the rule logs. A path that stays keeps its log, reopened (for logrotate); the
-// logs of paths that are gone are closed.
-func (l *ruleLogs) swap(files map[string]*os.File) {
-	old := *l.logs.Load()
-	next := make(map[string]*accessLog, len(files))
-	for path, file := range files {
-		if log, ok := old[path]; ok {
-			log.swap(file)
-			next[path] = log
-		} else {
-			next[path] = newAccessLogFile(file)
-		}
+func openStatic(root, p string) (*os.File, os.FileInfo) {
+	file, err := os.Open(filepath.Join(root, filepath.FromSlash(path.Clean("/"+p))))
+	if err != nil {
+		return nil, nil
 	}
-	for path, log := range old {
-		if _, ok := next[path]; !ok {
-			log.close()
-		}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		return nil, nil
 	}
-	l.logs.Store(&next)
-}
-
-// get returns the log of a path, or nil if a reload just closed it
-func (l *ruleLogs) get(path string) *accessLog {
-	return (*l.logs.Load())[path]
-}
-
-func (l *ruleLogs) close() {
-	l.swap(nil)
+	return file, info
 }

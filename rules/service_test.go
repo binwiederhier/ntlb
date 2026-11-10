@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"heckel.io/ntfy-lb/config"
+	"heckel.io/ntfy-lb/match"
 )
 
 const testBase = "listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]\n"
@@ -23,12 +24,22 @@ func testConfig(t *testing.T, rules string) *config.Config {
 // testEngine is an engine on a fake clock
 func testEngine(t *testing.T, rules string) (*Engine, *time.Time) {
 	t.Helper()
+	e, now, _ := testEngineBans(t, rules)
+	return e, now
+}
+
+// testEngineBans is testEngine that also returns the ban lines it writes
+func testEngineBans(t *testing.T, rules string) (*Engine, *time.Time, *[]string) {
+	t.Helper()
 	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
-	e := New(testConfig(t, rules))
+	var lines []string
+	e := New(testConfig(t, rules), func(line string) {
+		lines = append(lines, line)
+	})
 	e.now = func() time.Time {
 		return now
 	}
-	return e, &now
+	return e, &now, &lines
 }
 
 func request(method, target, remoteAddr string, headers ...string) *http.Request {
@@ -42,7 +53,7 @@ func request(method, target, remoteAddr string, headers ...string) *http.Request
 
 // decided returns the name of the rule that decided, or "" if the request passes
 func decided(e *Engine, r *http.Request) string {
-	if rule := e.Check(r); rule != nil {
+	if rule := e.Check(r, match.NewEnv(r)); rule != nil {
 		return rule.Name
 	}
 	return ""
@@ -54,7 +65,9 @@ func TestEngine_Match(t *testing.T) {
 rules:
   - name: topic
     match: path matches "^/nz_"
+    action: block
   - name: spy
+    action: block
     match: method in ["GET", "POST"] && (header("User-Agent") matches "(?i)ntfy-spy" || ipIn(ip, "203.0.113.0/24"))
 `)
 	ua := []string{"User-Agent", "ntfy/1.0"}
@@ -66,15 +79,17 @@ rules:
 }
 
 func TestEngine_RuleWithoutFieldsMatchesEverything(t *testing.T) {
-	e, _ := testEngine(t, "rules: [{name: all, status: 451}]")
-	rule := e.Check(request("GET", "/", "192.0.2.1:1"))
+	e, _ := testEngine(t, "rules: [{name: all, action: block, status: 451}]")
+	r := request("GET", "/", "192.0.2.1:1")
+	rule := e.Check(r, match.NewEnv(r))
 	require.NotNil(t, rule)
 	require.Equal(t, 451, rule.Status)
 }
 
 func TestEngine_NoRules(t *testing.T) {
 	e, _ := testEngine(t, "")
-	require.Nil(t, e.Check(request("GET", "/", "192.0.2.1:1")))
+	r := request("GET", "/", "192.0.2.1:1")
+	require.Nil(t, e.Check(r, match.NewEnv(r)))
 }
 
 func TestEngine_Order(t *testing.T) {
@@ -83,6 +98,7 @@ func TestEngine_Order(t *testing.T) {
 rules:
   - name: abuse
     match: path startsWith "/bad"
+    action: block
   - name: exempt
     match: ipIn(ip, "10.0.0.0/8")
     action: allow
@@ -91,6 +107,7 @@ rules:
     rate: 1/h
   - name: after-limit
     match: path startsWith "/late"
+    action: block
 `)
 	for range 5 {
 		require.Equal(t, "", decided(e, request("GET", "/x", "10.1.2.3:1")))
@@ -147,7 +164,7 @@ func TestEngine_LimitKeyIsHashPrefix(t *testing.T) {
 	require.Equal(t, "l", decided(e, request("GET", "/", "[2001:db8:1:2::ffff]:1")))
 	require.Equal(t, "", decided(e, request("GET", "/", "[2001:db8:1:3::1]:1")))
 
-	e, _ = testEngine(t, "hash: {ipv4-prefix-bits: 24}\nrules: [{name: l, action: limit, rate: 1/h}]")
+	e, _ = testEngine(t, "client-key: {ipv4-prefix-bits: 24}\nrules: [{name: l, action: limit, rate: 1/h}]")
 	require.Equal(t, "", decided(e, request("GET", "/", "192.0.2.1:1")))
 	require.Equal(t, "l", decided(e, request("GET", "/", "192.0.2.99:1")))
 }
@@ -159,7 +176,7 @@ func TestEngine_UpdateKeepsUnchangedLimits(t *testing.T) {
 	require.Equal(t, "l", decided(e, request("GET", "/", "192.0.2.1:1")))
 
 	// Same rule: the client is still limited; a new rule in front changes nothing about that
-	e.Update(testConfig(t, "rules: [{name: new, match: 'path == \"/new\"'}, {name: l, action: limit, rate: 1/h}]"))
+	e.Update(testConfig(t, "rules: [{name: new, action: block, match: 'path == \"/new\"'}, {name: l, action: limit, rate: 1/h}]"))
 	require.Equal(t, "l", decided(e, request("GET", "/", "192.0.2.1:1")))
 	require.Equal(t, "new", decided(e, request("GET", "/new", "192.0.2.1:1")))
 
@@ -169,30 +186,30 @@ func TestEngine_UpdateKeepsUnchangedLimits(t *testing.T) {
 
 	// A changed client key starts over too
 	require.Equal(t, "l", decided(e, request("GET", "/", "192.0.2.1:1")))
-	e.Update(testConfig(t, "hash: {ipv4-prefix-bits: 24}\nrules: [{name: l, action: limit, rate: 2/h}]"))
+	e.Update(testConfig(t, "client-key: {ipv4-prefix-bits: 24}\nrules: [{name: l, action: limit, rate: 2/h}]"))
 	require.Equal(t, "", decided(e, request("GET", "/", "192.0.2.1:1")))
 
 	// Removing all rules lets everything pass
 	e.Update(testConfig(t, ""))
-	require.Nil(t, e.Check(request("GET", "/", "192.0.2.1:1")))
+	require.Equal(t, "", decided(e, request("GET", "/", "192.0.2.1:1")))
 }
 
 func TestEngine_SweepForgetsFullBuckets(t *testing.T) {
 	e, now := testEngine(t, "rules: [{name: l, action: limit, rate: 1/h, burst: 9}]")
 	for i := range 100 {
-		e.Check(request("GET", "/", "192.0.2."+strconv.Itoa(i)+":1"))
+		decided(e, request("GET", "/", "192.0.2."+strconv.Itoa(i)+":1"))
 	}
 	l := e.state.Load().rules[0].limiter
 	require.Len(t, l.buckets, 100)
 
 	// Not yet refilled: kept
 	*now = now.Add(sweepInterval)
-	e.Check(request("GET", "/", "192.0.2.1:1"))
+	decided(e, request("GET", "/", "192.0.2.1:1"))
 	require.Len(t, l.buckets, 100)
 
 	// Refilled: forgotten, except the one that just took a token
 	*now = now.Add(time.Hour)
-	e.Check(request("GET", "/", "192.0.2.1:1"))
+	decided(e, request("GET", "/", "192.0.2.1:1"))
 	require.Len(t, l.buckets, 1)
 }
 
@@ -203,10 +220,13 @@ func TestEngine_SweepForgetsFullBuckets(t *testing.T) {
 const benchRules = `
 rules:
   - name: abuse-topics
+    action: block
     match: path matches "^/(alex-kaggle-|nz_|nezha|my-bets($|/)|tuna_zamplia_alerts($|/)|gunbot-contabo-|medusa-one-page-deploy-|carmen-hub-7164-firetv($|/)|whitedeck-2fa-|abrotp_z1b6lgs4qfj($|/)|BADat($|/)|BACam($|/)|spam-)"
   - name: abuse-user-agents
+    action: block
     match: header("User-Agent") matches "(?i)ntfy-spy"
   - name: abuse-topic-count
+    action: block
     match: path matches "^/[^/]*(,[^/,]*){150,}"
   - name: limit-exempt
     match: ipIn(ip, "116.203.112.46/32", "132.226.42.65/32", "136.243.88.169/32", "176.126.240.0/24", "188.40.204.226/32", "45.43.14.223/32")
@@ -219,11 +239,11 @@ rules:
 func BenchmarkEngine_Check(b *testing.B) {
 	conf, err := config.Parse([]byte(testBase + benchRules))
 	require.NoError(b, err)
-	e := New(conf)
+	e := New(conf, nil)
 	r := request("GET", "/mytopic/json?since=1730000000", "203.0.113.7:4321", "User-Agent", "ntfy/1.27.0 (Android; 14)")
 	b.ReportAllocs()
 	for b.Loop() {
-		if e.Check(r) != nil {
+		if e.Check(r, match.NewEnv(r)) != nil {
 			b.Fatal("unexpected decision")
 		}
 	}
@@ -232,12 +252,23 @@ func BenchmarkEngine_Check(b *testing.B) {
 func BenchmarkEngine_CheckParallel(b *testing.B) {
 	conf, err := config.Parse([]byte(testBase + benchRules))
 	require.NoError(b, err)
-	e := New(conf)
+	e := New(conf, nil)
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		r := request("GET", "/mytopic/json", "203.0.113.7:4321", "User-Agent", "ntfy/1.27.0 (Android; 14)")
 		for pb.Next() {
-			e.Check(r)
+			e.Check(r, match.NewEnv(r))
 		}
 	})
+}
+
+func TestEngine_RedirectAndStaticDecide(t *testing.T) {
+	e, _ := testEngine(t, `
+rules:
+  - {name: docs, match: 'path startsWith "/docs"', action: redirect, location: '"https://docs.ntfy.sh/"'}
+  - {name: site, match: 'path == "/"', action: static, root: /srv}
+`)
+	require.Equal(t, "docs", decided(e, request("GET", "/docs/x", "192.0.2.1:1")))
+	require.Equal(t, "site", decided(e, request("GET", "/", "192.0.2.1:1")))
+	require.Equal(t, "", decided(e, request("GET", "/mytopic", "192.0.2.1:1")))
 }

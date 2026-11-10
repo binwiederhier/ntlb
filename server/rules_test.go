@@ -1,6 +1,8 @@
 package server
 
 import (
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -9,26 +11,39 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntfy-lb/config"
 )
+
+// noRedirects is a client that shows redirects instead of following them
+var noRedirects = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+	Timeout: 3 * time.Second,
+}
+
+// notFound makes /missing on an upstream answer 404
+func notFound(u *testUpstream) {
+	u.on("/missing", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+}
 
 func TestServer_RuleBlocks(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
-	dir := t.TempDir()
-	abuseLog, accessLogFile := filepath.Join(dir, "abuse.log"), filepath.Join(dir, "access.log")
-	s, _ := newTestServer(t, "access-log: "+accessLogFile+`
+	accessLogFile := filepath.Join(t.TempDir(), "access.log")
+	s, _ := newTestServer(t, "access-logs: [{file: "+accessLogFile+"}]"+`
 rules:
   - name: abuse
     match: path startsWith "/nz_"
-    log: `+abuseLog+`
+    action: block
   - name: spy
     match: header("User-Agent") matches "(?i)ntfy-spy"
+    action: block
     status: 451
 `, app1)
 
 	// Blocked before any upstream sees it, also subscriptions
-	quick := &http.Client{Timeout: 3 * time.Second} // Unblocked, this would be an endless subscription
-	status, body := get(t, quick, "http://"+s.HTTPAddr()+"/nz_x/json")
+	status, body := get(t, noRedirects, "http://"+s.HTTPAddr()+"/nz_x/json") // Unblocked, an endless subscription
 	require.Equal(t, http.StatusForbidden, status)
 	require.Equal(t, "Forbidden\n", body)
 	req, _ := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+"/name", nil)
@@ -43,20 +58,15 @@ rules:
 	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
 	require.Equal(t, http.StatusOK, status)
 
-	// The rule's log has its requests only; the access log has all of them, with the rule
+	// The access log names the rule that decided
 	waitFor(t, func() bool {
 		b, _ := os.ReadFile(accessLogFile)
 		return strings.Count(string(b), "\n") == 3
 	})
-	b, err := os.ReadFile(abuseLog)
+	b, err := os.ReadFile(accessLogFile)
 	require.NoError(t, err)
-	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	require.Len(t, lines, 1)
-	require.Contains(t, lines[0], `"GET /nz_x/json HTTP/1.1" 403 `)
-	require.Contains(t, lines[0], " upstream=- upstream_status=- rule=abuse")
-	b, err = os.ReadFile(accessLogFile)
-	require.NoError(t, err)
-	require.Contains(t, string(b), "rule=abuse\n")
+	require.Contains(t, string(b), `"GET /nz_x/json HTTP/1.1" 403 `)
+	require.Contains(t, string(b), " upstream=- upstream_status=- rule=abuse\n")
 	require.Contains(t, string(b), "rule=spy\n")
 	require.Contains(t, string(b), "upstream=app1 upstream_status=200\n") // No rule field when none decided
 
@@ -91,124 +101,192 @@ rules:
 	require.EqualValues(t, 6, app1.hits.Load())
 }
 
-func TestServer_RulesHotReload(t *testing.T) {
+func TestServer_RuleRedirects(t *testing.T) {
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, `
+rules:
+  - name: https
+    match: scheme == "http" && path == "/"
+    action: redirect
+    location: '"https://" + host + uri'
+  - name: docs
+    match: path startsWith "/docs/"
+    action: redirect
+    location: '"https://docs.ntfy.sh/" + trimPrefix(path, "/docs/")'
+    status: 301
+`, app1)
+	resp, err := noRedirects.Get("http://" + s.HTTPAddr() + "/?x=1")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+	require.Equal(t, "https://"+s.HTTPAddr()+"/?x=1", resp.Header.Get("Location"))
+	resp, err = noRedirects.Get("http://" + s.HTTPAddr() + "/docs/publish/")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusMovedPermanently, resp.StatusCode)
+	require.Equal(t, "https://docs.ntfy.sh/publish/", resp.Header.Get("Location"))
+	require.Zero(t, app1.hits.Load())
+}
+
+func TestServer_RuleRedirectEmptyLocation(t *testing.T) {
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "rules: [{name: r, action: redirect, location: 'query'}]", app1)
+	status, _ := get(t, noRedirects, "http://"+s.HTTPAddr()+"/x")
+	require.Equal(t, http.StatusInternalServerError, status)
+}
+
+func TestServer_RuleStatic(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	dir := t.TempDir()
-	rulesFile := filepath.Join(dir, "rules.yml")
-	require.NoError(t, os.WriteFile(rulesFile, nil, 0600))
-	s, _ := newTestServer(t, "rules-file: "+rulesFile, app1)
+	root := filepath.Join(dir, "html")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "_next", "static"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "index.html"), []byte("<h1>ntfy</h1>"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "_next", "static", "app.js"), []byte("app()"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0644))
+	s, _ := newTestServer(t, `
+rules:
+  - name: website
+    match: path == "/" || path startsWith "/_next/" || path contains ".."
+    action: static
+    root: `+root+`
+    fallback: /index.html
+  - name: no-fallback
+    match: path startsWith "/assets/"
+    action: static
+    root: `+root+`
+`, app1)
+	base := "http://" + s.HTTPAddr()
+
+	// A file, by its path
+	resp, err := http.Get(base + "/_next/static/app.js")
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "app()", string(body))
+	require.Contains(t, resp.Header.Get("Content-Type"), "javascript")
+	require.NotEmpty(t, resp.Header.Get("Last-Modified"))
+
+	// A directory or a missing file: the fallback, like try_files $uri /index.html
+	for _, path := range []string{"/", "/_next/", "/_next/missing.js"} {
+		status, body := get(t, http.DefaultClient, base+path)
+		require.Equal(t, http.StatusOK, status, path)
+		require.Equal(t, "<h1>ntfy</h1>", body, path)
+	}
+
+	// Nothing outside the root, also with an unnormalized path on the wire
+	conn, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.Write([]byte("GET /_next/../../secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+	require.NoError(t, err)
+	raw, _ := io.ReadAll(conn)
+	require.NotContains(t, string(raw), "secret")
+
+	// No fallback: 404
+	status, _ := get(t, http.DefaultClient, base+"/assets/missing.css")
+	require.Equal(t, http.StatusNotFound, status)
+
+	// HEAD and conditional requests work
+	req, _ := http.NewRequest(http.MethodHead, base+"/_next/static/app.js", nil)
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, "5", resp.Header.Get("Content-Length"))
+	req, _ = http.NewRequest(http.MethodGet, base+"/_next/static/app.js", nil)
+	req.Header.Set("If-Modified-Since", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusNotModified, resp.StatusCode)
+	require.Zero(t, app1.hits.Load())
+}
+
+func TestServer_Bans(t *testing.T) {
+	app1 := newTestUpstream(t, "app1")
+	notFound(app1)
+	banLog := filepath.Join(t.TempDir(), "ban.log")
+	s, _ := newTestServer(t, "bans: {file: "+banLog+", threshold: 10}"+`
+rules:
+  - name: abuse
+    match: path startsWith "/nz_"
+    action: block
+    strike: 4
+  - name: not-found
+    on: response
+    match: status == 404 && upstream_status == 404
+    strike: 1
+`, app1)
+	a, b := clientFrom("127.0.0.1"), clientFrom("127.0.0.2")
+	for range 3 {
+		get(t, a, "http://"+s.HTTPAddr()+"/nz_x")
+	}
+	for range 11 {
+		get(t, b, "http://"+s.HTTPAddr()+"/missing")
+	}
+	waitFor(t, func() bool {
+		data, _ := os.ReadFile(banLog)
+		return strings.Count(string(data), "\n") == 2
+	})
+	data, err := os.ReadFile(banLog)
+	require.NoError(t, err)
+	require.Contains(t, string(data), " 127.0.0.1 127.0.0.1/32 abuse\n")
+	require.Contains(t, string(data), " 127.0.0.2 127.0.0.2/32 not-found\n")
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, "ntfy_lb_bans_total 2")
+}
+
+func TestServer_AccessLogsByStatus(t *testing.T) {
+	app1 := newTestUpstream(t, "app1")
+	notFound(app1)
+	dir := t.TempDir()
+	okLog, errLog := filepath.Join(dir, "access.log"), filepath.Join(dir, "access_error.log")
+	s, _ := newTestServer(t, "access-logs: [{file: "+okLog+", match: 'status < 400'}, {file: "+errLog+"}]", app1)
+	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
+	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/missing")
+	waitFor(t, func() bool {
+		a, _ := os.ReadFile(okLog)
+		b, _ := os.ReadFile(errLog)
+		return strings.Contains(string(a), "GET /name ") && strings.Contains(string(b), "GET /missing ")
+	})
+	a, _ := os.ReadFile(okLog)
+	b, _ := os.ReadFile(errLog)
+	require.NotContains(t, string(a), "/missing")
+	require.NotContains(t, string(b), "/name")
+}
+
+func TestServer_RulesHotReload(t *testing.T) {
+	app1 := newTestUpstream(t, "app1")
+	s, filename := newTestServer(t, "", app1)
 	stream, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
 	defer closeStream()
 
 	// A new block rule turns new requests away, but leaves open streams alone
-	log1 := filepath.Join(dir, "rules1.log")
-	writeRules := func(rules string) {
-		require.NoError(t, os.WriteFile(rulesFile, []byte(rules), 0600))
-	}
-	writeRules("rules: [{name: mytopic, match: 'path startsWith \"/mytopic/\"', log: " + log1 + "}]")
+	writeConfig(t, filename, "rules: [{name: mytopic, match: 'path startsWith \"/mytopic/\"', action: block}]", app1)
 	requireReload(t, s)
 	status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json?poll=1")
 	require.Equal(t, http.StatusForbidden, status)
 	require.False(t, streamClosed(stream))
 
-	// A broken rules file is rejected as a whole, and the old rules stay
-	writeRules("rules: [{name: mytopic, match: 'path matches \"(\"'}]")
+	// A broken rule is rejected with the whole config, and the old rules stay
+	writeConfig(t, filename, "rules: [{name: mytopic, match: 'path matches \"(\"', action: block}]", app1)
 	_, err := s.Reload()
 	require.ErrorContains(t, err, "invalid match")
 	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json?poll=1")
 	require.Equal(t, http.StatusForbidden, status)
 
-	// So is a log file that cannot be opened
-	writeRules("rules: [{name: mytopic, match: 'path == \"/x\"', log: " + filepath.Join(dir, "missing", "x.log") + "}]")
-	_, err = s.Reload()
-	require.Error(t, err)
-	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json?poll=1")
-	require.Equal(t, http.StatusForbidden, status)
-
-	// Moving the log: new lines go to the new file, the old one is closed
-	log2 := filepath.Join(dir, "rules2.log")
-	writeRules("rules: [{name: mytopic, match: 'path startsWith \"/mytopic/\"', log: " + log2 + "}]")
-	requireReload(t, s)
-	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json?poll=1")
-	waitFor(t, func() bool {
-		b, _ := os.ReadFile(log2)
-		return strings.Count(string(b), "\n") == 1
-	})
-	b, err := os.ReadFile(log1)
-	require.NoError(t, err)
-	require.Equal(t, 3, strings.Count(string(b), "\n")) // The three while the first file was live
-
 	// Without the rule, everything passes again
-	writeRules("")
+	writeConfig(t, filename, "", app1)
 	requireReload(t, s)
 	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json?poll=1")
 	require.Equal(t, http.StatusOK, status)
 	require.False(t, streamClosed(stream))
-	require.Len(t, *s.ruleLogs.logs.Load(), 0)
 }
 
-func TestServer_RuleLogsShareFiles(t *testing.T) {
-	app1 := newTestUpstream(t, "app1")
-	abuseLog := filepath.Join(t.TempDir(), "abuse.log")
-	s, _ := newTestServer(t, `
-rules:
-  - {name: a, match: 'path == "/a"', log: `+abuseLog+`}
-  - {name: b, match: 'path == "/b"', log: `+abuseLog+`}
-`, app1)
-	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/a")
-	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/b")
-	require.Len(t, *s.ruleLogs.logs.Load(), 1)
-	waitFor(t, func() bool {
-		b, _ := os.ReadFile(abuseLog)
-		return strings.Contains(string(b), "rule=a\n") && strings.Contains(string(b), "rule=b\n")
-	})
-}
-
-func TestServer_NewFailsOnRuleLog(t *testing.T) {
+func TestServer_NewFailsOnBanFile(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	writeConfig(t, filename, "rules: [{name: a, log: /nonexistent/dir/a.log}]", app1)
+	writeConfig(t, filename, "bans: {file: /nonexistent/dir/ban.log, threshold: 1}", app1)
 	_, err := New(filename)
 	require.Error(t, err)
-}
-
-func TestServer_RuleLogReopenedOnReload(t *testing.T) {
-	// logrotate moves the file away, then reloads: the rule log is reopened at its path
-	app1 := newTestUpstream(t, "app1")
-	abuseLog := filepath.Join(t.TempDir(), "abuse.log")
-	s, _ := newTestServer(t, "rules: [{name: a, match: 'path == \"/a\"', log: "+abuseLog+"}]", app1)
-	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/a")
-	before := s.ruleLogs.get(abuseLog)
-	require.NoError(t, os.Rename(abuseLog, abuseLog+".1"))
-	requireReload(t, s)
-	require.Same(t, before, s.ruleLogs.get(abuseLog)) // Same log, new file
-	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/a")
-	waitFor(t, func() bool {
-		b, _ := os.ReadFile(abuseLog)
-		return strings.Count(string(b), "\n") == 1
-	})
-	b, err := os.ReadFile(abuseLog + ".1")
-	require.NoError(t, err)
-	require.Equal(t, 1, strings.Count(string(b), "\n"))
-}
-
-func TestOpenRuleLogFiles_ClosesOnFailure(t *testing.T) {
-	dir := t.TempDir()
-	conf := "listen-http: ':80'\nupstreams: [{name: a, addresses: ['1.2.3.4:80']}]\nrules:\n" +
-		"  - {name: a, log: " + filepath.Join(dir, "a.log") + "}\n" +
-		"  - {name: b, log: " + filepath.Join(dir, "a.log") + "}\n" +
-		"  - {name: c, log: " + filepath.Join(dir, "missing", "c.log") + "}\n"
-	c, err := config.Parse([]byte(conf))
-	require.NoError(t, err)
-	opened := openFDs(t)
-	_, err = openRuleLogFiles(c)
-	require.ErrorContains(t, err, "rule c")
-	require.Equal(t, opened, openFDs(t))
-}
-
-// openFDs counts the open file descriptors of this process
-func openFDs(t *testing.T) int {
-	entries, err := os.ReadDir("/proc/self/fd")
-	require.NoError(t, err)
-	return len(entries)
 }
