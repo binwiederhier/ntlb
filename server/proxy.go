@@ -31,14 +31,27 @@ const (
 	// events are small, and larger bodies (attachments) just take more reads.
 	copyBufferSize = 4 * 1024
 
+	// upgradedDownBufferSize and upgradedUpBufferSize are the copy buffers of an upgraded connection
+	// (WebSocket), upstream to client and back
+	upgradedDownBufferSize = 4 * 1024
+	upgradedUpBufferSize   = 1024
+
 	statusClientClosedRequest = 499 // nginx's status for a request that ended before a response
 )
 
 // Headers the proxy sets or reads
 const (
-	headerConnection    = "Connection"
-	headerXForwardedFor = "X-Forwarded-For"
-	connectionClose     = "close"
+	headerConnection      = "Connection"
+	headerXForwardedFor   = "X-Forwarded-For"
+	headerAcceptEncoding  = "Accept-Encoding"
+	headerAcceptRanges    = "Accept-Ranges"
+	headerContentEncoding = "Content-Encoding"
+	headerContentLength   = "Content-Length"
+	headerContentType     = "Content-Type"
+	headerETag            = "ETag"
+	headerVary            = "Vary"
+	encodingGzip          = "gzip"
+	connectionClose       = "close"
 )
 
 var (
@@ -171,7 +184,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.track(pr)
 	r = r.WithContext(withProxyRequest(ctx, pr))
 	if stream {
-		p.serveStream(w, r, pr)
+		p.serveStream(unwrapGzip(w), r, pr)
 		return
 	}
 
@@ -617,6 +630,18 @@ func (b *upgradedBody) Close() error {
 	return b.rwc.Close()
 }
 
+// WriteTo copies the upstream side to the client with a small buffer: the reverse proxy's io.Copy
+// would take 32 KiB, held for the whole WebSocket while it waits for the next message
+func (b *upgradedBody) WriteTo(w io.Writer) (int64, error) {
+	return copySmall(w, b, upgradedDownBufferSize)
+}
+
+// ReadFrom copies the client side to the upstream, like WriteTo; clients send small frames
+// (pings, pongs; ntfy reads at most 64 bytes per message)
+func (b *upgradedBody) ReadFrom(r io.Reader) (int64, error) {
+	return copySmall(b, r, upgradedUpBufferSize)
+}
+
 // bufferPool hands out the reverse proxy's copy buffers
 type bufferPool struct {
 	pool sync.Pool
@@ -704,4 +729,26 @@ func safely(where string, f func()) {
 		}
 	}()
 	f()
+}
+
+// copySmall copies until EOF or an error with a buffer of size bytes. A loop of its own, not
+// io.CopyBuffer, which would hand the copy to w's ReadFrom or r's WriteTo and their 32 KiB buffers.
+func copySmall(w io.Writer, r io.Reader, size int) (int64, error) {
+	buf := make([]byte, size)
+	var written int64
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			m, werr := w.Write(buf[:n])
+			written += int64(m)
+			if werr != nil {
+				return written, werr
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return written, nil
+		} else if err != nil {
+			return written, err
+		}
+	}
 }

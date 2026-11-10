@@ -37,7 +37,7 @@ func TestBalancer_ProbeOne(t *testing.T) {
 				return
 			}
 			if status == http.StatusMovedPermanently {
-				http.Redirect(w, r, "/elsewhere", status) // Not followed, so it fails
+				http.Redirect(w, r, "/elsewhere", status) // Not followed: answering is what counts (e.g. "/" redirecting to a login page)
 				return
 			}
 			w.WriteHeader(status)
@@ -53,7 +53,9 @@ func TestBalancer_ProbeOne(t *testing.T) {
 		{"200", http.StatusOK, ""},
 		{"204", http.StatusNoContent, ""},
 		{"299", 299, ""},
-		{"301", http.StatusMovedPermanently, "unexpected status 301"},
+		{"301", http.StatusMovedPermanently, ""},
+		{"399", 399, ""},
+		{"400", http.StatusBadRequest, "unexpected status 400"},
 		{"404", http.StatusNotFound, "unexpected status 404"},
 		{"500", http.StatusInternalServerError, "unexpected status 500"},
 		{"503", http.StatusServiceUnavailable, "unexpected status 503"},

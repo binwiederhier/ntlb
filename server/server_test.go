@@ -225,6 +225,14 @@ func (u *testUpstream) addr() string {
 	return strings.TrimPrefix(u.server.URL, "http://")
 }
 
+// A site set up like ntfy's (packaging/sites.d/ntfy.yml): its subscriptions as streams, its
+// readiness probe, hashing; the tests play ntfy
+const (
+	testStreamsMatch = `method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")`
+	testHealthPath   = "/v1/ready" // ntfy's readiness, which the test upstreams answer
+	testNtfySite     = "health-check: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}, balance: hash, streams: {match: '" + testStreamsMatch + "'}"
+)
+
 // siteKeys are the settings writeConfig moves from extra into the site
 var (
 	siteKeys = []string{"streams:", "cert-file:", "key-file:", "listen-https:"}
@@ -244,12 +252,18 @@ func upstreamsYAML(upstreams ...*testUpstream) string {
 	return siteYAML(nil, upstreams...)
 }
 
-// siteYAML is a site "s" with the settings (one per line) and the upstreams
+// siteYAML is a site "s" with the settings (one per line) and the upstreams, set up like ntfy's
+// (readiness path, hashing, its subscriptions as streams, unless the settings have streams)
 func siteYAML(settings []string, upstreams ...*testUpstream) string {
 	var b strings.Builder
-	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    health-check: {interval: 1h, timeout: 1s}\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    health-check: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}\n    balance: hash\n")
+	streams := false
 	for _, setting := range settings {
 		b.WriteString("    " + setting + "\n")
+		streams = streams || strings.HasPrefix(setting, "streams:")
+	}
+	if !streams {
+		b.WriteString("    streams: {match: '" + testStreamsMatch + "'}\n")
 	}
 	b.WriteString("    upstreams:\n")
 	for _, u := range upstreams {
@@ -549,8 +563,8 @@ func TestServer_ReloadOpensAndClosesListeners(t *testing.T) {
 	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
 	dir := t.TempDir()
 	filename := filepath.Join(dir, "config.yml")
-	siteA := fmt.Sprintf("  - {name: a, listen-http: '127.0.0.1:0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}\n", a1.addr())
-	siteB := fmt.Sprintf("  - {name: b, listen-http: '127.0.0.2:0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}\n", b1.addr())
+	siteA := fmt.Sprintf("  - {name: a, listen-http: '127.0.0.1:0', "+testNtfySite+", upstreams: [{name: app1, addresses: [%q]}]}\n", a1.addr())
+	siteB := fmt.Sprintf("  - {name: b, listen-http: '127.0.0.2:0', "+testNtfySite+", upstreams: [{name: app1, addresses: [%q]}]}\n", b1.addr())
 	write := func(sites string) {
 		require.NoError(t, os.WriteFile(filename, []byte("listen-admin: '127.0.0.1:0'\nsites:\n"+sites), 0600))
 	}
@@ -584,23 +598,30 @@ func TestServer_ReloadOpensAndClosesListeners(t *testing.T) {
 	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
 	require.Equal(t, http.StatusOK, status)
 
-	// A kept-alive connection to the removed address is sent away: 503, then closed
+	// A kept-alive connection to the removed address is closed (HTTP/2: GOAWAY), and the removed
+	// server is forgotten once its last connection is gone; a stream it hijacked runs on
 	write(siteA + siteB)
 	requireReload(t, s)
 	addrB = s.ListenerAddr("127.0.0.2:0")
-	keepalive := &http.Client{Transport: &http.Transport{}}
-	resp, err := keepalive.Get("http://" + addrB + "/name")
+	idle, err := net.Dial("tcp", addrB)
+	require.NoError(t, err)
+	defer idle.Close()
+	fmt.Fprint(idle, "GET /name HTTP/1.1\r\nHost: x\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(idle), nil)
 	require.NoError(t, err)
 	io.ReadAll(resp.Body)
 	resp.Body.Close()
 	write(siteA)
 	requireReload(t, s)
-	resp, err = keepalive.Get("http://" + addrB + "/name")
-	require.NoError(t, err)
-	io.ReadAll(resp.Body)
-	resp.Body.Close()
-	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-	require.True(t, resp.Close)
+	idle.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err = idle.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	waitFor(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.retired) == 0
+	})
+	require.Equal(t, 1, s.balancer.Status().Streams) // The first stream, hijacked
 
 	// An address cannot switch between HTTP and HTTPS without a restart
 	writeTestCert(t, filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), "a.com")
@@ -739,7 +760,7 @@ func TestServer_ReloadAddsSiteFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 include: [sites.d/*.yml]
-sites: [{name: a, listen-http: '127.0.0.1:0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}]
+sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}]
 `, a1.addr())), 0600))
 	s := startTestServer(t, filename)
 	getHost := func(host string) {
@@ -755,7 +776,7 @@ sites: [{name: a, listen-http: '127.0.0.1:0', health-check: {interval: 1h, timeo
 	getHost("b.com")
 	require.Equal(t, int64(1), a1.hits.Load())
 
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}]\n", b1.addr())), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], "+testNtfySite+", upstreams: [{name: app1, addresses: [%q]}]}]\n", b1.addr())), 0600))
 	requireReload(t, s)
 	getHost("b.com")
 	require.Equal(t, int64(1), b1.hits.Load())

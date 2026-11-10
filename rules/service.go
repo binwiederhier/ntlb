@@ -17,9 +17,14 @@ import (
 	"heckel.io/ntlb/match"
 )
 
-// sweepInterval is how often a limiter forgets the buckets that refilled
 const (
+	// sweepInterval is how often a limiter forgets the buckets that refilled
 	sweepInterval = time.Minute
+
+	// fullSweepInterval is how often a full limiter or bans map (maxTracked) sweeps for room for
+	// a new client; in between, new clients go untracked. A sweep of 1M entries takes ~60 ms under
+	// the lock, which every new key of a spray would pay otherwise.
+	fullSweepInterval = 5 * time.Second
 )
 
 var (
@@ -254,7 +259,9 @@ func (l *limiter) take(key string, now time.Time) bool {
 	}
 	b, ok := l.buckets[key]
 	if !ok && len(l.buckets) >= maxTracked {
-		l.sweepNoLock(now)
+		if now.Sub(l.lastSweep) >= fullSweepInterval {
+			l.sweepNoLock(now)
+		}
 		if len(l.buckets) >= maxTracked {
 			return true // Untracked: a spray of keys must not grow the map without bound
 		}

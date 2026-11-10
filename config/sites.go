@@ -34,8 +34,10 @@ type Site struct {
 	KeyFile     string       `yaml:"key-file"`     //
 	AccessLogs  []*AccessLog `yaml:"access-logs"`  // Replace the global access logs for this site
 	Bans        *Bans        `yaml:"bans"`         // Replace the global bans settings for this site (usually there are only global ones)
+	Gzip        *Gzip        `yaml:"gzip"`         // Replace the global gzip settings for this site
 	HealthCheck *HealthCheck `yaml:"health-check"` // Active health checks against every upstream
 	Streams     *Streams     `yaml:"streams"`      // Which requests are long-lived streams
+	Balance     string       `yaml:"balance"`      // round-robin (default), least-conn, random-two or hash
 	Upstreams   []*Upstream  `yaml:"upstreams"`    // Upstream names are per site
 	Rules       []*Rule      `yaml:"rules"`        // Checked after the global rules
 
@@ -137,6 +139,15 @@ func (c *Config) BansFor(site *Site) *Bans {
 	return c.Bans
 }
 
+// GzipFor returns the gzip settings for a request to a site: its own, else the global ones, or
+// nil for no compression
+func (c *Config) GzipFor(site *Site) *Gzip {
+	if site != nil && site.Gzip != nil {
+		return site.Gzip
+	}
+	return c.Gzip
+}
+
 // UpstreamCount returns the number of upstreams over all sites
 func (c *Config) UpstreamCount() int {
 	n := 0
@@ -213,6 +224,9 @@ func (s *Site) applyDefaults() {
 		s.Streams.Match = DefaultStreamsMatch
 	}
 	s.Bans.applyDefaults()
+	if s.Balance == "" {
+		s.Balance = DefaultBalance
+	}
 	applyRuleDefaults(s.Rules)
 }
 
@@ -269,6 +283,11 @@ func (s *Site) validate(bans *Bans) error {
 		return err
 	} else if err := validateBans(s.Bans); err != nil {
 		return err
+	} else if err := s.Gzip.validate(); err != nil {
+		return err
+	}
+	if !slices.Contains(balances, s.Balance) {
+		return fmt.Errorf("invalid balance %q, expected one of %s", s.Balance, strings.Join(balances, ", "))
 	}
 	if err := s.HealthCheck.validate(); err != nil {
 		return err

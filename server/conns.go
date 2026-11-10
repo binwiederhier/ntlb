@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -23,6 +24,20 @@ type connInfoKey struct{}
 type connTracker struct {
 	conns sync.Map // net.Conn -> *connInfo
 	onBad func(remoteAddr string)
+}
+
+// countingListener counts a public listener's client connections from accept to close. At the
+// listener, not in ConnState: a hijacked connection (a stream, a WebSocket) is still open.
+type countingListener struct {
+	net.Listener
+	metrics *metrics
+}
+
+// countedConn is an accepted connection, uncounted once on its first Close
+type countedConn struct {
+	net.Conn
+	metrics *metrics
+	once    sync.Once
 }
 
 // connInfo is one connection's state: reading a request (active) and whether a handler got it
@@ -61,6 +76,49 @@ func (t *connTracker) connState(c net.Conn, state http.ConnState) {
 			t.onBad(c.RemoteAddr().String())
 		}
 	}
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.metrics.connectionsAccepted.Inc()
+	l.metrics.connections.Inc()
+	return &countedConn{
+		Conn:    c,
+		metrics: l.metrics,
+	}, nil
+}
+
+func (c *countedConn) Close() error {
+	c.once.Do(c.metrics.connections.Dec)
+	return c.Conn.Close()
+}
+
+// CloseWrite half-closes, which net/http does before closing a connection, so the client reads
+// an early response (e.g. an error before the body was read) before the reset
+func (c *countedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil // Nothing to half-close: Close follows
+}
+
+// ReadFrom keeps the TCP connection's (sendfile, splice) for static files and copies
+func (c *countedConn) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := c.Conn.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(struct{ io.Writer }{c.Conn}, r)
+}
+
+// WriteTo keeps the TCP connection's (splice)
+func (c *countedConn) WriteTo(w io.Writer) (int64, error) {
+	if wt, ok := c.Conn.(io.WriterTo); ok {
+		return wt.WriteTo(w)
+	}
+	return io.Copy(w, struct{ io.Reader }{c.Conn})
 }
 
 // markHandled records that a handler got the connection's request

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/pprof"
 	"strings"
 	"time"
 
@@ -93,8 +92,7 @@ func (s *Server) adminHandler() http.Handler {
 	mux.HandleFunc("POST "+apiUpstreamDrainPath, s.handleAdmin(s.handleUpstreamDrain))
 	mux.HandleFunc("DELETE "+apiUpstreamDrainPath, s.handleAdmin(s.handleUpstreamUndrain))
 	mux.Handle("GET "+apiMetricsPath, promhttp.HandlerFor(s.metrics.registry, promhttp.HandlerOpts{}))
-	mux.HandleFunc("GET "+apiPprofPath, pprof.Index)
-	mux.HandleFunc("GET "+apiPprofPath+"profile", pprof.Profile)
+	handlePprof(mux)
 	return mux
 }
 

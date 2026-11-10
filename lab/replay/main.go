@@ -181,21 +181,37 @@ func main() {
 	// Polls (most lines in the access log), every since form
 	for _, since := range []string{"all", "none", "latest", "10m", "1762750000", "abcdefghijkl", "invalid!"} {
 		since := since
-		add("poll since="+since, func(t target) result { return raw(t.http, false, h1("/rtopic/json?poll=1&since="+since), 5*time.Second) })
+		add("poll since="+since, func(t target) result {
+			return raw(t.http, false, h1("/rtopic/json?poll=1&since="+since), 5*time.Second)
+		})
 	}
-	add("poll x-poll header", func(t target) result { return raw(t.http, false, h1("/rtopic/json", "X-Poll: 1\r\n"), 5*time.Second) })
-	add("poll po=1", func(t target) result { return raw(t.http, false, h1("/rtopic/json?po=1"), 5*time.Second) })
-	add("poll 140 topics", func(t target) result { return raw(t.http, false, h1("/"+topics(140)+"/json?poll=1"), 5*time.Second) })
-	add("poll 160 topics (abuse)", func(t target) result { return raw(t.http, false, h1("/"+topics(160)+"/json?poll=1"), 5*time.Second) })
+	add("poll x-poll header", func(t target) result {
+		return raw(t.http, false, h1("/rtopic/json", "X-Poll: 1\r\n"), 5*time.Second)
+	})
+	add("poll po=1", func(t target) result {
+		return raw(t.http, false, h1("/rtopic/json?po=1"), 5*time.Second)
+	})
+	add("poll 140 topics", func(t target) result {
+		return raw(t.http, false, h1("/"+topics(140)+"/json?poll=1"), 5*time.Second)
+	})
+	add("poll 160 topics (abuse)", func(t target) result {
+		return raw(t.http, false, h1("/"+topics(160)+"/json?poll=1"), 5*time.Second)
+	})
 	add("poll iOS one message", func(t target) result {
 		return raw(t.https, true, h1("/rtopic/json?poll=1&id=abcdefghijkl", "User-Agent: ntfy/1.7.0 (build 9; iOS 26.6.2)\r\n"), 5*time.Second)
 	})
 	// Streams
 	for _, kind := range []string{"json", "sse", "raw"} {
 		kind := kind
-		add("stream h1 /"+kind, func(t target) result { return raw(t.http, false, h1("/rtopic/"+kind), 5*time.Second) })
-		add("stream h1+tls /"+kind, func(t target) result { return raw(t.https, true, h1("/rtopic/"+kind), 5*time.Second) })
-		add("stream h2 /"+kind, func(t target) result { return h2(t.https, "GET", "/rtopic/"+kind, nil, "") })
+		add("stream h1 /"+kind, func(t target) result {
+			return raw(t.http, false, h1("/rtopic/"+kind), 5*time.Second)
+		})
+		add("stream h1+tls /"+kind, func(t target) result {
+			return raw(t.https, true, h1("/rtopic/"+kind), 5*time.Second)
+		})
+		add("stream h2 /"+kind, func(t target) result {
+			return h2(t.https, "GET", "/rtopic/"+kind, nil, "")
+		})
 	}
 	add("stream android multi-topic h2", func(t target) result {
 		return h2(t.https, "GET", "/"+topics(30)+"/json", map[string]string{"User-Agent": "ntfy/1.25.2 (play; Android 17; SDK 37)"}, "")
@@ -219,44 +235,78 @@ func main() {
 	add("publish expect 100-continue", func(t target) result {
 		return raw(t.http, false, "POST /rtopic HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\nhello", 5*time.Second)
 	})
-	add("publish via GET /publish", func(t target) result { return raw(t.http, false, h1("/rtopic/publish?message=hi"), 5*time.Second) })
+	add("publish via GET /publish", func(t target) result {
+		return raw(t.http, false, h1("/rtopic/publish?message=hi"), 5*time.Second)
+	})
 	add("publish 20 MB (ntfy 413)", func(t target) result {
 		return raw(t.http, false, "PUT /rtopic HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Length: 20000000\r\nConnection: close\r\n\r\n"+strings.Repeat("a", 20000000), 20*time.Second)
 	})
-	add("unifiedpush discovery", func(t target) result { return raw(t.http, false, h1("/upAbCdEfGhIjKl?up=1"), 5*time.Second) })
+	add("unifiedpush discovery", func(t target) result {
+		return raw(t.http, false, h1("/upAbCdEfGhIjKl?up=1"), 5*time.Second)
+	})
 	add("unifiedpush aes128gcm", func(t target) result {
 		return raw(t.https, true, "POST /upAbCdEfGhIjKl HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Encoding: aes128gcm\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\x00\x01\xfe\xff", 5*time.Second)
 	})
 	add("matrix push gateway", func(t target) result {
 		return h2(t.https, "POST", "/_matrix/push/v1/notify", map[string]string{"Content-Type": "application/json"}, `{"notification":{"devices":[{"pushkey":"https://ntfy.sh/upAbCdEfGhIjKl?up=1"}]}}`)
 	})
-	add("matrix GET", func(t target) result { return h2(t.https, "GET", "/_matrix/push/v1/notify", nil, "") })
+	add("matrix GET", func(t target) result {
+		return h2(t.https, "GET", "/_matrix/push/v1/notify", nil, "")
+	})
 	// Web app and account API
-	add("config", func(t target) result { return h2(t.https, "GET", "/v1/config", nil, "") })
-	add("health", func(t target) result { return h2(t.https, "GET", "/v1/health", nil, "") })
-	add("account no auth", func(t target) result { return h2(t.https, "GET", "/v1/account", nil, "") })
+	add("config", func(t target) result {
+		return h2(t.https, "GET", "/v1/config", nil, "")
+	})
+	add("health", func(t target) result {
+		return h2(t.https, "GET", "/v1/health", nil, "")
+	})
+	add("account no auth", func(t target) result {
+		return h2(t.https, "GET", "/v1/account", nil, "")
+	})
 	add("account bad bearer", func(t target) result {
 		return h2(t.https, "GET", "/v1/account", map[string]string{"Authorization": "Bearer tk_invalid"}, "")
 	})
-	add("token PATCH no auth", func(t target) result { return h2(t.https, "PATCH", "/v1/account/token", nil, "") })
-	add("webpush DELETE with body", func(t target) result { return h2(t.https, "DELETE", "/v1/webpush", nil, `{"endpoint":"x"}`) })
+	add("token PATCH no auth", func(t target) result {
+		return h2(t.https, "PATCH", "/v1/account/token", nil, "")
+	})
+	add("webpush DELETE with body", func(t target) result {
+		return h2(t.https, "DELETE", "/v1/webpush", nil, `{"endpoint":"x"}`)
+	})
 	add("cors preflight", func(t target) result {
 		return h2(t.https, "OPTIONS", "/rtopic", map[string]string{"Origin": "https://example.com", "Access-Control-Request-Method": "PUT"}, "")
 	})
-	add("HEAD /", func(t target) result { return raw(t.https, true, "HEAD / HTTP/1.1\r\nHost: ntfy.sh\r\nConnection: close\r\n\r\n", 5*time.Second) })
-	add("HEAD /topic", func(t target) result { return raw(t.http, false, "HEAD /rtopic HTTP/1.1\r\nHost: ntfy.sh\r\nConnection: close\r\n\r\n", 5*time.Second) })
-	add("file missing", func(t target) result { return h2(t.https, "GET", "/file/abcdefghijkl.png", nil, "") })
+	add("HEAD /", func(t target) result {
+		return raw(t.https, true, "HEAD / HTTP/1.1\r\nHost: ntfy.sh\r\nConnection: close\r\n\r\n", 5*time.Second)
+	})
+	add("HEAD /topic", func(t target) result {
+		return raw(t.http, false, "HEAD /rtopic HTTP/1.1\r\nHost: ntfy.sh\r\nConnection: close\r\n\r\n", 5*time.Second)
+	})
+	add("file missing", func(t target) result {
+		return h2(t.https, "GET", "/file/abcdefghijkl.png", nil, "")
+	})
 	add("auth query ws (web app)", func(t target) result {
 		return raw(t.https, true, "GET /rtopic/ws?auth=QmFzaWMgZm9vOmJhcg HTTP/1.1\r\nHost: ntfy.sh\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", 5*time.Second)
 	})
 	// Website and redirects
-	add("http GET / redirect", func(t target) result { return raw(t.http, false, h1("/"), 5*time.Second) })
-	add("https GET / website", func(t target) result { return raw(t.https, true, h1("/"), 5*time.Second) })
-	add("docs redirect", func(t target) result { return raw(t.https, true, h1("/docs/publish/"), 5*time.Second) })
-	add("docs-xxx topic not redirected", func(t target) result { return raw(t.https, true, h1("/docs-abc/json?poll=1"), 5*time.Second) })
+	add("http GET / redirect", func(t target) result {
+		return raw(t.http, false, h1("/"), 5*time.Second)
+	})
+	add("https GET / website", func(t target) result {
+		return raw(t.https, true, h1("/"), 5*time.Second)
+	})
+	add("docs redirect", func(t target) result {
+		return raw(t.https, true, h1("/docs/publish/"), 5*time.Second)
+	})
+	add("docs-xxx topic not redirected", func(t target) result {
+		return raw(t.https, true, h1("/docs-abc/json?poll=1"), 5*time.Second)
+	})
 	// Abuse rules
-	add("abuse topic", func(t target) result { return raw(t.http, false, h1("/nz_abc/json?poll=1"), 5*time.Second) })
-	add("abuse user agent", func(t target) result { return raw(t.http, false, h1("/rtopic/json?poll=1", "User-Agent: ntfy-spy/2\r\n"), 5*time.Second) })
+	add("abuse topic", func(t target) result {
+		return raw(t.http, false, h1("/nz_abc/json?poll=1"), 5*time.Second)
+	})
+	add("abuse user agent", func(t target) result {
+		return raw(t.http, false, h1("/rtopic/json?poll=1", "User-Agent: ntfy-spy/2\r\n"), 5*time.Second)
+	})
 	// Junk, as in nginx's access_error_400.log on ntfy.sh
 	for name, junk := range map[string]string{
 		"junk TLS on HTTP port":    "\x16\x03\x01\x00{\x01\x00\x00w\x03\x03\xef\xa4aSz\r\n\r\n",
@@ -275,7 +325,9 @@ func main() {
 		"junk 200 headers":         "GET /rtopic/json?poll=1 HTTP/1.1\r\nHost: ntfy.sh\r\n" + strings.Repeat("X-A: b\r\n", 200) + "Connection: close\r\n\r\n",
 	} {
 		junk := junk
-		add(name, func(t target) result { return raw(t.http, false, junk, 5*time.Second) })
+		add(name, func(t target) result {
+			return raw(t.http, false, junk, 5*time.Second)
+		})
 	}
 	// Slow clients: headers never finished, a body trickling in, a body that stops
 	add("slow headers (slowloris)", func(t target) result {

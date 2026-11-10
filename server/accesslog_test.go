@@ -112,8 +112,8 @@ func TestAccessLog_PerSite(t *testing.T) {
 listen-admin: '127.0.0.1:0'
 access-logs: [{file: %s}]
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], access-logs: [{file: %s}], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
-  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], access-logs: [{file: %s}], `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], `+testNtfySite+`, upstreams: [{name: app1, addresses: [%q]}]}
 `, global, siteLog, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
 	for _, host := range []string{"a.com", "b.com", "c.com"} {

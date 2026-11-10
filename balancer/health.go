@@ -104,7 +104,7 @@ func (b *Balancer) probeOne(ctx context.Context, hc *config.HealthCheck, addr st
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+	if resp.StatusCode < 200 || resp.StatusCode > 399 { // Like HAProxy's httpchk: 2xx and 3xx (not followed) are up
 		return fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 	return nil

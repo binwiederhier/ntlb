@@ -1,5 +1,5 @@
 [Unit]
-Description=ntlb, load balancer for ntfy
+Description=ntlb, HTTP load balancer
 After=network-online.target
 Wants=network-online.target
 

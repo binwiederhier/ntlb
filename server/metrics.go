@@ -1,7 +1,10 @@
 package server
 
 import (
+	"os"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -45,16 +48,30 @@ const (
 // metrics are the load balancer's Prometheus metrics. Counters and histograms are updated as
 // requests end; the gauges that mirror the balancer's state are read from its Status on scrape.
 type metrics struct {
-	registry        *prometheus.Registry
-	requests        *prometheus.CounterVec
-	requestDuration *prometheus.HistogramVec
-	streamDuration  prometheus.Histogram
-	streams         *prometheus.GaugeVec
-	retries         *prometheus.CounterVec
-	refused         prometheus.Counter
-	streamsClosed   *prometheus.CounterVec
-	ruleMatches     *prometheus.CounterVec
-	bans            prometheus.Counter
+	registry            *prometheus.Registry
+	requests            *prometheus.CounterVec
+	requestDuration     *prometheus.HistogramVec
+	streamDuration      prometheus.Histogram
+	streams             *prometheus.GaugeVec
+	retries             *prometheus.CounterVec
+	refused             prometheus.Counter
+	streamsClosed       *prometheus.CounterVec
+	ruleMatches         *prometheus.CounterVec
+	bans                prometheus.Counter
+	connections         prometheus.Gauge
+	connectionsAccepted prometheus.Counter
+}
+
+// processCollector exports the process metrics of Prometheus' process collector, without the open
+// fds: counting them lists /proc/self/fd, ~110 ms and 170k strings per scrape at 85k clients
+// (ntlb_connections counts the client side)
+type processCollector struct {
+	start  time.Time // At startup, when the metrics are created
+	cpu    *prometheus.Desc
+	rss    *prometheus.Desc
+	vsize  *prometheus.Desc
+	maxFDs *prometheus.Desc
+	since  *prometheus.Desc
 }
 
 // statusCollector exports the balancer's Status as gauges and counters
@@ -120,6 +137,16 @@ func newMetrics(b *balancer.Balancer) *metrics {
 			Name:      "bans_total",
 			Help:      "Ban lines written: clients whose strikes went over the bans threshold",
 		}),
+		connections: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "connections",
+			Help:      "Open client connections on the public listeners, like nginx's active connections (idle, serving, streams, WebSockets)",
+		}),
+		connectionsAccepted: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "connections_accepted_total",
+			Help:      "Client connections accepted on the public listeners",
+		}),
 	}
 	for _, protocol := range []string{protocolHTTP1, protocolHTTP2, protocolWebSocket} {
 		m.streams.WithLabelValues(protocol)
@@ -140,9 +167,11 @@ func newMetrics(b *balancer.Balancer) *metrics {
 		m.streamsClosed,
 		m.ruleMatches,
 		m.bans,
+		m.connections,
+		m.connectionsAccepted,
 		newStatusCollector(b),
 		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		newProcessCollector(),
 	)
 	return m
 }
@@ -213,4 +242,46 @@ func streamProtocol(kind string, protoMajor int) string {
 	default:
 		return protocolHTTP1
 	}
+}
+
+func newProcessCollector() *processCollector {
+	desc := func(name, help string) *prometheus.Desc {
+		return prometheus.NewDesc(name, help, nil, nil)
+	}
+	return &processCollector{
+		start:  time.Now(),
+		cpu:    desc("process_cpu_seconds_total", "Total user and system CPU time spent in seconds."),
+		rss:    desc("process_resident_memory_bytes", "Resident memory size in bytes."),
+		vsize:  desc("process_virtual_memory_bytes", "Virtual memory size in bytes."),
+		maxFDs: desc("process_max_fds", "Maximum number of open file descriptors."),
+		since:  desc("process_start_time_seconds", "Start time of the process since unix epoch in seconds."),
+	}
+}
+
+func (c *processCollector) Describe(ch chan<- *prometheus.Desc) {
+	for _, d := range []*prometheus.Desc{c.cpu, c.rss, c.vsize, c.maxFDs, c.since} {
+		ch <- d
+	}
+}
+
+func (c *processCollector) Collect(ch chan<- prometheus.Metric) {
+	var usage syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err == nil {
+		cpu := time.Duration(usage.Utime.Nano() + usage.Stime.Nano())
+		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpu.Seconds())
+	}
+	if statm, err := os.ReadFile("/proc/self/statm"); err == nil { // "<size> <resident> ..." in pages
+		if fields := strings.Fields(string(statm)); len(fields) >= 2 {
+			pageSize := float64(os.Getpagesize())
+			size, _ := strconv.ParseFloat(fields[0], 64)
+			resident, _ := strconv.ParseFloat(fields[1], 64)
+			ch <- prometheus.MustNewConstMetric(c.vsize, prometheus.GaugeValue, size*pageSize)
+			ch <- prometheus.MustNewConstMetric(c.rss, prometheus.GaugeValue, resident*pageSize)
+		}
+	}
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err == nil {
+		ch <- prometheus.MustNewConstMetric(c.maxFDs, prometheus.GaugeValue, float64(limit.Cur))
+	}
+	ch <- prometheus.MustNewConstMetric(c.since, prometheus.GaugeValue, float64(c.start.UnixNano())/1e9)
 }

@@ -18,15 +18,23 @@ import (
 	"heckel.io/ntlb/match"
 )
 
-// Defaults, mostly mirroring the nginx + lbagent setup on ntfy.sh
+// Balancing strategies, a site's balance
+const (
+	BalanceRoundRobin = "round-robin"
+	BalanceLeastConn  = "least-conn"
+	BalanceRandomTwo  = "random-two"
+	BalanceHash       = "hash"
+)
+
+// Defaults, like nginx's where it has one
 const (
 	DefaultFile                    = "/etc/ntlb/config.yml"
 	DefaultListenAdmin             = "127.0.0.1:2590"
-	DefaultUpstreamConnectTimeout  = 5 * time.Second // Private network: a node that does not accept within 5s is down
-	DefaultUpstreamReadTimeout     = 3 * time.Minute // ntfy sends a keepalive every 45s, so 3m of silence is a dead stream
+	DefaultUpstreamConnectTimeout  = 5 * time.Second // Upstreams are usually on a private network: one that does not accept within 5s is down
+	DefaultUpstreamReadTimeout     = time.Minute     // nginx's proxy_read_timeout; streams need their upstream to send keepalives within it
 	DefaultDrainDuration           = 5 * time.Minute
 	DefaultShutdownDrainDuration   = 2 * time.Minute
-	DefaultHealthPath              = "/v1/ready"
+	DefaultHealthPath              = "/" // Any 2xx or 3xx answer is healthy
 	DefaultHealthInterval          = 5 * time.Second
 	DefaultHealthTimeout           = 3 * time.Second
 	DefaultHealthFails             = 3 // Failed probes in a row before an upstream leaves the rotation
@@ -37,22 +45,26 @@ const (
 	DefaultClientKeyIPv4PrefixBits = 32 // Like ntfy's visitor-prefix-bits-ipv4
 	DefaultClientKeyIPv6PrefixBits = 64 // Like ntfy's visitor-prefix-bits-ipv6: privacy addresses of one client stay together
 	DefaultBansWindow              = 10 * time.Minute
-	maxPortRange                   = 1000 // Ports in one "host:from-to" address, against typos like 2586-25860
+	DefaultBalance                 = BalanceRoundRobin // Like nginx
+	maxPortRange                   = 1000              // Ports in one "host:from-to" address, against typos like 2586-25860
 
-	// DefaultStreamsMatch are ntfy's subscriptions: GET /<topics>/<json|sse|raw|ws>, minus polls
-	// (poll=1 as a query parameter or header, read like ntfy's readParam)
-	DefaultStreamsMatch = `method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")`
+	// DefaultStreamsMatch is no request: which ones are long-lived streams depends on the app (see
+	// packaging/sites.d/ntfy.yml for ntfy's subscriptions)
+	DefaultStreamsMatch = "false"
 )
 
 var (
-	nameRegex = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`) // Names of sites, upstreams and rules
+	nameRegex      = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`)      // Names of sites, upstreams and rules
+	mediaTypeRegex = regexp.MustCompile(`^[-+.a-z0-9]+/[-+.a-z0-9]+$`) // gzip.types
+	balances       = []string{BalanceRoundRobin, BalanceLeastConn, BalanceRandomTwo, BalanceHash}
 )
 
 // Config is the ntlb config file. Field names follow ntfy's server.yml (kebab-case).
 type Config struct {
-	ListenAdmin            string        `yaml:"listen-admin"`   // Admin API, status, metrics, pprof; no auth
-	ListenMetrics          string        `yaml:"listen-metrics"` // Only /metrics, e.g. for Prometheus on a private network
-	AccessLogs             []*AccessLog  `yaml:"access-logs"`    // For sites without their own, and requests no site serves
+	ListenAdmin            string        `yaml:"listen-admin"`    // Admin API, status, metrics, pprof; no auth
+	ListenMetrics          string        `yaml:"listen-metrics"`  // Only /metrics, e.g. for Prometheus on a private network
+	ListenProfiler         string        `yaml:"listen-profiler"` // Only /debug/pprof/, e.g. on a private network
+	AccessLogs             []*AccessLog  `yaml:"access-logs"`     // For sites without their own, and requests no site serves
 	ClientKeepalive        *Keepalive    `yaml:"client-keepalive"`
 	UpstreamKeepalive      *Keepalive    `yaml:"upstream-keepalive"`
 	UpstreamConnectTimeout time.Duration `yaml:"upstream-connect-timeout"`
@@ -61,6 +73,7 @@ type Config struct {
 	ShutdownDrainDuration  time.Duration `yaml:"shutdown-drain-duration"`
 	ClientKey              *ClientKey    `yaml:"client-key"`
 	Bans                   *Bans         `yaml:"bans"`
+	Gzip                   *Gzip         `yaml:"gzip"`    // For sites without their own
 	Rules                  []*Rule       `yaml:"rules"`   // Checked for every request, before its site's rules
 	Include                []string      `yaml:"include"` // Globs of files merged into this one, relative to its directory
 	Sites                  []*Site       `yaml:"sites"`
@@ -116,7 +129,13 @@ type Bans struct {
 	Threshold float64       `yaml:"threshold"`
 }
 
-// Upstream is one ntfy node. The name, not the address, is what clients are hashed to, so every
+// Gzip compresses responses of the listed media types for clients that accept it, like nginx's
+// gzip with gzip_proxied any
+type Gzip struct {
+	Types []string `yaml:"types"` // Media types without parameters, e.g. text/html
+}
+
+// Upstream is one backend node. The name, not the address, is what clients are hashed to, so every
 // load balancer must use the same names for the same nodes to route a client the same way. An
 // address may be a port range ("10.0.0.1:2586-2589"), one address per port.
 type Upstream struct {
@@ -140,8 +159,8 @@ func Parse(b []byte) (*Config, error) {
 }
 
 // RestartRequired returns the settings that differ between c and other but that a reload cannot
-// apply: the admin and metrics listeners, and the keepalives of the sites' listeners. (A reload
-// binds and closes the sites' listen addresses.)
+// apply: the admin, metrics and profiler listeners, and the keepalives of the sites' listeners.
+// (A reload binds and closes the sites' listen addresses.)
 func (c *Config) RestartRequired(other *Config) []string {
 	var settings []string
 	if c.ListenAdmin != other.ListenAdmin {
@@ -149,6 +168,9 @@ func (c *Config) RestartRequired(other *Config) []string {
 	}
 	if c.ListenMetrics != other.ListenMetrics {
 		settings = append(settings, "listen-metrics")
+	}
+	if c.ListenProfiler != other.ListenProfiler {
+		settings = append(settings, "listen-profiler")
 	}
 	if *c.ClientKeepalive != *other.ClientKeepalive {
 		settings = append(settings, "client-keepalive")
@@ -259,6 +281,9 @@ func (c *Config) validate() error {
 	if err := validateAccessLogs(c.AccessLogs); err != nil {
 		return err
 	}
+	if err := c.Gzip.validate(); err != nil {
+		return err
+	}
 	if err := validateBans(c.Bans); err != nil {
 		return err
 	}
@@ -302,6 +327,22 @@ func (c *Config) anyBans() bool {
 		}
 	}
 	return false
+}
+
+// validate lowercases the types and checks them; nil is no compression
+func (g *Gzip) validate() error {
+	if g == nil {
+		return nil
+	} else if len(g.Types) == 0 {
+		return errors.New("gzip.types is required")
+	}
+	for i, typ := range g.Types {
+		g.Types[i] = strings.ToLower(typ)
+		if !mediaTypeRegex.MatchString(g.Types[i]) {
+			return fmt.Errorf("gzip.types: invalid media type %q, expected e.g. text/html without parameters", typ)
+		}
+	}
+	return nil
 }
 
 func validateBans(b *Bans) error {

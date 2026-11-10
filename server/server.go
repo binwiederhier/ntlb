@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,10 +30,11 @@ const (
 	drainTickSlack    = 2 * time.Second // The drain closes the last streams on its first tick after the deadline
 )
 
-// Names of the admin and metrics listeners; the public ones are named by their address
+// Names of the admin, metrics and profiler listeners; the public ones are named by their address
 const (
-	listenerAdmin   = "admin"
-	listenerMetrics = "metrics"
+	listenerAdmin    = "admin"
+	listenerMetrics  = "metrics"
+	listenerProfiler = "profiler"
 )
 
 var (
@@ -51,26 +53,27 @@ var (
 
 // Server is the load balancer process: listeners, proxy and admin API around a balancer.Balancer
 type Server struct {
-	configFile string
-	config     atomic.Pointer[config.Config]
-	balancer   *balancer.Balancer
-	proxy      *proxy
-	rules      *rules.Engine
-	certs      *certStore
-	files      *logFiles // Access logs and the ban file
-	metrics    *metrics
-	public     map[string]*publicServer // Proxying servers by listen address
-	retired    []*publicServer          // Removed by a reload: no new connections, open ones run on
-	admin      *http.Server
-	metricsSrv *http.Server // listen-metrics, if set
-	listeners  map[string]net.Listener
-	serving    bool       // Serve started the servers; ones added later start right away
-	errChan    chan error // A listener that failed; Serve shuts down
-	stopped    chan struct{}
-	stopping   bool // Shutdown began: no more reloads, protected by reloadMu
-	stopOnce   sync.Once
-	reloadMu   sync.Mutex // Serializes reloads, and keeps them out of Shutdown
-	mu         sync.Mutex // Protects public, retired, listeners, serving
+	configFile  string
+	config      atomic.Pointer[config.Config]
+	balancer    *balancer.Balancer
+	proxy       *proxy
+	rules       *rules.Engine
+	certs       *certStore
+	files       *logFiles // Access logs and the ban file
+	metrics     *metrics
+	public      map[string]*publicServer // Proxying servers by listen address
+	retired     []*publicServer          // Removed by a reload: no new connections, open ones run on
+	admin       *http.Server
+	metricsSrv  *http.Server // listen-metrics, if set
+	profilerSrv *http.Server // listen-profiler, if set
+	listeners   map[string]net.Listener
+	serving     bool       // Serve started the servers; ones added later start right away
+	errChan     chan error // A listener that failed; Serve shuts down
+	stopped     chan struct{}
+	stopping    bool // Shutdown began: no more reloads, protected by reloadMu
+	stopOnce    sync.Once
+	reloadMu    sync.Mutex // Serializes reloads, and keeps them out of Shutdown
+	mu          sync.Mutex // Protects public, retired, listeners, serving
 }
 
 // publicServer is the proxying server of one listen address
@@ -140,6 +143,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	go s.serve(listenerAdmin, s.admin, s.listeners[listenerAdmin], false)
 	if s.metricsSrv != nil {
 		go s.serve(listenerMetrics, s.metricsSrv, s.listeners[listenerMetrics], false)
+	}
+	if s.profilerSrv != nil {
+		go s.serve(listenerProfiler, s.profilerSrv, s.listeners[listenerProfiler], false)
 	}
 	s.mu.Unlock()
 	select {
@@ -224,6 +230,9 @@ func (s *Server) Shutdown(d time.Duration) {
 		if s.metricsSrv != nil {
 			servers = append(servers, s.metricsSrv)
 		}
+		if s.profilerSrv != nil {
+			servers = append(servers, s.profilerSrv)
+		}
 		s.mu.Lock()
 		for _, ps := range s.public {
 			servers = append(servers, ps.srv)
@@ -265,6 +274,11 @@ func (s *Server) ListenerAddr(listen string) string {
 // MetricsAddr returns the address the metrics listener is bound to, or "" if there is none
 func (s *Server) MetricsAddr() string {
 	return s.listenerAddr(listenerMetrics)
+}
+
+// ProfilerAddr returns the address the profiler listener is bound to, or "" if there is none
+func (s *Server) ProfilerAddr() string {
+	return s.listenerAddr(listenerProfiler)
 }
 
 // AdminAddr returns the address the admin listener is bound to
@@ -371,11 +385,15 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			http.Error(sw, "Bad Request", http.StatusBadRequest)
 			return
 		}
+		w = newGzipWriter(sw, r, conf.GzipFor(site), pr)
+		if gw, ok := w.(*gzipWriter); ok {
+			defer gw.close() // Runs before the deferred finish above, which reads sw
+		}
 		if rule != nil {
-			s.answer(sw, r, env, rule)
+			s.answer(w, r, env, rule)
 			return
 		}
-		next.ServeHTTP(sw, r.WithContext(withProxyRequest(r.Context(), pr)))
+		next.ServeHTTP(w, r.WithContext(withProxyRequest(r.Context(), pr)))
 	})
 }
 
@@ -430,6 +448,16 @@ func (s *Server) listen(conf *config.Config) error {
 		s.listeners[listenerMetrics] = ln
 		s.metricsSrv = newHTTPServer(listenerMetrics, s.metricsHandler())
 	}
+
+	// Profiler listener
+	if conf.ListenProfiler != "" {
+		ln, err := net.Listen("tcp", conf.ListenProfiler)
+		if err != nil {
+			return err
+		}
+		s.listeners[listenerProfiler] = ln
+		s.profilerSrv = newHTTPServer(listenerProfiler, profilerHandler())
+	}
 	return nil
 }
 
@@ -465,7 +493,10 @@ func (s *Server) bindPublic(conf *config.Config, listeners []*config.Listener) (
 		}
 		public[l.Addr] = &publicServer{
 			srv: srv,
-			ln:  ln,
+			ln: &countingListener{
+				Listener: ln,
+				metrics:  s.metrics,
+			},
 			tls: l.TLS,
 		}
 	}
@@ -509,8 +540,21 @@ func (s *Server) swapPublic(conf *config.Config, added map[string]*publicServer)
 			s.retired = append(s.retired, ps)
 			delete(s.public, addr)
 			delete(s.listeners, addr)
+			go s.forgetRetired(ps)
 		}
 	}
+}
+
+// forgetRetired shuts a removed listener's server down gracefully (closes its idle connections,
+// sends HTTP/2 GOAWAY, waits for the requests in flight), then forgets it. The streams it hijacked
+// are not its own any more and run on.
+func (s *Server) forgetRetired(ps *publicServer) {
+	ps.srv.Shutdown(context.Background()) // Shutdown cuts it short with Close, if it runs that long
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retired = slices.DeleteFunc(s.retired, func(p *publicServer) bool {
+		return p == ps
+	})
 }
 
 func (s *Server) firstListenerAddr(tls bool) string {

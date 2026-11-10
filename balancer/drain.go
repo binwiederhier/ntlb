@@ -76,38 +76,37 @@ func (b *Balancer) drainTick(now time.Time) {
 	}
 }
 
+// drainTickVictims picks this tick's streams to close. It scans the sessions only while a drain
+// runs: at ~100k streams the scan holds the lock for milliseconds, every tick. (A session that
+// attaches to a forgotten upstream is closed by Attach.)
 func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	var all, orphans []*Session
-	byUpstream := make(map[*Upstream][]*Session)
-	for _, s := range b.sessions {
-		if s.canceled {
-			continue
-		} else if s.upstream != nil && b.upstreams[s.upstream.id] != s.upstream {
-			// Attached after its removed upstream was forgotten (Attach raced the last tick), so
-			// no drain would ever close it
-			orphans = append(orphans, s)
-			continue
-		}
-		all = append(all, s)
-		if s.upstream != nil && s.upstream.drain != nil {
-			byUpstream[s.upstream] = append(byUpstream[s.upstream], s)
-		}
-	}
 	var victims []*Session
-	if b.drain != nil {
-		victims = b.drain.pick(now, all)
-	} else {
-		for _, u := range b.upstreams {
-			if u.drain != nil {
-				victims = append(victims, u.drain.pick(now, byUpstream[u])...)
+	if b.drain != nil || b.upstreamDrainingNoLock() {
+		var all []*Session
+		byUpstream := make(map[*Upstream][]*Session)
+		for _, s := range b.sessions {
+			if s.canceled {
+				continue
+			}
+			all = append(all, s)
+			if s.upstream != nil && s.upstream.drain != nil {
+				byUpstream[s.upstream] = append(byUpstream[s.upstream], s)
 			}
 		}
-	}
-	victims = append(victims, orphans...)
-	for _, s := range victims {
-		s.canceled = true
+		if b.drain != nil {
+			victims = b.drain.pick(now, all)
+		} else {
+			for _, u := range b.upstreams {
+				if u.drain != nil {
+					victims = append(victims, u.drain.pick(now, byUpstream[u])...)
+				}
+			}
+		}
+		for _, s := range victims {
+			s.canceled = true
+		}
 	}
 	for id, u := range b.upstreams {
 		if u.removed && u.drain != nil && u.drain.done(now) && u.streamCount() == 0 {
@@ -119,4 +118,14 @@ func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 		}
 	}
 	return victims
+}
+
+// upstreamDrainingNoLock reports whether any upstream is draining (removed, or by command)
+func (b *Balancer) upstreamDrainingNoLock() bool {
+	for _, u := range b.upstreams {
+		if u.drain != nil {
+			return true
+		}
+	}
+	return false
 }

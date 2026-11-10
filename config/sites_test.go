@@ -324,3 +324,43 @@ func TestConfig_Site(t *testing.T) {
 	require.Nil(t, c.Site("b"))
 	require.Nil(t, c.Site(""))
 }
+
+func TestParse_Gzip(t *testing.T) {
+	// Global gzip settings, replaced by a site's own; types are matched without parameters
+	c, err := Parse([]byte(`
+gzip: {types: [text/html, Application/JSON]}
+sites:
+  - {name: a, listen-http: ':80', hosts: [a.com], gzip: {types: [text/css]}, ` + testUp + `}
+  - {name: b, listen-http: ':80', ` + testUp + `}
+`))
+	require.NoError(t, err)
+	require.Equal(t, []string{"text/css"}, c.GzipFor(c.Sites[0]).Types)
+	require.Equal(t, []string{"text/html", "application/json"}, c.GzipFor(c.Sites[1]).Types)
+	require.Equal(t, []string{"text/html", "application/json"}, c.GzipFor(nil).Types)
+
+	// None: no compression
+	c, err = Parse([]byte("sites: [{name: a, listen-http: ':80', " + testUp + "}]"))
+	require.NoError(t, err)
+	require.Nil(t, c.GzipFor(c.Sites[0]))
+
+	for name, gzip := range map[string]string{
+		"no types":       "{}",
+		"not a type":     "{types: [html]}",
+		"with parameter": "{types: ['text/html; charset=utf-8']}",
+	} {
+		_, err := Parse([]byte("gzip: " + gzip + "\nsites: [{name: a, listen-http: ':80', " + testUp + "}]"))
+		require.ErrorContains(t, err, "gzip", name)
+		_, err = Parse([]byte("sites: [{name: a, listen-http: ':80', gzip: " + gzip + ", " + testUp + "}]"))
+		require.ErrorContains(t, err, "site a: gzip", name)
+	}
+}
+
+func TestParse_Balance(t *testing.T) {
+	for _, balance := range []string{BalanceRoundRobin, BalanceLeastConn, BalanceRandomTwo, BalanceHash} {
+		c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', balance: " + balance + ", upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+		require.NoError(t, err, balance)
+		require.Equal(t, balance, c.Sites[0].Balance)
+	}
+	_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', balance: ip-hash, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	require.ErrorContains(t, err, "site s: invalid balance \"ip-hash\"")
+}

@@ -426,6 +426,16 @@ func TestEngine_TrackedClientsCapped(t *testing.T) {
 	}
 	require.Len(t, limiter.buckets, 3)
 
+	// At the cap, a new key sweeps at most every fullSweepInterval: a full sweep of 1M buckets
+	// takes ~60 ms under the lock, which every new key of a spray would pay otherwise
+	swept := limiter.lastSweep
+	*now = now.Add(time.Second)
+	decided(e, request("GET", "/", "[2001:db8:0:98::1]:1"))
+	require.Equal(t, swept, limiter.lastSweep)
+	*now = now.Add(fullSweepInterval)
+	decided(e, request("GET", "/", "[2001:db8:0:98::1]:1"))
+	require.NotEqual(t, swept, limiter.lastSweep)
+
 	// Once the old buckets refilled, a sweep makes room again
 	*now = now.Add(2 * time.Hour)
 	decided(e, request("GET", "/", "[2001:db8:0:99::1]:1"))
@@ -437,10 +447,21 @@ func TestBans_TrackedClientsCapped(t *testing.T) {
 		maxTracked = old
 	}(maxTracked)
 	maxTracked = 2
-	e, _, lines := testEngineBans(t, testBans+"rules: [{name: abuse, action: block, strike: 11}]")
+	e, now, lines := testEngineBans(t, testBans+"rules: [{name: abuse, action: block, strike: 11}]")
 	decided(e, request("GET", "/", "192.0.2.1:1"))
 	decided(e, request("GET", "/", "192.0.2.2:1"))
 	decided(e, request("GET", "/", "192.0.2.3:1")) // Over the cap: not counted
 	require.Len(t, *lines, 2)
-	require.Len(t, e.state.Load().bans.clients, 2)
+	b := e.state.Load().bans
+	require.Len(t, b.clients, 2)
+
+	// Reported clients stay for their whole window, so a spray keeps the map full: sweep at most
+	// every fullSweepInterval then
+	swept := b.lastSweep
+	*now = now.Add(time.Second)
+	decided(e, request("GET", "/", "192.0.2.4:1"))
+	require.Equal(t, swept, b.lastSweep)
+	*now = now.Add(fullSweepInterval)
+	decided(e, request("GET", "/", "192.0.2.4:1"))
+	require.NotEqual(t, swept, b.lastSweep)
 }

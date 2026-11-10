@@ -23,9 +23,9 @@ const (
 	addressBackoffMax = 30 * time.Second
 )
 
-// Balancer routes clients to upstreams by rendezvous hashing their IP over the healthy upstreams
-// of their site, and owns the health checks and the drains. Upstreams are keyed by their ID,
-// "<site>/<name>".
+// Balancer routes requests to the healthy upstreams of their site, by the site's balance (round
+// robin, least connections, random two, or rendezvous hashing of the client), and owns the health
+// checks and the drains. Upstreams are keyed by their ID, "<site>/<name>".
 type Balancer struct {
 	config    *config.Config
 	upstreams map[string]*Upstream
@@ -33,11 +33,12 @@ type Balancer struct {
 	sessions  map[uint64]*Session
 	nextID    uint64
 	drain     *drainState // Draining the load balancer itself
+	turns     sync.Map    // Site name -> *atomic.Uint64, the next turn of round-robin and least-conn
 	client    *http.Client
 	mu        sync.RWMutex // Protects config, upstreams, order, sessions, nextID, drain, and each Upstream's removed and drain
 }
 
-// Upstream is one ntfy node and its addresses. Several addresses (usually one node's ports) let
+// Upstream is one backend node and its addresses. Several addresses (usually one node's ports) let
 // the load balancer hold more than ~63k connections to one node from a single source IP.
 type Upstream struct {
 	id          string // site/name
@@ -99,33 +100,33 @@ func (b *Balancer) Start(ctx context.Context) {
 	go b.drainLoop(ctx.Done())
 }
 
-// Pick returns the upstreams of a site to try for a client key, best first: the healthy upstreams
-// that are not draining. If none is healthy, it fails open and returns every upstream that is not
-// draining, since a problem shared by all nodes (e.g. their database) is no reason to turn every
-// client away. Returns nothing only if every upstream of the site is draining. Clients are hashed
-// to the upstream names, not the IDs, so the site's name does not change the order.
+// Pick returns the upstreams of a site to try, best first: the healthy upstreams that are not
+// draining. If none is healthy, it fails open and returns every upstream that is not draining,
+// since a problem shared by all nodes (e.g. their database) is no reason to turn every client
+// away. Returns nothing only if every upstream of the site is draining. The order is the site's
+// balance (strategy.go); the client key matters for balance hash only.
 func (b *Balancer) Pick(site string, key []byte) []*Upstream {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	names := make([]string, 0, len(b.upstreams))
-	byName := make(map[string]*Upstream)
-	for _, u := range b.upstreams {
-		if u.site == site && !u.removed && u.drain == nil {
-			names = append(names, u.name)
-			byName[u.name] = u
-		}
+	siteConf := b.config.Site(site)
+	if siteConf == nil {
+		return nil
 	}
 	var healthy, unhealthy []*Upstream
-	for _, name := range rank(key, names) {
-		if u := byName[name]; u.isHealthy() {
-			healthy = append(healthy, u)
-		} else {
-			unhealthy = append(unhealthy, u)
+	for _, id := range b.order {
+		if u := b.upstreams[id]; u.site == site && !u.removed && u.drain == nil {
+			if u.isHealthy() {
+				healthy = append(healthy, u)
+			} else {
+				unhealthy = append(unhealthy, u)
+			}
 		}
 	}
 	if len(healthy) > 0 {
+		b.sortFor(siteConf, key, healthy)
 		return healthy
 	}
+	b.sortFor(siteConf, key, unhealthy) // Fail open
 	return unhealthy
 }
 
@@ -160,18 +161,33 @@ func (b *Balancer) Reserve(s *Session, u *Upstream) string {
 	return addr
 }
 
-// Attach records that a session is being served by an upstream address
+// Attach records that a session is being served by an upstream address. A session on an
+// upstream the drain already forgot (the request picked it before a reload removed it) is closed
+// right away: no drain would ever close it.
 func (b *Balancer) Attach(s *Session, u *Upstream, addr string) {
+	if b.attach(s, u, addr) {
+		s.cancel(ErrDrained)
+	}
+}
+
+// attach records the session, and reports whether its upstream was forgotten, so that the
+// caller cancels it (outside the lock)
+func (b *Balancer) attach(s *Session, u *Upstream, addr string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s.releaseNoLock()
 	s.upstream, s.addr = u, addr
 	u.requests.Add(1)
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	u.addrStreams[addr]++
 	delete(u.addrFails, addr)
 	delete(u.addrRetry, addr)
+	u.mu.Unlock()
+	forgotten := b.upstreams[u.id] != u && !s.canceled
+	if forgotten {
+		s.canceled = true
+	}
+	return forgotten
 }
 
 // Close unregisters a session
@@ -283,6 +299,12 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	}
 	b.order = order
 	b.config = conf
+	b.turns.Range(func(site, _ any) bool {
+		if conf.Site(site.(string)) == nil {
+			b.turns.Delete(site) // The site is gone; a site of that name later starts over
+		}
+		return true
+	})
 	return true
 }
 

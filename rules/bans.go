@@ -63,7 +63,9 @@ func (b *bans) strike(addr netip.Addr, weight float64, rule string, now time.Tim
 	}
 	s, ok := b.clients[prefix]
 	if !ok && len(b.clients) >= maxTracked {
-		b.sweepNoLock(now)
+		if now.Sub(b.lastSweep) >= fullSweepInterval {
+			b.sweepNoLock(now)
+		}
 		if len(b.clients) >= maxTracked {
 			return "", false // Untracked, see maxTracked
 		}

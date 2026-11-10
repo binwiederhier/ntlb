@@ -27,7 +27,7 @@ const (
 func New() *cli.Command {
 	return &cli.Command{
 		Name:                   "ntlb",
-		Usage:                  "load balancer for ntfy",
+		Usage:                  "HTTP load balancer, built for ntfy",
 		UseShortOptionHandling: true,
 		Reader:                 os.Stdin,
 		Writer:                 os.Stdout,

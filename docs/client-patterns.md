@@ -39,7 +39,7 @@ Paths below are relative to those roots: `server/...` = `ntfy/ntfy/server/...`, 
 | Static | `/static/*`, `/app.html`, `/sw.js`, `/sw.js.map`, `/docs/*`: `http.FileServer` over embedded FS with ModTime = **process start time** -> `Last-Modified`/`If-Modified-Since` -> 304, Range -> 206; gzip if `Accept-Encoding` contains `gzip` (no `Vary` set by ntfy) | `server/server_web.go:64-73`, `server/server.go:156-171`, `util/gzip_handler.go:13-30` |
 | SPA routes | `GET /`, `GET /<topic>`, `GET /<host.tld>/<topic>`, `/account/email/verify/<tok>`, `/account/password/reset/<tok>` -> index.html | `server/server.go:766`, `:914-917` |
 | config | `GET /v1/config` (JSON, no-cache), `GET /config.js` (JS, no-cache), `GET /manifest.webmanifest` | `server/server.go:776-781`, `server/server_web.go:28-61` |
-| Health | `GET /v1/health`, `GET /v1/ready` (ntlb probes `/v1/ready`) | `server/server.go:770-773` |
+| Health | `GET /v1/health`, `GET /v1/ready` (the ntfy site in ntlb probes `/v1/ready`) | `server/server.go:770-773` |
 | Body limits | message 4096 B (bigger body becomes attachment); attachment 15 MB default (ntfy.sh tiers higher); JSON publish body 2x message limit | `server/config.go:79-82`, `server/server.go:1537-1560`, `:2348` |
 | Upload length | `attachment.Write(..., r.ContentLength, ...)`: works with `Content-Length` and with -1 (chunked / h2 without length) | `server/server.go:1632` area |
 | Errors | JSON `{"code":40001,"http":400,"error":...}`, `Retry-After` and rate-limit headers on 429 | `server/server.go:710-762` |
@@ -404,7 +404,7 @@ Streams and classification
 9. `GET /<topic>/auth` with comma lists (`authPathRegex` allows `a,b/auth`).
 10. Long-lived stream over h2 (Android, CLI over TLS, browsers' fetch) and over h1 chunked; ensure each
     write is flushed (keepalive line every 45s is the only traffic for hours).
-11. Streams with no traffic but keepalives: upstream idle timeout (ntlb 3m) must exceed 45s keepalive with
+11. Streams with no traffic but keepalives: upstream idle timeout (3m in the ntfy config; ntlb's default is 60s) must exceed 45s keepalive with
     margin; client-side read timeouts: Android 77s, browsers none, CLI none.
 12. A client that disappears without FIN (phone in a tunnel): server learns via write failure at the next
     keepalive or WS pong timeout (60s). LB TCP keepalives towards clients matter here.

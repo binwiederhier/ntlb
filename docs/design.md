@@ -13,7 +13,21 @@ docs are in the [README](../README.md).
 | `client` | Admin API client used by the CLI. |
 | `cmd` | urfave/cli v3 commands. v3 because it parses flags after positional args (`upstream drain app2 -d 5m`) and root flags are persistent. |
 
-## Routing (`balancer/hash.go`)
+## Routing (`balancer/strategy.go`, `balancer/hash.go`)
+
+`Balancer.Pick(site, key)` collects the site's upstreams that are in the config and not draining,
+in config order, keeps the healthy ones (all of them if none is: fail open, like lbagent), and
+orders them by the site's `balance`; the first is the choice, the rest are the retries. Only if
+every upstream is draining does it return nothing (-> 503).
+
+- `round-robin`: rotated by a per-site turn (`Balancer.turns`, a `sync.Map` of `atomic.Uint64`),
+  over the healthy upstreams only, so an unhealthy one does not hand its turn to its neighbor.
+- `least-conn`: rotated, then stable-sorted by load: attached streams plus reserved attempts
+  (`Upstream.load`), so a burst of new requests spreads before any of them is answered. Equal
+  loads take turns.
+- `random-two`: two distinct random upstreams, the less loaded first, then the rest by load.
+  Unlike least-conn, it does not herd when several load balancers each see only their own load.
+- `hash`: rendezvous hashing of the client key, below.
 
 `rank(key, names)` scores every upstream name with `splitmix64(fnv1a(key || 0xff || name))` and
 sorts by score (name as tie-break). The key is the client IP shortened to `client-key.ipv4-prefix-bits`
@@ -26,17 +40,14 @@ even.
 **Changing `score` re-routes every client** on the next request. Never change it without a reason
 and a rolling plan; two load balancers with different hash functions disagree on every client.
 
-`Balancer.Pick(key)` returns the ranked upstreams that are in the config, not draining, and
-healthy. If none is healthy, it returns all non-draining ones (fail open, like lbagent). Only if
-every upstream is draining does it return nothing (-> 503).
-
 Existing streams never move because of routing changes: health changes, reloads and undrains only
 affect new requests. Only drains close streams.
 
 ## Health (`balancer/health.go`)
 
 One probe round per interval over all upstreams and all their addresses in parallel,
-`GET http://<address><path>`, new connection each time (keepalives off), 2xx = pass. An upstream
+`GET http://<address><path>`, new connection each time (keepalives off), 2xx or 3xx = pass
+(redirects not followed, like HAProxy's `httpchk`; default path `/`). An upstream
 passes a round if any address passed, so load balancers that list a node's ports in a different
 order agree on it (the lab soak found two LBs routing differently when only the first address was
 probed and it was dead); an address that failed is skipped by address selection until it passes
@@ -56,8 +67,8 @@ ends, even on panic). `Reserve` picks an address of an upstream for an attempt a
 against that address right away (so a reconnect storm spreads over a node's ports); `Attach` turns
 the reservation into a stream once the upstream answered, and `Close` or another `Reserve` releases
 it. `RecordAddressFailure` backs a failed address off (1s, doubling to 30s); a successful `Attach`
-clears it. A session attached to an upstream that was already forgotten is drained on the next
-tick.
+clears it. A session that attaches to an upstream that was already forgotten (the request picked
+it before a reload removed it) is canceled by `Attach` right away.
 Draining = calling the session's `context.CancelCauseFunc` with `ErrDrained`, which aborts the
 reverse proxy's copy (and closes a hijacked WebSocket via its backend-conn watcher).
 
@@ -77,14 +88,16 @@ Drain sources:
 Invariant: **a draining thing gets no new streams**, otherwise pacing cannot converge (each tick
 earns closes proportional to what is open, so arrivals push the close rate up hyperbolically
 towards the deadline; seen in the lab as 67/s -> 1100/s). A draining upstream is excluded by
-`Pick`. A draining load balancer turns away new *subscriptions* (`isSubscription`: GET
-`/<topics>/{json,sse,raw,ws}` that does not poll, see `streams` in the config) with 503 +
+`Pick`. A draining load balancer turns away new *subscriptions* (`isSubscription`: the site's
+`streams.match`, default none; ntfy's are GET `/<topics>/{json,sse,raw,ws}` that do not poll) with 503 +
 `Connection: close`, but still serves
 publishes and other short requests until it is drained, so publishers lose nothing.
 
 Locking: `Balancer.mu` protects the maps, sessions, drains and each upstream's `removed`/`drain`;
 `Upstream.mu` the addresses, per-address stream counts and health. Order: `Balancer.mu` before
-`Upstream.mu`. `drainTick` collects victims under the lock and cancels them outside it.
+`Upstream.mu`. `drainTick` collects victims under the lock and cancels them outside it, and scans
+the sessions only while a drain runs: at 40k streams the scan took ~13 ms under the write lock
+every second (2% of the CPU, 5% of the allocations in the 2026-11-10 lab), with nothing to drain.
 
 ## Proxy (`server/proxy.go`)
 
@@ -135,7 +148,8 @@ served).
 
 ## Stream path (`server/stream.go`)
 
-Subscriptions (`isStream`: GET `/<topics>/{json,sse,raw}`, not WebSocket upgrades) bypass
+Subscriptions (the site's `streams.match`, for ntfy GET `/<topics>/{json,sse,raw}`; bodyless,
+not WebSocket upgrades) bypass
 `ReverseProxy`, because they are idle almost all the time and there are many of them:
 
 - **Upstream**: a raw TCP connection per stream; the request goes out as `HTTP/1.0`, so ntfy (which
@@ -168,7 +182,8 @@ Subscriptions (`isStream`: GET `/<topics>/{json,sse,raw}`, not WebSocket upgrade
 
 Because a detached stream outlives its handler, all per-request cleanup (session `Close`, context
 cancel, the access log line) is registered as `proxyRequest` finishers and run by whoever ends the
-request: the outermost handler (`finishUnlessDetached`), or the stream goroutine. Finishers must
+request: the outermost handler (`observe`, unless the request was detached), or the stream
+goroutine. Finishers must
 not reference the `ResponseWriter` or the request (the access log copies what it needs into an
 `accessLogEntry` upfront), or they pin the very server state the detach frees.
 
@@ -196,7 +211,8 @@ run on (a new request on one gets a 404) until they end or `Shutdown`. An addres
 between HTTP and HTTPS without a restart, since it cannot be bound twice.
 
 There is still one `Balancer`: upstreams are keyed by `site/name`, `Pick(site, key)` ranks only
-the site's upstreams, and it hashes the bare names, so a site's name does not move clients. Drains
+the site's upstreams, and with `balance: hash` it hashes the bare names, so a site's name does
+not move clients. Drains
 take `site/name`, or the bare name if only one site has it (`ErrUpstreamAmbiguous` otherwise).
 The load balancer drain, sessions and readiness stay global. Each upstream carries its site's
 health check; the health loop wakes at the shortest interval and probes the upstreams whose
@@ -213,6 +229,21 @@ response), so global rules and access logs can tell sites apart. A site's `acces
 any, replace the global ones for its requests (`Config.AccessLogsFor`, `Config.BansFor`): a site
 with its own bans settings counts its requests' strikes (global rules' included) in its own
 buckets and writes to its own file. Usually there is only the global section.
+
+## Compression (`server/gzip.go`)
+
+`observe` wraps the response in a `gzipWriter` when the site (or the global config) has `gzip` and
+the client accepts it (HTTP/1.1+, `gzip` with q > 0), so both proxied and rule-answered responses
+(static files) are covered, and `statusWriter` below it counts the compressed bytes for the log.
+The decision waits for the status and headers: listed media type, 200/403/404, no
+`Content-Encoding`, not HEAD, `pr.kind == kindRequest` (no stream, no upgrade). A Content-Length
+decides at once (>= 1100 compresses); without one, bytes are held back until 1100 are there, or
+the handler flushes (compress: the reverse proxy flushes after every write, and nginx compresses
+any unbuffered response of unknown length too), or it returns (short: as is, e.g. `http.Error`).
+Each Flush is a gzip sync flush, so a slow response streams. Compressing drops Content-Length and
+Accept-Ranges, weakens a strong ETag and adds `Vary: Accept-Encoding` (nginx's `gzip_vary` is
+off; harmless). Range requests to static files stay 206, uncompressed (nginx sends the whole file
+compressed instead). Writers come from a `sync.Pool`, level 6.
 
 ## Requests Go rejects (`server/conns.go`)
 
@@ -279,7 +310,9 @@ rejects the reload), reopens paths that stay (logrotate), and closes paths that 
 goes to the first access log whose response expression matches.
 
 `listen-metrics` serves only `/metrics`, so Prometheus can scrape over a private network without
-reaching the admin API (no auth: reload, drain, pprof).
+reaching the admin API (no auth: reload, drain, pprof). `listen-profiler` serves only
+`/debug/pprof/` (index and named profiles, CPU profile, trace, symbol), for profiling under load
+without the admin API either.
 
 Cost: rules shaped like ntfy.sh's nginx config (13 topic patterns, a user agent, the topic count,
 6 exempt networks, a limit) take ~1.2 us per request on one core (`BenchmarkEngine_Check`, with
@@ -294,6 +327,10 @@ finisher as the access log (`Server.observe`), so detached streams are counted w
   none serves the host; upstream empty if none answered; code 499 if the client left before a
   response)
 - `ntlb_request_duration_seconds{kind="request"}`, `ntlb_stream_duration_seconds`
+- `ntlb_connections`, `ntlb_connections_accepted_total`: client connections on the public
+  listeners, like nginx's `stub_status` active and accepted. Counted at the listener (accept to
+  first `Close`), not in `ConnState`, so hijacked HTTP/1 streams and WebSockets stay counted.
+  A closed client of a hijacked stream counts until the next write to it fails (ntfy's keepalive).
 - `ntlb_streams{protocol}` (http1, http2, websocket), `ntlb_open_requests`
 - `ntlb_retries_total{reason}` (connect, error, 503), `ntlb_refused_total`,
   `ntlb_streams_closed_total{reason}` (drained, read_timeout)

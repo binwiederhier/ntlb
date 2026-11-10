@@ -278,17 +278,13 @@ func TestParse_Invalid(t *testing.T) {
 	}
 }
 
-func TestParse_StreamsDefaults(t *testing.T) {
+func TestParse_NoStreamsByDefault(t *testing.T) {
+	// Which requests are long-lived streams is up to the site; the ntfy site's are in packaging
 	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
 	require.NoError(t, err)
-	require.Equal(t, DefaultStreamsMatch, c.Sites[0].Streams.Match)
-	for _, target := range []string{"/mytopic/json", "/a,b_c-d/sse", "/t/raw", "/t/ws", "/t/json?since=10m"} {
-		require.True(t, isStream(c, "GET", target), target)
-	}
-	for _, target := range []string{"/a/b/json", "/mytopic", "/t/json/x", "/t/xml", "//json", "/a,/json", "/v1/health", "/t/json?poll=1", "/t/json?po=1"} {
+	for _, target := range []string{"/mytopic/json", "/t/sse", "/events"} {
 		require.False(t, isStream(c, "GET", target), target)
 	}
-	require.False(t, isStream(c, "POST", "/mytopic/json"))
 }
 
 func TestParse_StreamsCustom(t *testing.T) {
@@ -435,6 +431,19 @@ func TestLoad_PackagingExample(t *testing.T) {
 	require.Equal(t, DefaultShutdownDrainDuration, c.ShutdownDrainDuration)
 	require.Len(t, c.Sites, 1)
 	require.Len(t, c.Sites[0].Upstreams, 3)
+
+	// The ntfy site: hashed, ntfy's readiness endpoint, its subscriptions as streams
+	ntfy := c.Sites[0]
+	require.Equal(t, BalanceHash, ntfy.Balance)
+	require.Equal(t, "/v1/ready", ntfy.HealthCheck.Path)
+	require.Equal(t, 3*time.Minute, c.UpstreamReadTimeout)
+	for _, target := range []string{"/mytopic/json", "/a,b_c-d/sse", "/t/raw", "/t/ws", "/t/json?since=10m"} {
+		require.True(t, isStream(c, "GET", target), target)
+	}
+	for _, target := range []string{"/a/b/json", "/mytopic", "/t/json/x", "/t/xml", "//json", "/a,/json", "/v1/health", "/t/json?poll=1", "/t/json?po=1"} {
+		require.False(t, isStream(c, "GET", target), target)
+	}
+	require.False(t, isStream(c, "POST", "/mytopic/json"))
 }
 
 // Defaults for sections that are missing or explicitly null
@@ -452,6 +461,7 @@ sites: [{name: s, listen-http: ":80", health-check: null, streams: null, upstrea
 	require.Equal(t, DefaultHealthPath, c.Sites[0].HealthCheck.Path)
 	require.Equal(t, DefaultStreamsMatch, c.Sites[0].Streams.Match)
 	require.NotNil(t, c.Sites[0].Streams.Program)
+	require.Equal(t, DefaultBalance, c.Sites[0].Balance)
 	require.Equal(t, DefaultClientKeyIPv6PrefixBits, c.ClientKey.IPv6PrefixBits)
 }
 
@@ -459,7 +469,9 @@ func TestParse_AllDefaults(t *testing.T) {
 	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
 	require.NoError(t, err)
 	require.Equal(t, DefaultUpstreamConnectTimeout, c.UpstreamConnectTimeout)
-	require.Equal(t, DefaultUpstreamReadTimeout, c.UpstreamReadTimeout)
+	require.Equal(t, time.Minute, c.UpstreamReadTimeout) // nginx's proxy_read_timeout
+	require.Equal(t, BalanceRoundRobin, c.Sites[0].Balance)
+	require.Equal(t, "/", c.Sites[0].HealthCheck.Path)
 	require.Equal(t, DefaultDrainDuration, c.DrainDuration)
 	require.Equal(t, DefaultShutdownDrainDuration, c.ShutdownDrainDuration)
 	require.Equal(t, &HealthCheck{
@@ -523,6 +535,11 @@ func TestRestartRequired_Each(t *testing.T) {
 			name:     "listen-metrics",
 			config:   "listen-metrics: '10.0.0.1:9090'\n",
 			settings: []string{"listen-metrics"},
+		},
+		{
+			name:     "listen-profiler",
+			config:   "listen-profiler: '10.0.0.1:6060'\n",
+			settings: []string{"listen-profiler"},
 		},
 		{
 			name:     "listen-admin",

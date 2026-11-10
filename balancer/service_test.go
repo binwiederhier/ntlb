@@ -55,8 +55,13 @@ func (u *testUpstream) addr() string {
 }
 
 func newTestConfig(upstreams ...*testUpstream) *config.Config {
+	return newTestConfigBalance(config.BalanceHash, upstreams...)
+}
+
+// newTestConfigBalance is a site "s" with the upstreams and the given balance
+func newTestConfigBalance(balance string, upstreams ...*testUpstream) *config.Config {
 	var b strings.Builder
-	b.WriteString("sites:\n  - name: s\n    listen-http: ':0'\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: ':0'\n    balance: " + balance + "\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n")
 	for _, u := range upstreams {
 		fmt.Fprintf(&b, "      - name: %s\n        addresses: [%q]\n", u.name, u.addr())
 	}

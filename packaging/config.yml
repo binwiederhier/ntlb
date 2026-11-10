@@ -1,7 +1,7 @@
 # ntlb config. Reload with "systemctl reload ntlb" (SIGHUP) or "ntlb reload": everything but
-# listen-admin, listen-metrics and client-keepalive applies without cutting a stream, the sites'
-# listen addresses too (a reload says which changed settings need a restart). A config with an error is rejected as a whole, and the
-# old one stays. Unknown keys are an error. Check a file with "ntlb check-config".
+# listen-admin, listen-metrics, listen-profiler and client-keepalive applies without cutting a
+# stream, the sites' listen addresses too (a reload says which changed settings need a restart).
+# A config with an error is rejected as a whole, and the old one stays. Unknown keys are an error. Check a file with "ntlb check-config".
 #
 # Expressions (match, location) are in the expr language (https://expr-lang.org, also used by
 # CrowdSec's filters) and are checked when the config loads:
@@ -24,6 +24,10 @@ listen-admin: "127.0.0.1:2590"
 # Only /metrics, e.g. for Prometheus on a private network (optional)
 # listen-metrics: "10.108.0.2:25031"
 
+# Only /debug/pprof/ (CPU, heap, goroutines, trace), to profile under load without reaching the
+# admin API (optional)
+# listen-profiler: "127.0.0.1:6060"
+
 # Access logs, in nginx's "combined" format plus key=value fields. A request goes to the first
 # file whose match (a response expression) is true; one without match takes the rest. A site with
 # its own access-logs uses those instead; requests that no site serves use these. A reload reopens
@@ -45,7 +49,7 @@ upstream-keepalive:
   count: 4
 
 upstream-connect-timeout: 5s # A node that does not accept within this is down, try the next
-upstream-read-timeout: 3m    # Cut a stream after this long without a byte (ntfy sends keepalives every 45s);
+upstream-read-timeout: 3m    # Default 60s. Cut a stream after this long without a byte (ntfy sends keepalives every 45s);
                              # also bounds a client that stops reading; a stalled upload is cut after
                              # 60s (like nginx's client_body_timeout), or this if shorter
 
@@ -68,6 +72,25 @@ bans:
   file: /var/log/ntlb/ban.log
   window: 10m
   threshold: 100
+
+# Compression, like nginx's gzip with gzip_proxied any (level 6, at least 1100 bytes): responses of
+# these media types with status 200, 403 or 404, to HTTP/1.1+ clients that accept gzip, unless the
+# upstream encoded them already. A flushed response is compressed as it goes (sync flushes);
+# subscriptions (streams.match) never are. Default: none. A site may have its own list instead.
+gzip:
+  types:
+    - text/html
+    - text/plain
+    - text/css
+    - text/js
+    - text/xml
+    - text/javascript
+    - application/javascript
+    - application/x-javascript
+    - application/json
+    - application/xml
+    - application/rss+xml
+    - image/svg+xml
 
 # Rules. Request rules are checked in order before a request is proxied: these global rules first,
 # then the site's own. The first block, allow, redirect or static whose match is true decides, and

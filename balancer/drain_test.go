@@ -378,7 +378,8 @@ func TestBalancer_AttachToRemovedUpstream(t *testing.T) {
 
 func TestBalancer_AttachToForgottenUpstream(t *testing.T) {
 	// A request picked an upstream, which was then removed, drained and forgotten before the
-	// request attached. Its stream must still be closed, or it would run on forever, invisible.
+	// request attached. Its stream must still be closed, or it would run on forever, invisible:
+	// right away, as no tick scans the streams while nothing drains.
 	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
 	b := newTestBalancer(t, app1, app2)
 	u2 := b.upstream("app2") // Picked before the reload
@@ -395,7 +396,6 @@ func TestBalancer_AttachToForgottenUpstream(t *testing.T) {
 		s.cause = cause
 	})
 	b.Attach(s.Session, u2, u2.NextAddress())
-	b.drainTick(now.Add(time.Second))
 	require.True(t, s.canceled())
 	require.ErrorIs(t, s.cause, ErrDrained)
 
@@ -409,7 +409,6 @@ func TestBalancer_AttachToForgottenUpstream(t *testing.T) {
 	})
 	b.Attach(s2.Session, u2, u2.NextAddress())
 	fresh := newTestSession(b, "app2")
-	b.drainTick(now.Add(2 * time.Second))
 	require.True(t, s2.canceled())
 	require.False(t, fresh.canceled())
 }
