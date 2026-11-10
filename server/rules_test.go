@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -361,4 +362,234 @@ func TestServer_RuleStaticOnlyCleanPaths(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, conn("/s/./ok.txt"))
 	require.Equal(t, http.StatusNotFound, conn("/s//ok.txt"))
 	require.Equal(t, http.StatusNotFound, conn("/s/.hidden"))
+}
+
+// banLines returns the ban file's lines without their timestamps: "<ip> <prefix> <rule>"
+func banLines(t *testing.T, banLog string) []string {
+	data, _ := os.ReadFile(banLog)
+	var lines []string
+	for line := range strings.Lines(string(data)) {
+		_, rest, _ := strings.Cut(strings.TrimSpace(line), " ")
+		lines = append(lines, rest)
+	}
+	return lines
+}
+
+func TestServer_HotReloadBanRules(t *testing.T) {
+	// Adding and changing ban rules on the fly, like an operator reacting to an attack: strikes
+	// count on across reloads as long as the bans settings stay, new rules strike right away, and
+	// a broken config changes nothing
+	app1 := newTestUpstream(t, "app1")
+	notFound(app1)
+	dir := t.TempDir()
+	banLog := filepath.Join(dir, "ban.log")
+	bans := "bans: {file: " + banLog + ", threshold: 3}\n"
+	scanners := "  - {name: scanners, match: 'path startsWith \"/wp-\"', action: block, status: 404, strike: 1}\n"
+	s, filename := newTestServer(t, bans+"rules:\n"+scanners, app1)
+	addr := "http://" + s.HTTPAddr()
+	stream, closeStream := openStream(t, http.DefaultClient, addr+"/stream")
+	defer closeStream()
+
+	// Two strikes, then a new rule: its strikes add up, and the fourth bans
+	a := clientFrom("127.0.0.61")
+	get(t, a, addr+"/wp-login.php")
+	get(t, a, addr+"/wp-admin/")
+	envProbe := "  - {name: env-probe, match: 'path endsWith \"/.env\"', action: block, strike: 1}\n"
+	writeConfig(t, filename, bans+"rules:\n"+scanners+envProbe, app1)
+	requireReload(t, s)
+	status, _ := get(t, a, addr+"/app/.env")
+	require.Equal(t, http.StatusForbidden, status)
+	require.Empty(t, banLines(t, banLog))
+	get(t, a, addr+"/.env")
+	waitFor(t, func() bool {
+		return slices.Contains(banLines(t, banLog), "127.0.0.61 127.0.0.61/32 env-probe")
+	})
+
+	// A response rule added by reload: clients that collect 404s from the upstream
+	many404 := "  - {name: many-404, on: response, match: 'status == 404 && upstream_status == 404', strike: 1}\n"
+	writeConfig(t, filename, bans+"rules:\n"+scanners+envProbe+many404, app1)
+	requireReload(t, s)
+	b := clientFrom("127.0.0.62")
+	for range 4 {
+		status, _ := get(t, b, addr+"/missing")
+		require.Equal(t, http.StatusNotFound, status)
+	}
+	waitFor(t, func() bool {
+		return slices.Contains(banLines(t, banLog), "127.0.0.62 127.0.0.62/32 many-404")
+	})
+
+	// A strike above the threshold bans on the first request
+	instant := "  - {name: instant, match: 'query == \"evil\"', action: block, strike: 4}\n"
+	writeConfig(t, filename, bans+"rules:\n"+instant+scanners, app1)
+	requireReload(t, s)
+	get(t, clientFrom("127.0.0.63"), addr+"/?evil")
+	waitFor(t, func() bool {
+		return slices.Contains(banLines(t, banLog), "127.0.0.63 127.0.0.63/32 instant")
+	})
+
+	// Changed bans settings start the count over: 3 strikes before, 3 after, no ban
+	c := clientFrom("127.0.0.64")
+	for range 3 {
+		get(t, c, addr+"/wp-x")
+	}
+	writeConfig(t, filename, "bans: {file: "+banLog+", threshold: 5}\nrules:\n"+scanners, app1)
+	requireReload(t, s)
+	for range 3 {
+		get(t, c, addr+"/wp-x")
+	}
+	time.Sleep(100 * time.Millisecond)
+	require.NotContains(t, strings.Join(banLines(t, banLog), "\n"), "127.0.0.64")
+
+	// A new ban file: new bans go there
+	newLog := filepath.Join(dir, "ban-new.log")
+	writeConfig(t, filename, "bans: {file: "+newLog+", threshold: 1}\nrules:\n"+scanners, app1)
+	requireReload(t, s)
+	before := len(banLines(t, banLog))
+	d := clientFrom("127.0.0.65")
+	get(t, d, addr+"/wp-a")
+	get(t, d, addr+"/wp-b")
+	waitFor(t, func() bool {
+		return slices.Contains(banLines(t, newLog), "127.0.0.65 127.0.0.65/32 scanners")
+	})
+	require.Len(t, banLines(t, banLog), before)
+
+	// Strikes without a bans section: rejected, the old config stays
+	writeConfig(t, filename, "rules:\n"+scanners, app1)
+	_, err := s.Reload()
+	require.ErrorContains(t, err, "strike needs a bans section")
+	e := clientFrom("127.0.0.66")
+	get(t, e, addr+"/wp-a")
+	get(t, e, addr+"/wp-b")
+	waitFor(t, func() bool {
+		return slices.Contains(banLines(t, newLog), "127.0.0.66 127.0.0.66/32 scanners")
+	})
+
+	// None of it touched the open stream
+	require.False(t, streamClosed(stream))
+}
+
+func TestServer_HotReloadRulesMoveBetweenFiles(t *testing.T) {
+	// Rules in included files, as an operator would add a rules file during an attack: adding,
+	// changing and removing the file applies on reload; a site's rule is named after its site
+	app1 := newTestUpstream(t, "app1")
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "rules.d"), 0755))
+	banLog := filepath.Join(dir, "ban.log")
+	filename := filepath.Join(dir, "config.yml")
+	writeConfig(t, filename, "include: [rules.d/*.yml]\nbans: {file: "+banLog+", threshold: 1}", app1)
+	s := startTestServer(t, filename)
+	addr := "http://" + s.HTTPAddr()
+	rulesFile := filepath.Join(dir, "rules.d", "attack.yml")
+
+	// A global rule from a new file
+	require.NoError(t, os.WriteFile(rulesFile, []byte("rules: [{name: attack, match: 'header(\"User-Agent\") == \"flood\"', action: block, strike: 2}]\n"), 0600))
+	requireReload(t, s)
+	req, _ := http.NewRequest(http.MethodGet, addr+"/name", nil)
+	req.Header.Set("User-Agent", "flood")
+	resp, err := clientFrom("127.0.0.71").Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+	waitFor(t, func() bool {
+		return slices.Contains(banLines(t, banLog), "127.0.0.71 127.0.0.71/32 attack")
+	})
+
+	// The same name twice, in the main file and the included one: rejected, the rule stays
+	writeConfig(t, filename, "include: [rules.d/*.yml]\nbans: {file: "+banLog+", threshold: 1}\nrules: [{name: attack, action: block}]", app1)
+	_, err = s.Reload()
+	require.ErrorContains(t, err, `duplicate rule name "attack"`)
+	writeConfig(t, filename, "include: [rules.d/*.yml]\nbans: {file: "+banLog+", threshold: 1}", app1)
+	requireReload(t, s)
+
+	// The file removed: the rule is gone
+	require.NoError(t, os.Remove(rulesFile))
+	requireReload(t, s)
+	resp, err = clientFrom("127.0.0.72").Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestServer_HotReloadKeepsLimits(t *testing.T) {
+	// A reload is no amnesty: a client over its limit stays over it, unless its limit changed
+	// (unlike a restart, see the ntfy restart amnesty)
+	app1 := newTestUpstream(t, "app1")
+	limit := "  - {name: limit, action: limit, rate: 1/h, burst: 1}\n"
+	s, filename := newTestServer(t, "rules:\n"+limit, app1)
+	addr := "http://" + s.HTTPAddr()
+	client := clientFrom("127.0.0.81")
+	for range 2 {
+		status, _ := get(t, client, addr+"/name")
+		require.Equal(t, http.StatusOK, status)
+	}
+	status, _ := get(t, client, addr+"/name")
+	require.Equal(t, http.StatusTooManyRequests, status)
+
+	// Another rule added, and the limit moved behind it: still limited
+	writeConfig(t, filename, "rules:\n  - {name: other, match: 'path == \"/x\"', action: block}\n"+limit, app1)
+	requireReload(t, s)
+	status, _ = get(t, client, addr+"/name")
+	require.Equal(t, http.StatusTooManyRequests, status)
+
+	// A new rate is a new limit
+	writeConfig(t, filename, "rules:\n  - {name: limit, action: limit, rate: 2/h, burst: 1}\n", app1)
+	requireReload(t, s)
+	status, _ = get(t, client, addr+"/name")
+	require.Equal(t, http.StatusOK, status)
+
+	// Renamed, it is a new limit too
+	writeConfig(t, filename, "rules:\n  - {name: limit2, action: limit, rate: 2/h, burst: 0}\n", app1)
+	requireReload(t, s)
+	status, _ = get(t, client, addr+"/name")
+	require.Equal(t, http.StatusOK, status)
+	status, _ = get(t, client, addr+"/name")
+	require.Equal(t, http.StatusTooManyRequests, status)
+}
+
+func TestServer_HotReloadSiteRulesAndLogs(t *testing.T) {
+	// A rule added to one site by reload applies to that site only, is named after it in the ban
+	// file and the metrics, and new access log partitions apply to the next request
+	app1 := newTestUpstream(t, "app1")
+	dir := t.TempDir()
+	banLog, allLog, blockedLog := filepath.Join(dir, "ban.log"), filepath.Join(dir, "all.log"), filepath.Join(dir, "blocked.log")
+	filename := filepath.Join(dir, "config.yml")
+	write := func(logs, siteARules string) {
+		conf := fmt.Sprintf(`listen-admin: '127.0.0.1:0'
+bans: {file: %s, threshold: 1}
+access-logs: %s
+sites:
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], rules: %s, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+`, banLog, logs, siteARules, app1.addr(), app1.addr())
+		require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
+	}
+	write("[{file: "+allLog+"}]", "[]")
+	s := startTestServer(t, filename)
+	getHost := func(ip, host, target string) int {
+		req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+target, nil)
+		require.NoError(t, err)
+		req.Host = host
+		resp, err := clientFrom(ip).Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	require.Equal(t, http.StatusOK, getHost("127.0.0.91", "a.com", "/name?x"))
+
+	// Site a gets a rule, and the access log is split by whether a rule decided
+	write(`[{file: `+blockedLog+`, match: 'rule != ""'}, {file: `+allLog+`}]`, `[{name: block-x, match: 'query == "x"', action: block, strike: 2}]`)
+	requireReload(t, s)
+	require.Equal(t, http.StatusForbidden, getHost("127.0.0.92", "a.com", "/name?x"))
+	require.Equal(t, http.StatusOK, getHost("127.0.0.93", "b.com", "/name?x"))
+	waitFor(t, func() bool {
+		return slices.Contains(banLines(t, banLog), "127.0.0.92 127.0.0.92/32 a/block-x")
+	})
+	waitFor(t, func() bool {
+		b, _ := os.ReadFile(blockedLog)
+		return strings.Contains(string(b), "GET /name?x HTTP/1.1\" 403") && strings.Contains(string(b), "site=a")
+	})
+	b, _ := os.ReadFile(blockedLog)
+	require.NotContains(t, string(b), "site=b")
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_rule_matches_total{rule="a/block-x"} 1`)
 }

@@ -423,11 +423,22 @@ func validateServers(servers []*Server) error {
 			return fmt.Errorf("server %s has no addresses", srv.Name)
 		}
 		names[srv.Name] = true
+		if srv.Weight == 0 {
+			srv.Weight = 1
+		} else if srv.Weight < 1 || srv.Weight > maxWeight {
+			return fmt.Errorf("server %s: weight must be between 1 and %d", srv.Name, maxWeight)
+		}
 		addresses, err := expandAddresses(srv.Addresses)
 		if err != nil {
 			return fmt.Errorf("server %s: %w", srv.Name, err)
 		}
 		srv.Addresses = addresses
+	}
+	hasPrimary := slices.ContainsFunc(servers, func(srv *Server) bool {
+		return !srv.Backup
+	})
+	if !hasPrimary {
+		return errors.New("at least one server must not be a backup")
 	}
 	return nil
 }

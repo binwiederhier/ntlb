@@ -188,7 +188,7 @@ upstream:
 | `timeouts.read` | `60s` | Cut a response (or a WebSocket) after this long without a byte. Streams need their server to send keepalives within it. Also bounds a client that stops reading; a stalled upload is cut after 60s, or this if shorter. |
 | `keepalive` | `{idle: 1m, interval: 15s, count: 4}` | TCP keepalive towards the servers; a dead peer is noticed after `idle + interval * count`. `{disable: true}` turns it off. |
 | `health-check` | `{path: /, interval: 5s, timeout: 3s, fails: 3, passes: 2}` | See [Health checks](#health-checks-and-what-happens-when-one-goes-bad). |
-| `servers` | required | The backend nodes: a `name` and one or more `addresses`. Names are per site. |
+| `servers` | required | The backend nodes: a `name`, one or more `addresses`, and optionally a `weight` (1 to 1000, default 1) and `backup: true`. Names are per site. At least one server must not be a backup. |
 
 Each site has its own connections to its servers, so sites can differ: ntfy's 3m read timeout next
 to a site with the default. A reload keeps a site's idle connections unless its `timeouts` or
@@ -208,8 +208,39 @@ failing its health checks nor backing off after a failure.
 |---|---|---|---|
 | `round-robin` (default) | the next one in turn | (default) | similar nodes, short requests |
 | `least-conn` | the fewest open requests on this load balancer, in turn among equals | `least_conn` | long or uneven requests with one load balancer |
-| `random-two` | the less busy of two random ones | `random two least_conn` | uneven requests with several load balancers, which each see only their own load |
+| `random-two-least-conn` | the less busy of two random ones | `random two least_conn` | uneven requests with several load balancers, which each see only their own load |
 | `hash` | the same server for the same client, by `client-key` | `hash $remote_addr consistent` | per-client state on the node: rate limits, sessions, a pub/sub node per client |
+
+**Weights and backups** work with every `balance`:
+
+```yaml
+upstream:
+  balance: least-conn
+  servers:
+    - {name: big, addresses: ["10.0.0.11:8080"], weight: 3}   # 3 times the share of small
+    - {name: small, addresses: ["10.0.0.12:8080"]}            # weight 1
+    - {name: canary, addresses: ["10.0.0.13:8080"], weight: 1}
+    - {name: spare, addresses: ["10.0.0.14:8080"], backup: true}
+```
+
+- `weight` is a server's share relative to the others, like nginx's `weight=`. `round-robin` gives
+  each server `weight` turns per round; `least-conn` and `random-two-least-conn` compare open
+  requests per weight (and draw the two candidates by weight); `hash` sends each server its
+  weight's share of the clients (weighted rendezvous hashing), and changing a weight only moves
+  clients from or to that server.
+- `backup: true` is nginx's `backup`: the server gets no requests while any other server is
+  healthy, except as the last retry after all of them failed; if none of them is healthy, the
+  backups take over (in balance order). When every server is unhealthy, all are tried, backups
+  last.
+
+```mermaid
+flowchart TD
+    pick["Pick"] --> h{"any healthy<br>non-backup server?"}
+    h -- yes --> a["those, by balance and weight,<br>then the healthy backups<br>(last retries)"]
+    h -- no --> b{"any healthy<br>backup?"}
+    b -- yes --> c["the healthy backups,<br>by balance and weight"]
+    b -- no --> d["fail open: every server,<br>backups last"]
+```
 
 ```mermaid
 flowchart LR

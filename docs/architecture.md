@@ -167,7 +167,7 @@ flowchart LR
     u --> order
     order -- "round-robin" --> rr["Rotated by the site's turn"]
     order -- "least-conn" --> lc["Rotated, then by load<br/>(attached + reserved)"]
-    order -- "random-two" --> r2["Less loaded of two random,<br/>then the rest by load"]
+    order -- "random-two-least-conn" --> r2["Less loaded of two random,<br/>then the rest by load"]
     order -- "hash" --> hash["Rendezvous hash of the<br/>client key over the names"]
 ```
 

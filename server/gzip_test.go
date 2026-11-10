@@ -371,3 +371,30 @@ func TestGzip_NotOnSubscriptions(t *testing.T) {
 	w := newGzipWriter(rec, req, &config.Gzip{Types: []string{"text/plain"}}, &proxyRequest{kind: kindRequest})
 	require.Same(t, rec, unwrapGzip(w))
 }
+
+func TestGzip_HotReload(t *testing.T) {
+	// Turned on, changed and off by reload, for new responses
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/data", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", r.URL.Query().Get("type"))
+		io.WriteString(w, gzipBody)
+	})
+	s, filename := newTestServer(t, "", app1)
+	encoding := func(typ string) string {
+		resp, body := gzipGet(t, http.MethodGet, "http://"+s.HTTPAddr()+"/data?type="+typ, "gzip")
+		require.Equal(t, gzipBody, body)
+		return resp.Header.Get("Content-Encoding")
+	}
+	require.Empty(t, encoding("application/json"))
+	writeConfig(t, filename, testGzip, app1)
+	requireReload(t, s)
+	require.Equal(t, "gzip", encoding("application/json"))
+	require.Empty(t, encoding("text/css"))
+	writeConfig(t, filename, "gzip: {types: [text/css]}", app1)
+	requireReload(t, s)
+	require.Empty(t, encoding("application/json"))
+	require.Equal(t, "gzip", encoding("text/css"))
+	writeConfig(t, filename, "", app1)
+	requireReload(t, s)
+	require.Empty(t, encoding("text/css"))
+}

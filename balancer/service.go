@@ -46,6 +46,8 @@ type Upstream struct {
 	name        string
 	removed     bool        // Protected by Balancer.mu
 	drain       *drainState // Protected by Balancer.mu
+	weight      int         // Protected by Balancer.mu
+	backup      bool        // Protected by Balancer.mu
 	requests    atomic.Uint64
 	failures    atomic.Uint64
 	addresses   []string
@@ -101,10 +103,11 @@ func (b *Balancer) Start(ctx context.Context) {
 }
 
 // Pick returns the upstreams of a site to try, best first: the healthy upstreams that are not
-// draining. If none is healthy, it fails open and returns every upstream that is not draining,
-// since a problem shared by all nodes (e.g. their database) is no reason to turn every client
-// away. Returns nothing only if every upstream of the site is draining. The order is the site's
-// balance (strategy.go); the client key matters for balance hash only.
+// draining, then the healthy backups as the last retries; the healthy backups alone if no other
+// upstream is healthy. If none is healthy, it fails open and returns every upstream that is not
+// draining (backups last), since a problem shared by all nodes (e.g. their database) is no reason
+// to turn every client away. Returns nothing only if every upstream of the site is draining. The
+// order is the site's balance (strategy.go); the client key matters for balance hash only.
 func (b *Balancer) Pick(site string, key []byte) []*Upstream {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -112,22 +115,41 @@ func (b *Balancer) Pick(site string, key []byte) []*Upstream {
 	if siteConf == nil {
 		return nil
 	}
-	var healthy, unhealthy []*Upstream
+	var healthy, healthyBackups, unhealthy, unhealthyBackups []*Upstream
 	for _, id := range b.order {
-		if u := b.upstreams[id]; u.site == site && !u.removed && u.drain == nil {
-			if u.isHealthy() {
-				healthy = append(healthy, u)
-			} else {
-				unhealthy = append(unhealthy, u)
-			}
+		u := b.upstreams[id]
+		if u.site != site || u.removed || u.drain != nil {
+			continue
+		}
+		switch ok := u.isHealthy(); {
+		case ok && !u.backup:
+			healthy = append(healthy, u)
+		case ok:
+			healthyBackups = append(healthyBackups, u)
+		case !u.backup:
+			unhealthy = append(unhealthy, u)
+		default:
+			unhealthyBackups = append(unhealthyBackups, u)
 		}
 	}
-	if len(healthy) > 0 {
-		b.sortFor(siteConf, key, healthy)
-		return healthy
+	var turn uint64
+	if balance := siteConf.Upstream.Balance; balance == config.BalanceRoundRobin || balance == config.BalanceLeastConn {
+		turn = b.nextTurn(site)
 	}
-	b.sortFor(siteConf, key, unhealthy) // Fail open
-	return unhealthy
+	switch {
+	case len(healthy) > 0:
+		return sorted(siteConf, key, turn, healthy, healthyBackups)
+	case len(healthyBackups) > 0:
+		return sorted(siteConf, key, turn, healthyBackups, nil)
+	}
+	return sorted(siteConf, key, turn, unhealthy, unhealthyBackups) // Fail open
+}
+
+// sorted returns the upstreams sorted by the site's balance, then the backups sorted the same way
+func sorted(site *config.Site, key []byte, turn uint64, upstreams, backups []*Upstream) []*Upstream {
+	sortFor(site, key, turn, upstreams)
+	sortFor(site, key, turn, backups)
+	return append(upstreams, backups...)
 }
 
 // NewSession registers a proxied request; cancel is called (with ErrDrained) to drain it.
@@ -322,6 +344,7 @@ func (u *Upstream) updateNoLock(site *config.Site, uc *config.Server, probed *Up
 		slog.Info("Upstream addresses changed", "site", u.site, "upstream", u.name, "addresses", uc.Addresses, "healthy", probed.isHealthy())
 		u.replaceAddressesNoLock(probed)
 	}
+	u.weight, u.backup = uc.Weight, uc.Backup
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.health = site.Upstream.HealthCheck
@@ -448,6 +471,8 @@ func newUpstream(site *config.Site, uc *config.Server) *Upstream {
 		id:          upstreamID(site.Name, uc.Name),
 		site:        site.Name,
 		name:        uc.Name,
+		weight:      uc.Weight,
+		backup:      uc.Backup,
 		health:      site.Upstream.HealthCheck,
 		addresses:   slices.Clone(uc.Addresses),
 		addrStreams: make(map[string]int),
@@ -502,6 +527,8 @@ func (u *Upstream) statusNoLock(now time.Time) *UpstreamStatus {
 		Name:      u.name,
 		Healthy:   u.healthy,
 		Removed:   u.removed,
+		Weight:    u.weight,
+		Backup:    u.backup,
 		Addresses: slices.Clone(u.addresses),
 		Streams:   u.streamCountNoLock(),
 		Requests:  u.requests.Load(),

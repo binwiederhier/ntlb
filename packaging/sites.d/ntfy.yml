@@ -28,13 +28,17 @@ sites:
     # The servers, and how requests reach them (like nginx's upstream block)
     upstream:
       # How a request picks its server; the next ones are the retries, unhealthy servers last:
-      #   round-robin  in turn (default, like nginx)
-      #   least-conn   the fewest open requests on this load balancer, in turn among equals
-      #   random-two   the less busy of two random ones (nginx's "random two least_conn"): balances
-      #                like least-conn, also with several load balancers that each only see their own
-      #   hash         the client key (client-key) hashed to server NAMES (rendezvous hashing), so
-      #                every load balancer with the same names sends a client to the same server,
-      #                and adding or removing one only moves the clients that ranked it first
+      #   round-robin            in turn (default, like nginx)
+      #   least-conn             the fewest open requests on this load balancer, in turn among equals
+      #   random-two-least-conn  the less busy of two random ones (nginx's "random two least_conn"):
+      #                          balances like least-conn, also with several load balancers that
+      #                          each only see their own
+      #   hash                   the client key (client-key) hashed to server NAMES (rendezvous
+      #                          hashing), so every load balancer with the same names sends a client
+      #                          to the same server, and adding or removing one only moves the
+      #                          clients that ranked it first
+      # A server's weight (default 1) is its share in all of them; a backup server only gets
+      # requests if no other server is healthy, and is the last retry otherwise.
       # ntfy: hash, so a client's subscriptions and publishes meet on one node
       balance: hash
 

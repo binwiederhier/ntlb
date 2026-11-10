@@ -22,7 +22,7 @@ import (
 const (
 	BalanceRoundRobin = "round-robin"
 	BalanceLeastConn  = "least-conn"
-	BalanceRandomTwo  = "random-two"
+	BalanceRandomTwo  = "random-two-least-conn"
 	BalanceHash       = "hash"
 )
 
@@ -47,6 +47,7 @@ const (
 	DefaultBansWindow              = 10 * time.Minute
 	DefaultBalance                 = BalanceRoundRobin // Like nginx
 	maxPortRange                   = 1000              // Ports in one "host:from-to" address, against typos like 2586-25860
+	maxWeight                      = 1000              // A server's weight: plenty for shares, and bounds a round-robin round
 
 	// DefaultStreamsMatch is no request: which ones are long-lived streams depends on the app (see
 	// packaging/sites.d/ntfy.yml for ntfy's subscriptions)
@@ -54,21 +55,9 @@ const (
 )
 
 var (
-	nameRegex      = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`)      // Names of sites, upstreams and rules
+	nameRegex      = regexp.MustCompile(`^[-_.a-zA-Z0-9]{1,64}$`)      // Names of sites, servers and rules
 	mediaTypeRegex = regexp.MustCompile(`^[-+.a-z0-9]+/[-+.a-z0-9]+$`) // gzip.types
 	balances       = []string{BalanceRoundRobin, BalanceLeastConn, BalanceRandomTwo, BalanceHash}
-
-	// movedKeys are the keys that moved into a site's upstream block, and where to: an old config
-	// gets told instead of only "field not found"
-	movedKeys = map[string]string{
-		"upstream-connect-timeout": "sites[].upstream.timeouts.connect",
-		"upstream-read-timeout":    "sites[].upstream.timeouts.read",
-		"upstream-keepalive":       "sites[].upstream.keepalive",
-		"balance":                  "sites[].upstream.balance",
-		"health-check":             "sites[].upstream.health-check",
-		"upstreams":                "sites[].upstream.servers",
-	}
-	unknownFieldRegex = regexp.MustCompile(`field (\S+) not found in type config\.(Config|Site)$`)
 )
 
 // Config is the ntlb config file. Field names follow ntfy's server.yml (kebab-case).
@@ -166,6 +155,8 @@ type Timeouts struct {
 type Server struct {
 	Name      string   `yaml:"name"`
 	Addresses []string `yaml:"addresses"`
+	Weight    int      `yaml:"weight"` // Its share relative to the others, 1 (default) to maxWeight
+	Backup    bool     `yaml:"backup"` // Only used if no other server is healthy, and as their last retries
 }
 
 // Load reads, defaults and validates a config file and the site files it includes
@@ -236,23 +227,9 @@ func decode(b []byte, v any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
 	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
-		return withMovedKeys(err)
-	}
-	return nil
-}
-
-// withMovedKeys adds where a key went to the unknown field errors of keys that moved
-func withMovedKeys(err error) error {
-	var typeErr *yaml.TypeError
-	if !errors.As(err, &typeErr) {
 		return err
 	}
-	for i, msg := range typeErr.Errors {
-		if m := unknownFieldRegex.FindStringSubmatch(msg); m != nil && movedKeys[m[1]] != "" {
-			typeErr.Errors[i] = msg + " (moved to " + movedKeys[m[1]] + ")"
-		}
-	}
-	return typeErr
+	return nil
 }
 
 func (c *Config) applyDefaults() {

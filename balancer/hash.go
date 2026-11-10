@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"math"
 	"net/netip"
 	"slices"
 	"strings"
@@ -34,15 +35,28 @@ func ClientKey(addr netip.Addr, ipv4PrefixBits, ipv6PrefixBits int) []byte {
 // rank orders upstream names by preference for a key, using rendezvous (highest random weight)
 // hashing. The order depends only on the key and the names, not on the config order or the
 // process, so every load balancer with the same upstream names routes a client the same way, and
-// removing or adding an upstream only moves the clients that rank it first.
+// removing or adding an upstream only moves the clients that ranked it first.
 func rank(key []byte, names []string) []string {
+	return rankWeighted(key, names, nil)
+}
+
+// rankWeighted is rank with a weight per name (nil: all 1), by weighted rendezvous hashing: each
+// name scores weight / -ln(hash as a number in (0,1)), so a name gets its weight's share of keys,
+// and adding, removing or reweighting one only moves keys from or to it. Equal weights rank like
+// no weights, since the score grows with the hash.
+func rankWeighted(key []byte, names []string, weights []int) []string {
 	type scored struct {
 		name  string
-		score uint64
+		score float64
 	}
 	scores := make([]scored, len(names))
 	for i, name := range names {
-		scores[i] = scored{name: name, score: score(key, name)}
+		weight := 1
+		if weights != nil {
+			weight = weights[i]
+		}
+		u := (float64(score(key, name)>>11) + 0.5) / (1 << 53) // In (0,1), never 0 or 1
+		scores[i] = scored{name: name, score: float64(weight) / -math.Log(u)}
 	}
 	slices.SortFunc(scores, func(a, b scored) int {
 		if a.score != b.score {

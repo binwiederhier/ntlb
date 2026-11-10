@@ -849,3 +849,358 @@ func TestServer_InvalidHostOrTargetRejected(t *testing.T) {
 		require.True(t, validRequest(r), name)
 	}
 }
+
+// ntfyClient sends requests for ntfy.sh to a server from one loopback IP, over HTTP or HTTPS,
+// without following redirects
+type ntfyClient struct {
+	t      *testing.T
+	s      *Server
+	client *http.Client
+}
+
+func newNtfyClient(t *testing.T, s *Server, ip string) *ntfyClient {
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: net.ParseIP(ip)},
+	}
+	return &ntfyClient{
+		t: t,
+		s: s,
+		client: &http.Client{
+			Transport: &http.Transport{
+				DialContext:       dialer.DialContext,
+				DisableKeepAlives: true,
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+					ServerName:         "ntfy.sh",
+				},
+			},
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+}
+
+// do sends a request and returns the response with its body read
+func (c *ntfyClient) do(method, scheme, target, body string, header ...string) (*http.Response, string) {
+	c.t.Helper()
+	addr := c.s.HTTPAddr()
+	if scheme == "https" {
+		addr = c.s.HTTPSAddr()
+	}
+	req, err := http.NewRequest(method, scheme+"://"+addr+target, strings.NewReader(body))
+	require.NoError(c.t, err)
+	req.Host = "ntfy.sh"
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
+	}
+	resp, err := c.client.Do(req)
+	require.NoError(c.t, err)
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(c.t, err)
+	return resp, string(b)
+}
+
+// newNtfyPackagedServer runs the shipped config (packaging/config.yml and sites.d/ntfy.yml) as is,
+// but for what a test cannot have: addresses, files and certificates in a temporary directory,
+// the test upstreams, loopback IPs in the limit exemptions, and a small limit burst
+func newNtfyPackagedServer(t *testing.T, upstreams ...*testUpstream) (*Server, string) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "sites.d"), 0755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "html", "_next"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "html", "index.html"), []byte("<html>the website</html>"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "html", "_next", "app.js"), []byte("console.log('app')"), 0644))
+	writeTestCert(t, filepath.Join(dir, "fullchain.pem"), filepath.Join(dir, "privkey.pem"), "ntfy.sh")
+	main, err := os.ReadFile("../packaging/config.yml")
+	require.NoError(t, err)
+	site, err := os.ReadFile("../packaging/sites.d/ntfy.yml")
+	require.NoError(t, err)
+	mainConf := strings.NewReplacer(
+		`listen-admin: "127.0.0.1:2590"`, `listen-admin: "127.0.0.1:0"`,
+		"/var/log/ntlb/", dir+"/",
+	).Replace(string(main))
+	var servers strings.Builder
+	for _, u := range upstreams {
+		fmt.Fprintf(&servers, "        - name: %s\n          addresses: [%q]\n", u.name, u.addr())
+	}
+	siteConf := strings.NewReplacer(
+		`listen-http: ":80"`, `listen-http: "127.0.0.1:0"`,
+		`listen-https: ":443"`, `listen-https: "127.0.0.3:0"`,
+		"/etc/ntlb/certs/", dir+"/",
+		"/var/www/website/html", filepath.Join(dir, "html"),
+		`"198.51.100.7", "203.0.113.0/24"`, `"127.0.0.41", "203.0.113.0/24"`,
+		"burst: 1000", "burst: 3",
+	).Replace(string(site))
+	i := strings.Index(siteConf, "      servers:\n")
+	j := strings.Index(siteConf, "\n\n    # Rules of this site")
+	require.True(t, i > 0 && j > i, "servers section not found")
+	siteConf = siteConf[:i] + "      servers:\n" + servers.String() + siteConf[j+1:]
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yml"), []byte(mainConf), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "ntfy.yml"), []byte(siteConf), 0600))
+	return startTestServer(t, filepath.Join(dir, "config.yml")), dir
+}
+
+// stream opens a subscription and returns once its first line arrived, plus a func to close it
+func (c *ntfyClient) stream(scheme, target string) func() {
+	c.t.Helper()
+	addr := c.s.HTTPAddr()
+	if scheme == "https" {
+		addr = c.s.HTTPSAddr()
+	}
+	req, err := http.NewRequest(http.MethodGet, scheme+"://"+addr+target, nil)
+	require.NoError(c.t, err)
+	req.Host = "ntfy.sh"
+	resp, err := c.client.Do(req)
+	require.NoError(c.t, err)
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	require.NoError(c.t, err)
+	require.Equal(c.t, "start\n", line)
+	return func() {
+		resp.Body.Close()
+	}
+}
+
+func TestServer_NtfyPackagedConfig(t *testing.T) {
+	// The ntfy.sh setup end to end, as shipped, with three fake ntfy nodes
+	app1, app3, app5 := newTestUpstream(t, "app1"), newTestUpstream(t, "app3"), newTestUpstream(t, "app5")
+	for _, u := range []*testUpstream{app1, app3, app5} {
+		name := u.name
+		u.on("/mytopic", func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			fmt.Fprintf(w, "%s %s %s", name, r.Method, body)
+		})
+		u.on("/polltopic/json", func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, "polled") // Whatever the poll flag, so a misclassified poll cannot hang
+		})
+		u.on("/v1/stats", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"messages":`+strings.Repeat("1", 2000)+`}`)
+		})
+	}
+	s, dir := newNtfyPackagedServer(t, app1, app3, app5)
+	metrics := func() string {
+		_, m := adminDo(t, s, http.MethodGet, "/metrics", "")
+		return m
+	}
+	readLog := func(name string) string {
+		b, _ := os.ReadFile(filepath.Join(dir, name))
+		return string(b)
+	}
+
+	t.Run("subscriptions are streams, polls are not", func(t *testing.T) {
+		c := newNtfyClient(t, s, "127.0.0.11")
+		closeHTTPS := c.stream("https", "/mytopic/json")
+		closeHTTP := c.stream("http", "/a,b_c-d/json?since=10m") // Not redirected: old clients subscribe over HTTP
+		defer closeHTTPS()
+		defer closeHTTP()
+		require.Contains(t, metrics(), `ntlb_streams{protocol="http1"} 2`)
+		poller := newNtfyClient(t, s, "127.0.0.14") // Another client: 5 requests at once would hit the limit
+		for _, poll := range [][]string{{"/polltopic/json?poll=1"}, {"/polltopic/json?po=1"}, {"/polltopic/json", "X-Poll", "1"}} {
+			resp, body := poller.do(http.MethodGet, "https", poll[0], "", poll[1:]...)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, "polled", body)
+		}
+		require.Contains(t, metrics(), `ntlb_streams{protocol="http1"} 2`)
+		require.Regexp(t, `ntlb_requests_total\{code="200",kind="request",site="ntfy",upstream="app\d"\} 3`, metrics())
+	})
+
+	t.Run("publishes, any method, sticky per client", func(t *testing.T) {
+		c := newNtfyClient(t, s, "127.0.0.12")
+		_, first := c.do(http.MethodPost, "https", "/mytopic", "hello")
+		node := strings.Fields(first)[0]
+		require.Equal(t, node+" POST hello", first)
+		_, body := c.do(http.MethodPut, "http", "/mytopic", "over http") // Publishing over HTTP is not redirected
+		require.Equal(t, node+" PUT over http", body)
+		nodes := make(map[string]bool)
+		for i := 100; i < 130; i++ {
+			_, body := newNtfyClient(t, s, fmt.Sprintf("127.0.2.%d", i)).do(http.MethodPost, "https", "/mytopic", "x")
+			nodes[strings.Fields(body)[0]] = true
+		}
+		require.Len(t, nodes, 3) // Clients spread over all nodes
+	})
+
+	t.Run("redirects and the website", func(t *testing.T) {
+		c := newNtfyClient(t, s, "127.0.0.13")
+		hits := app1.hits.Load() + app3.hits.Load() + app5.hits.Load()
+		for target, location := range map[string]string{
+			"/docs":          "https://docs.ntfy.sh/",
+			"/docs/publish/": "https://docs.ntfy.sh/publish/",
+		} {
+			for _, scheme := range []string{"http", "https"} {
+				resp, _ := c.do(http.MethodGet, scheme, target, "")
+				require.Equal(t, http.StatusFound, resp.StatusCode, target)
+				require.Equal(t, location, resp.Header.Get("Location"), target)
+			}
+		}
+		for _, target := range []string{"/", "/mytopic", "/static/x.css", "/_next/app.js"} {
+			resp, _ := c.do(http.MethodGet, "http", target, "")
+			require.Equal(t, http.StatusFound, resp.StatusCode, target)
+			require.Equal(t, "https://ntfy.sh"+target, resp.Header.Get("Location"), target)
+		}
+		resp, body := c.do(http.MethodGet, "https", "/", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "<html>the website</html>", body)
+		resp, body = c.do(http.MethodGet, "https", "/_next/app.js", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "console.log('app')", body)
+		resp, _ = c.do(http.MethodGet, "https", "/_next/missing.js", "")
+		require.Equal(t, http.StatusNotFound, resp.StatusCode)
+		require.Equal(t, hits, app1.hits.Load()+app3.hits.Load()+app5.hits.Load()) // None reached a node
+	})
+
+	t.Run("abusive topics are blocked and banned", func(t *testing.T) {
+		resp, _ := newNtfyClient(t, s, "127.0.0.21").do(http.MethodGet, "https", "/spam-offers/json", "")
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		resp, _ = newNtfyClient(t, s, "127.0.0.22").do(http.MethodPost, "https", "/news,my-bets", "x") // Inside a topic list
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		resp, _ = newNtfyClient(t, s, "127.0.0.22").do(http.MethodGet, "https", "/my-betsy/json?poll=1", "") // A near miss
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		waitFor(t, func() bool {
+			bans := readLog("ban.log")
+			return strings.Contains(bans, " 127.0.0.21 127.0.0.21/32 ntfy/abuse-topics\n") &&
+				strings.Contains(bans, " 127.0.0.22 127.0.0.22/32 ntfy/abuse-topics\n")
+		})
+
+		// 150+ topics at once: blocked, 20 strikes, not banned yet
+		topics := strings.TrimSuffix(strings.Repeat("t,", 151), ",")
+		resp, _ = newNtfyClient(t, s, "127.0.0.23").do(http.MethodGet, "https", "/"+topics+"/json", "")
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+		// The global abuse rule, for every site
+		resp, _ = newNtfyClient(t, s, "127.0.0.24").do(http.MethodGet, "https", "/mytopic/json?poll=1", "", "User-Agent", "NTFY-Spy/1.0")
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		waitFor(t, func() bool {
+			return strings.Contains(readLog("access_error.log"), `"GET /mytopic/json?poll=1 HTTP/1.1" 403`)
+		})
+		require.NotContains(t, readLog("ban.log"), "127.0.0.23")
+		require.Contains(t, metrics(), `ntlb_rule_matches_total{rule="ntfy/abuse-topic-count"} 1`)
+		require.Contains(t, metrics(), `ntlb_rule_matches_total{rule="abuse"} 1`)
+	})
+
+	t.Run("the request limit, and its exemptions", func(t *testing.T) {
+		c := newNtfyClient(t, s, "127.0.0.31")
+		for range 4 { // burst 3: 4 at once
+			resp, _ := c.do(http.MethodPost, "https", "/mytopic", "x")
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		}
+		resp, _ := c.do(http.MethodPost, "https", "/mytopic", "x")
+		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode) // nginx's limit_req status
+		exempt := newNtfyClient(t, s, "127.0.0.41")
+		for range 10 {
+			resp, _ := exempt.do(http.MethodPost, "https", "/mytopic", "x")
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		}
+		require.Contains(t, metrics(), `ntlb_rule_matches_total{rule="ntfy/limit"} 1`)
+	})
+
+	t.Run("gzip for large JSON, never for subscriptions", func(t *testing.T) {
+		c := newNtfyClient(t, s, "127.0.0.51")
+		resp, _ := c.do(http.MethodGet, "https", "/v1/stats", "", "Accept-Encoding", "gzip")
+		require.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+		resp, _ = c.do(http.MethodGet, "https", "/mytopic/json?poll=1", "", "Accept-Encoding", "gzip")
+		require.Empty(t, resp.Header.Get("Content-Encoding"))
+	})
+
+	t.Run("garbage is a 400, logged and struck", func(t *testing.T) {
+		require.Equal(t, "HTTP/1.1 400 Bad Request", sendRaw(t, s.HTTPAddr(), "\x16\x03\x01garbage\r\n\r\n"))
+		waitFor(t, func() bool {
+			return strings.Contains(readLog("access_error.log"), `"-" 400 0 "-" "-" http_host=- site=-`)
+		})
+	})
+
+	t.Run("access logs split by status", func(t *testing.T) {
+		waitFor(t, func() bool {
+			return strings.Contains(readLog("access.log"), `"POST /mytopic HTTP/1.1" 200`)
+		})
+		require.NotContains(t, readLog("access.log"), `" 403 `)
+		require.NotContains(t, readLog("access_error.log"), `" 200 `)
+	})
+}
+
+func TestServer_HotReloadUpstreamSettings(t *testing.T) {
+	// Backups, weights and timeouts change on reload for new requests; an open stream stays
+	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
+	for _, u := range []*testUpstream{app1, app2} {
+		u.on("/slow", func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(300 * time.Millisecond)
+			io.WriteString(w, "slow")
+		})
+	}
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	write := func(upstream string) {
+		conf := fmt.Sprintf(`listen-admin: '127.0.0.1:0'
+sites:
+  - name: s
+    listen-http: '127.0.0.1:0'
+    upstream:
+      balance: round-robin
+      health-check: {path: /v1/ready, interval: 1h, timeout: 1s}
+%s`, upstream)
+		require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
+	}
+	servers := func(app1Settings, app2Settings string) string {
+		return fmt.Sprintf("      servers:\n        - {name: app1, addresses: [%q]%s}\n        - {name: app2, addresses: [%q]%s}\n", app1.addr(), app1Settings, app2.addr(), app2Settings)
+	}
+	picks := func(s *Server, n int) map[string]int {
+		counts := make(map[string]int)
+		for range n {
+			_, name := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
+			counts[name]++
+		}
+		return counts
+	}
+	write(servers("", ", backup: true"))
+	s := startTestServer(t, filename)
+	stream, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/stream") // On app1
+	defer closeStream()
+	require.Equal(t, map[string]int{"app1": 10}, picks(s, 10))
+
+	// app2 no backup any more, with 3 times app1's share
+	write(servers("", ", weight: 3"))
+	requireReload(t, s)
+	require.Equal(t, map[string]int{"app1": 2, "app2": 6}, picks(s, 8))
+
+	// app1 the backup now
+	write(servers(", backup: true", ""))
+	requireReload(t, s)
+	require.Equal(t, map[string]int{"app2": 10}, picks(s, 10))
+	status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/slow")
+	require.Equal(t, http.StatusOK, status)
+
+	// A shorter read timeout: the slow answer is a 504 now
+	write("      timeouts: {read: 100ms}\n" + servers(", backup: true", ""))
+	requireReload(t, s)
+	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/slow")
+	require.Equal(t, http.StatusGatewayTimeout, status)
+
+	// The stream on app1 outlived all of it: neither backup nor timeout settings move it
+	require.False(t, streamClosed(stream))
+}
+
+func TestServer_BackupTakesOverWhenOthersFail(t *testing.T) {
+	// A backup is the last retry when the others fail before the health checks noticed (taking
+	// over once they are unhealthy: balancer.TestStrategy_Backup)
+	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`listen-admin: '127.0.0.1:0'
+sites:
+  - name: s
+    listen-http: '127.0.0.1:0'
+    upstream:
+      health-check: {path: /v1/ready, interval: 1h, timeout: 1s, fails: 1}
+      servers:
+        - {name: app1, addresses: [%q]}
+        - {name: spare, addresses: [%q], backup: true}
+`, app1.addr(), app2.addr())), 0600))
+	s := startTestServer(t, filename)
+	_, name := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
+	require.Equal(t, "app1", name)
+
+	// app1 goes away: the very next request is retried on the backup
+	app1.server.Close()
+	_, name = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
+	require.Equal(t, "app2", name)
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_retries_total{reason="connect"} 1`)
+}

@@ -21,16 +21,25 @@ orders them by the site's `upstream.balance`; the first is the choice, the rest 
 every upstream is draining does it return nothing (-> 503).
 
 - `round-robin`: rotated by a per-site turn (`Balancer.turns`, a `sync.Map` of `atomic.Uint64`),
-  over the healthy upstreams only, so an unhealthy one does not hand its turn to its neighbor.
-- `least-conn`: rotated, then stable-sorted by load: attached streams plus reserved attempts
-  (`Upstream.load`), so a burst of new requests spreads before any of them is answered. Equal
-  loads take turns.
-- `random-two`: two distinct random upstreams, the less loaded first, then the rest by load.
-  Unlike least-conn, it does not herd when several load balancers each see only their own load.
-- `hash`: rendezvous hashing of the client key, below.
+  over the healthy upstreams only, so an unhealthy one does not hand its turn to its neighbor. With
+  weights, a round is the sum of the weights and each upstream comes first `weight` turns in a row
+  (not interleaved like nginx's smooth weighted round-robin: the share is the same, and it needs no
+  per-upstream state).
+- `least-conn`: rotated, then stable-sorted by load per weight: attached streams plus reserved
+  attempts (`Upstream.load`), so a burst of new requests spreads before any of them is answered.
+  Equal loads take turns.
+- `random-two-least-conn`: two distinct upstreams drawn by weight, the less loaded (per weight)
+  first, then the rest by load. Unlike least-conn, it does not herd when several load balancers
+  each see only their own load.
+- `hash`: weighted rendezvous hashing of the client key, below.
 
-`rank(key, names)` scores every upstream name with `splitmix64(fnv1a(key || 0xff || name))` and
-sorts by score (name as tie-break). The key is the client IP shortened to `client-key.ipv4-prefix-bits`
+Backups (`backup: true`) are sorted the same way, apart: after the healthy upstreams as their last
+retries, alone if none of the others is healthy, and last when failing open. The turn is taken
+once per pick, and only for round-robin and least-conn.
+
+`rankWeighted(key, names, weights)` scores every upstream name with `weight / -ln(u)`, where `u` is
+`splitmix64(fnv1a(key || 0xff || name))` mapped into (0,1), and sorts by score (name as
+tie-break); the score grows with the hash, so equal weights rank like plain rendezvous hashing. The key is the client IP shortened to `client-key.ipv4-prefix-bits`
 (default 32) or `client-key.ipv6-prefix-bits` (default 64), masked and cut to whole bytes
 (`ClientKey`); with the defaults that is 4 or 8 bytes. `TestRank_Golden` pins the hash.
 Properties the tests pin down: the order does not depend on config order or process; removing a
@@ -497,7 +506,7 @@ An adversarial review by Codex found 21 issues; all are fixed, each with a test 
 
 | # | Finding | Fix |
 |---|---|---|
-| 1 | `upstreams: [null]` panics (kills the process via SIGHUP) | rejected by validation |
+| 1 | `servers: [null]` panics (kills the process via SIGHUP) | rejected by validation |
 | 2 | re-adding an upstream while its removal finishes corrupts the map/order | `Update` re-checks before commit |
 | 3 | early-503 retry races the old attempt for the request body | per-attempt `attemptBody`, retired before a retry |
 | 4 | stalled uploads hold handlers forever, even through drains | client read deadline, interrupted on cancel |

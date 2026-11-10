@@ -46,6 +46,8 @@ type UpstreamStatus struct {
 	State         State      `json:"state"`
 	Healthy       bool       `json:"healthy"`
 	Removed       bool       `json:"removed,omitempty"`
+	Weight        int        `json:"weight"`
+	Backup        bool       `json:"backup,omitempty"`
 	Addresses     []string   `json:"addresses"`
 	Streams       int        `json:"streams"`
 	Requests      uint64     `json:"requests"`

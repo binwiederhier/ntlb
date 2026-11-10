@@ -30,7 +30,7 @@ flowchart LR
         direction TB
         listen["Listeners<br/>TLS by SNI"] --> site["Site by Host"]
         site --> rules["Rules<br/>block, limit, allow,<br/>redirect, static"]
-        rules --> pick["Balancer<br/>round-robin, least-conn,<br/>random-two, hash"]
+        rules --> pick["Balancer<br/>round-robin, least-conn,<br/>random-two-least-conn, hash"]
     end
     subgraph upstreams["Upstreams"]
         app1["app-1"]
@@ -67,14 +67,16 @@ sequenceDiagram
 ## Features
 
 - **Balancing per site** (`upstream.balance`): `round-robin` (default, like nginx), `least-conn` (fewest
-  open requests on this load balancer), `random-two` (the less busy of two random servers, like
-  nginx's `random two least_conn`, which stays balanced with several load balancers), or `hash`:
+  open requests on this load balancer), `random-two-least-conn` (the less busy of two random
+  servers, like nginx's `random two least_conn`, which stays balanced with several load balancers), or `hash`:
   sticky, consistent routing by rendezvous (highest random weight) hashing of the client IP (IPv4,
   or the IPv6 /64, like ntfy's `visitor-prefix-bits-ipv6`) over the upstream *names*. With `hash`,
   any number of load balancers with the same upstream names send a client to the same node, which
   keeps ntfy's in-memory rate limits in one place; removing a node moves only its clients, adding
   one only takes its share. (nginx ignores `consistent` for upstreams that resolve by DNS, as on
   ntfy.sh, so there every node change reshuffled most clients.) The ntfy site uses `hash`.
+  Servers can have a `weight` (their share in every strategy) and be a `backup` (only used
+  when no other server is healthy), like nginx's `weight=` and `backup`.
 - **Active health checks** (`GET /` every 5s by default, any 2xx or 3xx is healthy, on every
   address of every upstream; the ntfy site probes `/v1/ready`) with hysteresis: out after 3 failed probes in a row, back after 2 good ones. An
   upstream is up if any of its addresses is; a dead address is skipped. A new upstream, or one
@@ -305,7 +307,7 @@ sites:
     streams:                          # default none; ntfy's subscriptions, minus polls
       match: method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")
     upstream:                         # the servers, and how requests reach them
-      balance: hash                   # default round-robin; also least-conn, random-two
+      balance: hash                   # default round-robin; also least-conn, random-two-least-conn
       timeouts: {read: 3m}            # default 60s; ntfy sends a keepalive every 45s
       health-check: {path: /v1/ready} # default /
       servers:

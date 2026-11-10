@@ -64,6 +64,12 @@ func upstreamNote(u *balancer.UpstreamStatus) string {
 	if u.Removed {
 		notes = append(notes, "removed from config")
 	}
+	if u.Backup {
+		notes = append(notes, "backup")
+	}
+	if u.Weight > 1 {
+		notes = append(notes, fmt.Sprintf("weight %d", u.Weight))
+	}
 	if u.State == balancer.StateDraining && u.DrainDeadline != nil {
 		notes = append(notes, "drained "+until(*u.DrainDeadline))
 	}

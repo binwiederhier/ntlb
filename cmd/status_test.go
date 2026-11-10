@@ -188,6 +188,16 @@ func TestUpstreamNote(t *testing.T) {
 			note:     `^removed from config; drained in 1m(30|29)s \(\d\d:\d\d:\d\d\)$`,
 		},
 		{
+			name:     "weighted backup",
+			upstream: &balancer.UpstreamStatus{State: balancer.StateHealthy, Healthy: true, Weight: 3, Backup: true},
+			note:     `^backup; weight 3$`,
+		},
+		{
+			name:     "weight 1 is no note",
+			upstream: &balancer.UpstreamStatus{State: balancer.StateHealthy, Healthy: true, Weight: 1},
+			note:     `^$`,
+		},
+		{
 			name:     "removed and drained",
 			upstream: &balancer.UpstreamStatus{State: balancer.StateDrained, Healthy: true, Removed: true},
 			note:     `^removed from config$`,

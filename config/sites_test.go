@@ -1,7 +1,6 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -409,18 +408,21 @@ func TestParse_UpstreamRequired(t *testing.T) {
 	require.ErrorContains(t, err, "site a: at least one server is required (upstream.servers)")
 }
 
-func TestParse_UpstreamMovedKeys(t *testing.T) {
-	// The keys that moved into the upstream block say where they are now
-	site := "sites: [{name: a, listen-http: ':80', %s" + testUp + "}]"
-	for config, moved := range map[string]string{
-		"upstream-connect-timeout: 5s\n" + fmt.Sprintf(site, ""):   "sites[].upstream.timeouts.connect",
-		"upstream-read-timeout: 3m\n" + fmt.Sprintf(site, ""):      "sites[].upstream.timeouts.read",
-		"upstream-keepalive: {idle: 1m}\n" + fmt.Sprintf(site, ""): "sites[].upstream.keepalive",
-		fmt.Sprintf(site, "balance: hash, "):                       "sites[].upstream.balance",
-		fmt.Sprintf(site, "health-check: {path: /x}, "):            "sites[].upstream.health-check",
-		"sites: [{name: a, listen-http: ':80', upstreams: []}]":    "sites[].upstream.servers",
+func TestParse_ServerWeightAndBackup(t *testing.T) {
+	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80'], weight: 3}, {name: b, addresses: ['1.2.3.5:80']}, {name: c, addresses: ['1.2.3.6:80'], backup: true}]}}]"))
+	require.NoError(t, err)
+	servers := c.Sites[0].Upstream.Servers
+	require.Equal(t, 3, servers[0].Weight)
+	require.Equal(t, 1, servers[1].Weight) // Default
+	require.False(t, servers[1].Backup)
+	require.True(t, servers[2].Backup)
+	for weight, errMsg := range map[string]string{
+		"-1":   "server a: weight must be between 1 and 1000",
+		"1001": "server a: weight must be between 1 and 1000",
 	} {
-		_, err := Parse([]byte(config))
-		require.ErrorContains(t, err, "moved to "+moved, config)
+		_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80'], weight: " + weight + "}]}}]"))
+		require.ErrorContains(t, err, errMsg, weight)
 	}
+	_, err = Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80'], backup: true}]}}]"))
+	require.ErrorContains(t, err, "site s: at least one server must not be a backup")
 }
