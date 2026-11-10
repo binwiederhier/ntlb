@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -51,7 +50,7 @@ func TestReload(t *testing.T) {
 	s, filename := newTestServer(t, "app1", "app2")
 	good, err := os.ReadFile(filename)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("drain-duration: 1m"), 0600))
 	_, err = run(t, s, "reload")
 	require.ErrorContains(t, err, "at least one site")
 	require.NoError(t, os.WriteFile(filename, good, 0600))
@@ -60,18 +59,18 @@ func TestReload(t *testing.T) {
 	require.Equal(t, "Config reloaded\n", out)
 
 	// Settings a reload cannot apply are reported
-	changed := strings.Replace(string(good), "listen-http: '127.0.0.1:0'", "listen-http: '127.0.0.1:1'", 1)
+	changed := "client-keepalive: {idle: 9m}\n" + string(good)
 	require.NoError(t, os.WriteFile(filename, []byte(changed), 0600))
 	out, err = run(t, s, "reload")
 	require.NoError(t, err)
-	require.Equal(t, "Config reloaded, but these settings need a restart: listen-http\n", out)
+	require.Equal(t, "Config reloaded, but these settings need a restart: client-keepalive\n", out)
 }
 
 func TestCheckConfig(t *testing.T) {
 	_, filename := newTestServer(t, "app1")
 	app := New()
 	require.NoError(t, app.Run(context.Background(), []string{"ntlb", "check-config", "--config", filename}))
-	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("drain-duration: 1m"), 0600))
 	require.ErrorContains(t, app.Run(context.Background(), []string{"ntlb", "check-config", "--config", filename}), "at least one site")
 }
 

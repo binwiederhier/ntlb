@@ -70,7 +70,7 @@ func runApp(args ...string) (string, error) {
 // writeConfig writes a config file with the given listen-admin and returns its path
 func writeConfig(t *testing.T, listenAdmin string) string {
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	conf := "listen-http: '127.0.0.1:0'\nsites: [{name: s, upstreams: [{name: app1, addresses: ['127.0.0.1:1']}]}]\n"
+	conf := "sites: [{name: s, listen-http: '127.0.0.1:0', upstreams: [{name: app1, addresses: ['127.0.0.1:1']}]}]\n"
 	if listenAdmin != "" {
 		conf += "listen-admin: '" + listenAdmin + "'\n"
 	}

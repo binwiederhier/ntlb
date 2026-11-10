@@ -9,7 +9,8 @@ It is built for ntfy, but nothing in it is ntfy-only: which requests are long-li
 (`streams` in the config; default: ntfy's subscriptions), the health check path and the client
 key (`client-key`) are configurable, so it fits any HTTP backend with long-lived streams (SSE, long
 polling, WebSockets). One instance can serve several **sites** (virtual hosts), each with its own
-hosts, certificate, upstreams, health checks and rules, in the main file or one file per site.
+listen addresses, hosts, certificate, upstreams, health checks, rules and access logs, in the main
+file or in included files (`include: [sites.d/*.yml]`, merged like `sshd_config.d`).
 
 It is meant to replace the nginx + lbagent pair on the ntfy.sh load balancers (see
 `ntfy/ansible/roles/nginx` and `roles/lbagent`). What it does and does not take over from that
@@ -42,12 +43,16 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
 - **TCP keepalives** towards clients and upstreams, configurable (idle, interval, count).
 - **Several addresses per upstream** (e.g. one node's ports), each good for ~63k connections from
   one source IP; new streams go to the address with the fewest.
-- **Sites**: a request goes to the site whose `hosts` match its `Host` header (names and
-  `*.name` wildcards), else to the one site without hosts, else gets a 404. HTTPS picks the
-  certificate by SNI. Sites can live in their own files (`include: [sites.d/*.yml]`, like
-  `sshd_config.d`), and adding or removing a file applies on reload. Upstream names are per site.
-- **Reload without cutting streams** (`SIGHUP`, `systemctl reload`, `ntlb reload`): sites,
-  upstreams, health checks, timeouts, drain durations, streams, the client key, rules, bans, the
+- **Sites**: each site lists its listen addresses (`listen-http`, `listen-https`; sites can share
+  them). On each address, a request goes to the site whose `hosts` match its `Host` header (names
+  and `*.name` wildcards), else to the one site there without hosts, else gets a 404. HTTPS picks
+  the certificate among the address's sites by SNI. Included files are merged into the main file
+  (lists appended, anything else set once), so a site can be a drop-in file. A reload applies
+  added, changed and removed sites, also on new or removed listen addresses. Upstream names are
+  per site.
+- **Reload without cutting streams** (`SIGHUP`, `systemctl reload`, `ntlb reload`): sites and
+  their listen addresses (new ones are bound, removed ones stop accepting while their streams run
+  on), upstreams, health checks, timeouts, drain durations, streams, the client key, rules, bans, the
   TLS certificates and the log files. Streams to upstreams that stay are untouched. Listener addresses and client
   keepalives need a restart; a reload says so. A broken config (or certificate, or log path) is
   rejected as a whole.
@@ -62,7 +67,8 @@ setup is listed under [nginx parity](#nginx-parity). Internals: [docs/design.md]
   ban file, for CrowdSec to turn into a firewall ban, like ntfy's own ban feed.
 - **Access logs split by outcome**: several files, each with a response expression (e.g. `status
   < 400` to `access.log`, the rest to `access_error.log`), in nginx's `combined` format plus
-  key=value fields, so existing parsers keep working.
+  key=value fields, so existing parsers keep working. Global, or per site (a site's own replace
+  the global ones for it).
 - **Paced draining**: an upstream removed from the config, an upstream drained by command, and the
   load balancer itself (by command or on `SIGTERM`) close their streams oldest first, evenly spread
   over a duration. A draining load balancer turns away new *subscriptions* (so clients back off or
@@ -179,11 +185,9 @@ option with its default, the expression language, and example rules. The essenti
 
 ```yaml
 # /etc/ntlb/config.yml
-listen-http: ":80"
-listen-https: ":443"                  # certificate by SNI, from the sites
 listen-admin: "127.0.0.1:2590"        # admin API: no auth, keep it local
 listen-metrics: "10.108.0.2:25031"    # only /metrics, for Prometheus
-access-logs:
+access-logs:                          # for sites without their own, and requests no site serves
   - {file: /var/log/nginx/access.log, match: status < 400}
   - {file: /var/log/nginx/access_error.log}
 bans: {file: /var/log/ntlb/ban.log, window: 10m, threshold: 100}
@@ -196,41 +200,46 @@ rules:                                # global: checked first, for every site
     on: response                      # sees status, upstream_status and rule; only strikes
     match: status == 400 && upstream_status == 0
     strike: 1
-include: [sites.d/*.yml]              # one site per file, named after the file
+include: [sites.d/*.yml]              # merged into this file: lists appended, the rest set once
 ```
 
 ```yaml
 # /etc/ntlb/sites.d/ntfy.yml
-hosts: [ntfy.sh, "*.ntfy.sh"]         # leave out: every host no other site serves
-cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
-key-file: /etc/letsencrypt/live/ntfy.sh/privkey.pem
-upstreams:
-  - name: app1                        # the NAME is what clients hash to: keep names equal on all LBs
-    addresses: ["10.108.0.11:25010-25017"]
-  - name: app3
-    addresses: ["10.108.0.13:25010-25017"]
-rules:                                # after the global rules; logged as "ntfy/<name>"
-  - name: https-redirect
-    match: scheme == "http" && method == "GET" && path == "/"
-    action: redirect
-    location: '"https://" + host + uri'
-  - name: spam-topic
-    match: path matches "(^/|,)spam-topic(,|/|$)"   # also inside "/a,b/json"
-    action: block
-    strike: 101                       # over the threshold: banned on the first request
-  - name: limit-exempt
-    match: ipIn(ip, "116.203.112.46", "176.126.240.0/24")
-    action: allow                     # stops checking: these skip the limit below
-  - name: limit                       # no match: every request
-    action: limit                     # per client IP (IPv6 /64), like limit_req nodelay
-    rate: 45/m
-    burst: 1000
-    strike: 1                         # per limited request
+sites:
+  - name: ntfy
+    listen-http: ":80"                # one address or a list; other sites can share them
+    listen-https: ":443"
+    hosts: [ntfy.sh, "*.ntfy.sh"]     # leave out: every host no other site on these addresses serves
+    cert-file: /etc/letsencrypt/live/ntfy.sh/fullchain.pem
+    key-file: /etc/letsencrypt/live/ntfy.sh/privkey.pem
+    # access-logs: [{file: /var/log/ntlb/ntfy.log}]   # instead of the global ones
+    upstreams:
+      - name: app1                    # the NAME is what clients hash to: keep names equal on all LBs
+        addresses: ["10.108.0.11:25010-25017"]
+      - name: app3
+        addresses: ["10.108.0.13:25010-25017"]
+    rules:                            # after the global rules; logged as "ntfy/<name>"
+      - name: https-redirect
+        match: scheme == "http" && method == "GET" && path == "/"
+        action: redirect
+        location: '"https://" + host + uri'
+      - name: spam-topic
+        match: path matches "(^/|,)spam-topic(,|/|$)"   # also inside "/a,b/json"
+        action: block
+        strike: 101                   # over the threshold: banned on the first request
+      - name: limit-exempt
+        match: ipIn(ip, "116.203.112.46", "176.126.240.0/24")
+        action: allow                 # stops checking: these skip the limit below
+      - name: limit                   # no match: every request
+        action: limit                 # per client IP (IPv6 /64), like limit_req nodelay
+        rate: 45/m
+        burst: 1000
+        strike: 1                     # per limited request
 ```
 
-Sites can also be listed in the main file under `sites:` (each with a `name`). A reload applies
-everything except `listen-*` and `client-keepalive`, which need a restart (`ntlb reload` lists
-them if they changed). Unknown keys are an error.
+A reload applies everything except `listen-admin`, `listen-metrics` and `client-keepalive`, which
+need a restart (`ntlb reload` lists them if they changed); an address that switches between
+`listen-http` and `listen-https` needs one too. Unknown keys are an error.
 
 For a backend other than ntfy, set the site's long-lived streams and health path:
 

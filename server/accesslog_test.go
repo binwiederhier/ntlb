@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -97,4 +98,41 @@ func TestAccessLog_ReloadBadPathKeepsOld(t *testing.T) {
 		b, _ := os.ReadFile(logFile)
 		return strings.Contains(string(b), "GET /name?still ")
 	})
+}
+
+func TestAccessLog_PerSite(t *testing.T) {
+	// A site with access logs of its own logs there; the others, and requests no site serves, to
+	// the global ones
+	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
+	dir := t.TempDir()
+	global, siteLog := filepath.Join(dir, "access.log"), filepath.Join(dir, "a.log")
+	filename := filepath.Join(dir, "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
+listen-admin: '127.0.0.1:0'
+access-logs: [{file: %s}]
+sites:
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], access-logs: [{file: %s}], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+`, global, siteLog, a1.addr(), b1.addr())), 0600))
+	s := startTestServer(t, filename)
+	for _, host := range []string{"a.com", "b.com", "c.com"} {
+		req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+"/name?"+host, nil)
+		require.NoError(t, err)
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	waitFor(t, func() bool {
+		b, _ := os.ReadFile(global)
+		return strings.Contains(string(b), "/name?c.com")
+	})
+	a, _ := os.ReadFile(siteLog)
+	g, _ := os.ReadFile(global)
+	require.Contains(t, string(a), "GET /name?a.com ")
+	require.NotContains(t, string(a), "b.com ")
+	require.Contains(t, string(g), "GET /name?b.com ")
+	require.Contains(t, string(g), "GET /name?c.com HTTP/1.1\" 404")
+	require.NotContains(t, string(g), "a.com ")
 }

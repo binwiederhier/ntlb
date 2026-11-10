@@ -85,7 +85,7 @@ func TestStream_HTTP2(t *testing.T) {
 	dir := t.TempDir()
 	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 	writeTestCert(t, certFile, keyFile, "test")
-	s, _ := newTestServer(t, fmt.Sprintf("listen-https: '127.0.0.1:0'\ncert-file: %s\nkey-file: %s", certFile, keyFile), app1)
+	s, _ := newTestServer(t, fmt.Sprintf("listen-https: '127.0.0.3:0'\ncert-file: %s\nkey-file: %s", certFile, keyFile), app1)
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
@@ -506,7 +506,7 @@ func newTLSTestServer(t *testing.T, extra string, upstreams ...*testUpstream) *S
 	dir := t.TempDir()
 	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 	writeTestCert(t, certFile, keyFile, "test")
-	s, _ := newTestServer(t, fmt.Sprintf("listen-https: '127.0.0.1:0'\ncert-file: %s\nkey-file: %s\n%s", certFile, keyFile, extra), upstreams...)
+	s, _ := newTestServer(t, fmt.Sprintf("listen-https: '127.0.0.3:0'\ncert-file: %s\nkey-file: %s\n%s", certFile, keyFile, extra), upstreams...)
 	return s
 }
 

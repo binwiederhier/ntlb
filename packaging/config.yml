@@ -18,11 +18,6 @@
 #                                       the rule that decided the request ("" if none did)
 #   == != < > && || ! in matches (RE2) startsWith endsWith contains + ( ), lower(), trimPrefix(), ...
 
-# Public listeners, shared by all sites. HTTPS serves HTTP/2 and HTTP/1.1, with the certificate of
-# the site whose hosts match the client's SNI (else the first site's).
-listen-http: ":80"
-listen-https: ":443"
-
 # Admin API (reload, drain, status), /metrics and pprof. No auth: keep it on localhost.
 listen-admin: "127.0.0.1:2590"
 
@@ -30,8 +25,9 @@ listen-admin: "127.0.0.1:2590"
 # listen-metrics: "10.108.0.2:25031"
 
 # Access logs, in nginx's "combined" format plus key=value fields. A request goes to the first
-# file whose match (a response expression) is true; one without match takes the rest. A reload
-# reopens the files (logrotate). No access-logs: no access log.
+# file whose match (a response expression) is true; one without match takes the rest. A site with
+# its own access-logs uses those instead; requests that no site serves use these. A reload reopens
+# the files (logrotate). No access-logs: no access log.
 access-logs:
   - file: /var/log/ntlb/access.log
     match: status < 400
@@ -99,10 +95,17 @@ rules:
     match: status == 400 && upstream_status == 0
     strike: 1
 
-# Sites: the hosts a site serves, its certificate, health checks, streams, upstreams and rules.
-# A request goes to the site whose hosts match its Host header (exact names, then the longest
-# "*.name" wildcard), else to the one site without hosts; with none, it gets a 404. Sites can be
-# listed here under "sites:", or one per file in the include globs (relative to this file's
-# directory; the file name is the site name unless it sets one). Adding, changing or removing a
-# site file applies on reload.
+# Included files are merged into this one, as if they were one big file: lists (sites, rules,
+# access-logs) are appended in order (this file first, then each glob's files by name), and any
+# other setting may be set in only one file. Globs are relative to this file's directory; only
+# this file may include. Adding, changing or removing a file applies on reload.
 include: [sites.d/*.yml]
+
+# Sites: each has the addresses it listens on (listen-http, listen-https: one or a list; sites can
+# share them), the hosts it serves there, its certificate, health checks, streams, upstreams,
+# rules and optionally its own access logs. On each listener, a request goes to the site whose
+# hosts match its Host header (exact names, then the longest "*.name" wildcard), else to the one
+# site there without hosts; with none, it gets a 404. HTTPS serves HTTP/2 and HTTP/1.1, with the
+# certificate of the listener's site that matches the client's SNI (else its first site's).
+# New or removed listen addresses need a restart; sites can move between the existing ones on
+# reload. See sites.d/ntfy.yml.

@@ -349,7 +349,7 @@ func TestBalancer_HealthProbesEveryAddress(t *testing.T) {
 	dead := ln.Addr().String()
 	ln.Close()
 	for _, order := range [][]string{{dead, live.addr()}, {live.addr(), dead}} {
-		conf, err := config.Parse([]byte(fmt.Sprintf("listen-http: ':0'\nsites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n", order[0], order[1])))
+		conf, err := config.Parse([]byte(fmt.Sprintf("sites:\n  - name: s\n    listen-http: ':0'\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n", order[0], order[1])))
 		require.NoError(t, err)
 		b := New(conf)
 		b.checkHealth(context.Background())
@@ -365,7 +365,7 @@ func TestBalancer_HealthProbesEveryAddress(t *testing.T) {
 
 	// All addresses down: unhealthy
 	live.ready.Store(false)
-	conf, err := config.Parse([]byte(fmt.Sprintf("listen-http: ':0'\nsites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n", dead, live.addr())))
+	conf, err := config.Parse([]byte(fmt.Sprintf("sites:\n  - name: s\n    listen-http: ':0'\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n", dead, live.addr())))
 	require.NoError(t, err)
 	b := New(conf)
 	b.checkHealth(context.Background())
@@ -386,10 +386,9 @@ func TestBalancer_HealthCheckPerSite(t *testing.T) {
 	t.Cleanup(server.Close)
 	addr := strings.TrimPrefix(server.URL, "http://")
 	conf := mustParse(t, fmt.Sprintf(`
-listen-http: ':0'
 sites:
-  - {name: a, hosts: [a.com], health-check: {interval: 10ms, timeout: 5ms}, upstreams: [{name: x, addresses: [%q]}]}
-  - {name: b, health-check: {path: /other, interval: 1h, timeout: 1s}, upstreams: [{name: x, addresses: [%q]}]}
+  - {name: a, listen-http: ':0', hosts: [a.com], health-check: {interval: 10ms, timeout: 5ms}, upstreams: [{name: x, addresses: [%q]}]}
+  - {name: b, listen-http: ':0', health-check: {path: /other, interval: 1h, timeout: 1s}, upstreams: [{name: x, addresses: [%q]}]}
 `, addr, addr))
 	b := New(conf)
 	b.checkHealth(context.Background())

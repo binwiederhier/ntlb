@@ -202,11 +202,11 @@ func TestProxy_DrainingRefusesNewSubscriptions(t *testing.T) {
 }
 
 func TestIsSubscription(t *testing.T) {
-	ntfy, err := config.Parse([]byte("listen-http: ':80'\nsites: [{name: s, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	ntfy, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
 	require.NoError(t, err)
-	custom, err := config.Parse([]byte("listen-http: ':80'\nsites: [{name: s, streams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	custom, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
 	require.NoError(t, err)
-	disabled, err := config.Parse([]byte("listen-http: ':80'\nsites: [{name: s, streams: {match: 'false'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
+	disabled, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'false'}, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]"))
 	require.NoError(t, err)
 	tests := []struct {
 		name    string
@@ -702,7 +702,7 @@ func TestProxy_DeadAddressTriesSameUpstreamFirst(t *testing.T) {
 	deadAddr := dead.Addr().String()
 	dead.Close()
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	conf := fmt.Sprintf("listen-http: '127.0.0.1:0'\nlisten-admin: '127.0.0.1:0'\nsites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n      - name: app2\n        addresses: [%q]\n", app1.addr(), deadAddr, app2.addr())
+	conf := fmt.Sprintf("listen-admin: '127.0.0.1:0'\nsites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n      - name: app1\n        addresses: [%q, %q]\n      - name: app2\n        addresses: [%q]\n", app1.addr(), deadAddr, app2.addr())
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	s := startTestServer(t, filename) // Health checks probe the first address, which is alive
 	client := clientForRank(t, s, "app1", "app2")
@@ -802,15 +802,16 @@ func TestProxy_Sites(t *testing.T) {
 	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
-listen-http: '127.0.0.1:0'
 listen-admin: '127.0.0.1:0'
 rules: [{name: global, match: 'site == "a" && query == "global"', action: block}]
 sites:
   - name: a
+    listen-http: '127.0.0.1:0'
     hosts: [a.com]
     health-check: {interval: 1h, timeout: 1s}
     upstreams: [{name: app1, addresses: [%q]}]
   - name: b
+    listen-http: '127.0.0.1:0'
     hosts: ["*.b.com"]
     health-check: {interval: 1h, timeout: 1s}
     upstreams: [{name: app1, addresses: [%q]}]
@@ -860,11 +861,10 @@ func TestProxy_SiteStreams(t *testing.T) {
 	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
-listen-http: '127.0.0.1:0'
 listen-admin: '127.0.0.1:0'
 sites:
-  - {name: a, hosts: [a.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
-  - {name: b, streams: {match: 'false'}, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: b, listen-http: '127.0.0.1:0', streams: {match: 'false'}, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
 `, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
 	for _, host := range []string{"a.com", "other.com"} {
@@ -879,4 +879,32 @@ sites:
 		_, metrics := get(t, http.DefaultClient, "http://"+s.AdminAddr()+"/metrics")
 		return strings.Contains(metrics, `ntlb_streams{protocol="http1"} 1`) && s.balancer.Status().Streams == 2
 	})
+}
+
+func TestProxy_SitesPerListener(t *testing.T) {
+	// A site only takes requests on its own listen addresses
+	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
+listen-admin: '127.0.0.1:0'
+sites:
+  - {name: a, listen-http: '127.0.0.1:0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: b, listen-http: '127.0.0.2:0', hosts: [b.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+`, a1.addr(), b1.addr())), 0600))
+	s := startTestServer(t, filename)
+	getHost := func(addr, host string) int {
+		req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/name", nil)
+		require.NoError(t, err)
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	require.Equal(t, http.StatusOK, getHost(s.ListenerAddr("127.0.0.1:0"), "b.com")) // a takes every host here
+	require.Equal(t, int64(1), a1.hits.Load())
+	require.Equal(t, http.StatusOK, getHost(s.ListenerAddr("127.0.0.2:0"), "b.com"))
+	require.Equal(t, int64(1), b1.hits.Load())
+	require.Equal(t, http.StatusNotFound, getHost(s.ListenerAddr("127.0.0.2:0"), "a.com"))
 }

@@ -50,11 +50,9 @@ var (
 
 // Config is the ntlb config file. Field names follow ntfy's server.yml (kebab-case).
 type Config struct {
-	ListenHTTP             string        `yaml:"listen-http"`
-	ListenHTTPS            string        `yaml:"listen-https"`
 	ListenAdmin            string        `yaml:"listen-admin"`   // Admin API, status, metrics, pprof; no auth
 	ListenMetrics          string        `yaml:"listen-metrics"` // Only /metrics, e.g. for Prometheus on a private network
-	AccessLogs             []*AccessLog  `yaml:"access-logs"`
+	AccessLogs             []*AccessLog  `yaml:"access-logs"`    // For sites without their own, and requests no site serves
 	ClientKeepalive        *Keepalive    `yaml:"client-keepalive"`
 	UpstreamKeepalive      *Keepalive    `yaml:"upstream-keepalive"`
 	UpstreamConnectTimeout time.Duration `yaml:"upstream-connect-timeout"`
@@ -64,10 +62,10 @@ type Config struct {
 	ClientKey              *ClientKey    `yaml:"client-key"`
 	Bans                   *Bans         `yaml:"bans"`
 	Rules                  []*Rule       `yaml:"rules"`   // Checked for every request, before its site's rules
-	Include                []string      `yaml:"include"` // Globs of site files, relative to the config file's directory
+	Include                []string      `yaml:"include"` // Globs of files merged into this one, relative to its directory
 	Sites                  []*Site       `yaml:"sites"`
 
-	sites *siteIndex // Sites by host, see SiteFor
+	Listeners []*Listener `yaml:"-"` // The sites' listen addresses, in order of first use
 }
 
 // AccessLog is one access log file. A request is logged to the first file whose match (a response
@@ -167,15 +165,10 @@ func decode(b []byte, v any) error {
 }
 
 // RestartRequired returns the settings that differ between c and other but that a reload cannot
-// apply, because they belong to the listening sockets
+// apply: the admin and metrics listeners, and the keepalives of the sites' listeners. (A reload
+// binds and closes the sites' listen addresses.)
 func (c *Config) RestartRequired(other *Config) []string {
 	var settings []string
-	if c.ListenHTTP != other.ListenHTTP {
-		settings = append(settings, "listen-http")
-	}
-	if c.ListenHTTPS != other.ListenHTTPS {
-		settings = append(settings, "listen-https")
-	}
 	if c.ListenAdmin != other.ListenAdmin {
 		settings = append(settings, "listen-admin")
 	}
@@ -246,9 +239,6 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	if c.ListenHTTP == "" && c.ListenHTTPS == "" {
-		return errors.New("listen-http or listen-https must be set")
-	}
 	if c.UpstreamConnectTimeout <= 0 {
 		return errors.New("upstream-connect-timeout must be positive")
 	} else if c.UpstreamReadTimeout <= 0 {
@@ -268,7 +258,7 @@ func (c *Config) validate() error {
 	if c.ClientKey.IPv6PrefixBits < 1 || c.ClientKey.IPv6PrefixBits > 128 {
 		return errors.New("client-key.ipv6-prefix-bits must be between 1 and 128")
 	}
-	if err := c.validateAccessLogs(); err != nil {
+	if err := validateAccessLogs(c.AccessLogs); err != nil {
 		return err
 	}
 	if err := c.validateBans(); err != nil {
@@ -280,8 +270,8 @@ func (c *Config) validate() error {
 	return c.validateSites()
 }
 
-func (c *Config) validateAccessLogs() error {
-	for i, l := range c.AccessLogs {
+func validateAccessLogs(logs []*AccessLog) error {
+	for i, l := range logs {
 		if l == nil || l.File == "" {
 			return fmt.Errorf("access-logs[%d]: file is required", i)
 		}

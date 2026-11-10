@@ -169,7 +169,7 @@ func TestHandleSignals_Reload(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ["), 0600))
 	reload(signals)
 	require.Equal(t, []string{"app1", "app2", "app3"}, upstreamNames(fetchStatus(t, s)))
-	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'"), 0600)) // No upstreams
+	require.NoError(t, os.WriteFile(filename, []byte("drain-duration: 1m"), 0600)) // No upstreams
 	reload(signals)
 	status := fetchStatus(t, s)
 	require.Equal(t, []string{"app1", "app2", "app3"}, upstreamNames(status))
@@ -328,7 +328,7 @@ func TestServe_Errors(t *testing.T) {
 
 	// Invalid config
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("drain-duration: 1m"), 0600))
 	_, err = runApp("--config", filename, "serve")
 	require.ErrorContains(t, err, "at least one site")
 
@@ -364,7 +364,7 @@ func TestCheckConfig_Errors(t *testing.T) {
 	out, err := runApp("check-config", "-c", filename)
 	require.ErrorContains(t, err, "invalid config")
 	require.Empty(t, out)
-	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'\nsites: [{name: s, upstreams: [{name: a, addresses: ['nope']}]}]"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['nope']}]}]"), 0600))
 	_, err = runApp("check-config", "-c", filename)
 	require.ErrorContains(t, err, `invalid address "nope"`)
 }

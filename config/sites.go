@@ -6,10 +6,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
 
+	"gopkg.in/yaml.v3"
 	"heckel.io/ntlb/match"
 )
 
@@ -18,15 +20,19 @@ var (
 	hostRegex     = regexp.MustCompile(`^(\*\.)?[-_a-z0-9]+(\.[-_a-z0-9]+)*$`)
 )
 
-// Site is one site: the hosts it serves, its certificate, and the upstreams it proxies to. A
-// request goes to the site whose hosts match its Host header (exact names first, then the
-// longest wildcard), or else to the site without hosts, if there is one. Global rules are
-// checked before the site's own.
+// Site is one site: the addresses it listens on, the hosts it serves there, its certificate,
+// access logs and the upstreams it proxies to. On each listener, a request goes to the site
+// whose hosts match its Host header (exact names first, then the longest wildcard), or else to
+// the listener's site without hosts, if there is one. Global rules are checked before the site's
+// own.
 type Site struct {
-	Name        string       `yaml:"name"`         // Defaults to the file name for an included site
-	Hosts       []string     `yaml:"hosts"`        // Names and wildcards ("*.ntfy.sh": any subdomain); none: the default site
-	CertFile    string       `yaml:"cert-file"`    // Picked by SNI among the sites' certificates
+	Name        string       `yaml:"name"`
+	ListenHTTP  ListenAddrs  `yaml:"listen-http"`  // One address or a list; sites may share them
+	ListenHTTPS ListenAddrs  `yaml:"listen-https"` // Needs cert-file and key-file
+	Hosts       []string     `yaml:"hosts"`        // Names and wildcards ("*.ntfy.sh": any subdomain); none: the listeners' default site
+	CertFile    string       `yaml:"cert-file"`    // Picked by SNI among the certificates of a listener's sites
 	KeyFile     string       `yaml:"key-file"`     //
+	AccessLogs  []*AccessLog `yaml:"access-logs"`  // Replace the global access logs for this site
 	HealthCheck *HealthCheck `yaml:"health-check"` // Active health checks against every upstream
 	Streams     *Streams     `yaml:"streams"`      // Which requests are long-lived streams
 	Upstreams   []*Upstream  `yaml:"upstreams"`    // Upstream names are per site
@@ -35,7 +41,19 @@ type Site struct {
 	file string // The file the site came from, for errors; "" for the main file
 }
 
-// siteIndex finds a site by host
+// ListenAddrs are listen addresses, written as one address or a list
+type ListenAddrs []string
+
+// Listener is one public listen address and the sites served on it
+type Listener struct {
+	Addr  string
+	TLS   bool
+	Sites []*Site // In config order
+
+	index *siteIndex
+}
+
+// siteIndex finds a listener's site by host
 type siteIndex struct {
 	exact     map[string]*Site
 	wildcards []*wildcard // Longest suffix first
@@ -47,19 +65,56 @@ type wildcard struct {
 	site   *Site
 }
 
-// SiteFor returns the site for a request's Host header (a port and a trailing dot are ignored),
-// or nil if no site serves it
-func (c *Config) SiteFor(host string) *Site {
+// UnmarshalYAML takes a single address as a list of one
+func (l *ListenAddrs) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		*l = ListenAddrs{node.Value}
+		return nil
+	}
+	var addrs []string
+	if err := node.Decode(&addrs); err != nil {
+		return err
+	}
+	*l = addrs
+	return nil
+}
+
+// SiteFor returns the site for a request to a listener (its configured address) with a Host
+// header (a port and a trailing dot are ignored), or nil if no site there serves it
+func (c *Config) SiteFor(listen, host string) *Site {
+	l := c.Listener(listen)
+	if l == nil {
+		return nil
+	}
 	h := normalizeHost(host)
-	if site, ok := c.sites.exact[h]; ok {
+	if site, ok := l.index.exact[h]; ok {
 		return site
 	}
-	for _, w := range c.sites.wildcards {
+	for _, w := range l.index.wildcards {
 		if strings.HasSuffix(h, w.suffix) {
 			return w.site
 		}
 	}
-	return c.sites.fallback
+	return l.index.fallback
+}
+
+// Listener returns the listener with a configured address, or nil
+func (c *Config) Listener(addr string) *Listener {
+	for _, l := range c.Listeners {
+		if l.Addr == addr {
+			return l
+		}
+	}
+	return nil
+}
+
+// AccessLogsFor returns the access logs for a request to a site: its own, else the global ones.
+// site is nil for a request no site serves.
+func (c *Config) AccessLogsFor(site *Site) []*AccessLog {
+	if site != nil && len(site.AccessLogs) > 0 {
+		return site.AccessLogs
+	}
+	return c.AccessLogs
 }
 
 // UpstreamCount returns the number of upstreams over all sites
@@ -71,8 +126,8 @@ func (c *Config) UpstreamCount() int {
 	return n
 }
 
-// loadIncludes appends the sites of the files that the include globs match, in file name order
-// per glob. A relative glob is relative to dir.
+// loadIncludes merges the files that the include globs match into c, in file name order per glob.
+// A relative glob is relative to dir.
 func (c *Config) loadIncludes(dir string) error {
 	for _, pattern := range c.Include {
 		if !filepath.IsAbs(pattern) {
@@ -83,31 +138,47 @@ func (c *Config) loadIncludes(dir string) error {
 			return fmt.Errorf("invalid include %q: %w", pattern, err)
 		}
 		for _, file := range files {
-			site, err := loadSite(file)
-			if err != nil {
+			if err := c.mergeFile(file); err != nil {
 				return err
 			}
-			c.Sites = append(c.Sites, site)
 		}
 	}
 	return nil
 }
 
-func loadSite(file string) (*Site, error) {
+// mergeFile merges a config file into c: lists are appended, anything else may only be set in
+// one file
+func (c *Config) mergeFile(file string) error {
 	b, err := os.ReadFile(file)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	site := &Site{
-		file: file,
+	part := &Config{}
+	if err := decode(b, part); err != nil {
+		return fmt.Errorf("%s: %w", file, err)
+	} else if part.Include != nil {
+		return fmt.Errorf("%s: include is only allowed in the main file", file)
 	}
-	if err := decode(b, site); err != nil {
-		return nil, fmt.Errorf("%s: %w", file, err)
+	for _, site := range part.Sites {
+		if site != nil {
+			site.file = file
+		}
 	}
-	if site.Name == "" {
-		site.Name = strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+	dst, src := reflect.ValueOf(c).Elem(), reflect.ValueOf(part).Elem()
+	for i := 0; i < dst.NumField(); i++ {
+		field := dst.Type().Field(i)
+		from, to := src.Field(i), dst.Field(i)
+		if field.Tag.Get("yaml") == "-" || from.IsZero() {
+			continue
+		} else if from.Kind() == reflect.Slice {
+			to.Set(reflect.AppendSlice(to, from))
+		} else if !to.IsZero() {
+			return fmt.Errorf("%s: %s is set in another file", file, field.Tag.Get("yaml"))
+		} else {
+			to.Set(from)
+		}
 	}
-	return site, nil
+	return nil
 }
 
 func (s *Site) applyDefaults() {
@@ -124,17 +195,12 @@ func (s *Site) applyDefaults() {
 	applyRuleDefaults(s.Rules)
 }
 
-// validateSites checks every site and indexes them by host
+// validateSites checks every site and indexes the listeners' sites by host
 func (c *Config) validateSites() error {
 	if len(c.Sites) == 0 {
-		return errors.New("at least one site is required (sites or include)")
-	}
-	c.sites = &siteIndex{
-		exact: make(map[string]*Site),
+		return errors.New("at least one site is required (sites, here or in an included file)")
 	}
 	names := make(map[string]bool)
-	suffixes := make(map[string]bool)
-	hasCert := false
 	for i, site := range c.Sites {
 		if site == nil {
 			return fmt.Errorf("sites[%d] is empty", i)
@@ -150,39 +216,22 @@ func (c *Config) validateSites() error {
 			}
 			return fmt.Errorf("site %s: %w", site.Name, err)
 		}
-		hasCert = hasCert || site.CertFile != ""
-
-		// Index the hosts
-		if len(site.Hosts) == 0 {
-			if c.sites.fallback != nil {
-				return fmt.Errorf("sites %s and %s both have no hosts; only one site may take the rest", c.sites.fallback.Name, site.Name)
-			}
-			c.sites.fallback = site
-		}
-		for _, host := range site.Hosts {
-			if suffix, ok := strings.CutPrefix(host, "*"); ok {
-				if suffixes[suffix] {
-					return fmt.Errorf("duplicate host %q", host)
-				}
-				suffixes[suffix] = true
-				c.sites.wildcards = append(c.sites.wildcards, &wildcard{suffix: suffix, site: site})
-			} else if _, ok := c.sites.exact[host]; ok {
-				return fmt.Errorf("duplicate host %q", host)
-			} else {
-				c.sites.exact[host] = site
-			}
+		if err := c.addListeners(site); err != nil {
+			return fmt.Errorf("site %s: %w", site.Name, err)
 		}
 	}
-	slices.SortStableFunc(c.sites.wildcards, func(a, b *wildcard) int {
-		return len(b.suffix) - len(a.suffix)
-	})
-	if c.ListenHTTPS != "" && !hasCert {
-		return errors.New("listen-https requires a site with cert-file and key-file")
+	for _, l := range c.Listeners {
+		if err := l.indexSites(); err != nil {
+			return fmt.Errorf("listener %s: %w", l.Addr, err)
+		}
 	}
 	return nil
 }
 
 func (s *Site) validate(bans *Bans) error {
+	if len(s.ListenHTTP) == 0 && len(s.ListenHTTPS) == 0 {
+		return errors.New("listen-http or listen-https is required")
+	}
 	for i, host := range s.Hosts {
 		h := strings.TrimSuffix(strings.ToLower(host), ".")
 		if !hostRegex.MatchString(h) {
@@ -192,6 +241,11 @@ func (s *Site) validate(bans *Bans) error {
 	}
 	if (s.CertFile == "") != (s.KeyFile == "") {
 		return errors.New("cert-file and key-file go together")
+	} else if len(s.ListenHTTPS) > 0 && s.CertFile == "" {
+		return errors.New("listen-https requires cert-file and key-file")
+	}
+	if err := validateAccessLogs(s.AccessLogs); err != nil {
+		return err
 	}
 	if err := s.HealthCheck.validate(); err != nil {
 		return err
@@ -204,6 +258,75 @@ func (s *Site) validate(bans *Bans) error {
 		return err
 	}
 	return validateRules(s.Rules, s.Name, bans)
+}
+
+// addListeners adds the site to its listeners, creating those not seen yet
+func (c *Config) addListeners(site *Site) error {
+	seen := make(map[string]bool)
+	add := func(addr string, tls bool) error {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return fmt.Errorf("invalid listen address %q, expected host:port or :port", addr)
+		} else if seen[addr] {
+			return fmt.Errorf("duplicate listen address %s", addr)
+		}
+		seen[addr] = true
+		l := c.Listener(addr)
+		if l == nil {
+			l = &Listener{
+				Addr: addr,
+				TLS:  tls,
+			}
+			c.Listeners = append(c.Listeners, l)
+		} else if l.TLS != tls {
+			return fmt.Errorf("%s is listen-http in one site and listen-https in another", addr)
+		}
+		l.Sites = append(l.Sites, site)
+		return nil
+	}
+	for _, addr := range site.ListenHTTP {
+		if err := add(addr, false); err != nil {
+			return err
+		}
+	}
+	for _, addr := range site.ListenHTTPS {
+		if err := add(addr, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexSites indexes the listener's sites by host
+func (l *Listener) indexSites() error {
+	l.index = &siteIndex{
+		exact: make(map[string]*Site),
+	}
+	suffixes := make(map[string]bool)
+	for _, site := range l.Sites {
+		if len(site.Hosts) == 0 {
+			if l.index.fallback != nil {
+				return fmt.Errorf("sites %s and %s both have no hosts; only one site may take the rest", l.index.fallback.Name, site.Name)
+			}
+			l.index.fallback = site
+		}
+		for _, host := range site.Hosts {
+			if suffix, ok := strings.CutPrefix(host, "*"); ok {
+				if suffixes[suffix] {
+					return fmt.Errorf("duplicate host %q", host)
+				}
+				suffixes[suffix] = true
+				l.index.wildcards = append(l.index.wildcards, &wildcard{suffix: suffix, site: site})
+			} else if _, ok := l.index.exact[host]; ok {
+				return fmt.Errorf("duplicate host %q", host)
+			} else {
+				l.index.exact[host] = site
+			}
+		}
+	}
+	slices.SortStableFunc(l.index.wildcards, func(a, b *wildcard) int {
+		return len(b.suffix) - len(a.suffix)
+	})
+	return nil
 }
 
 func validateUpstreams(upstreams []*Upstream) error {

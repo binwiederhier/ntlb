@@ -12,7 +12,7 @@ import (
 	"heckel.io/ntlb/match"
 )
 
-const testBase = "listen-http: ':80'\nsites: [{name: s, upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
+const testBase = "sites: [{name: s, listen-http: ':80', upstreams: [{name: a, addresses: ['1.2.3.4:80']}]}]\n"
 
 func testConfig(t *testing.T, rules string) *config.Config {
 	t.Helper()
@@ -68,7 +68,6 @@ func decidedOn(e *Engine, r *http.Request, site string) string {
 
 func TestEngine_SiteRules(t *testing.T) {
 	conf, err := config.Parse([]byte(`
-listen-http: ':80'
 bans: {file: /tmp/ban.log, threshold: 10}
 rules:
   - {name: abuse, match: 'path == "/abuse"', action: block}
@@ -76,6 +75,7 @@ rules:
   - {name: errors, on: response, match: 'status >= 500', strike: 4}
 sites:
   - name: a
+    listen-http: ':80'
     hosts: [a.com]
     upstreams: [{name: x, addresses: ['1.2.3.4:80']}]
     rules:
@@ -83,6 +83,7 @@ sites:
       - {name: limit, action: limit, rate: 1/h}
       - {name: errors, on: response, match: 'status == 404', strike: 4}
   - name: b
+    listen-http: ':80'
     hosts: [b.com]
     upstreams: [{name: x, addresses: ['1.2.3.4:80']}]
     rules:
@@ -131,12 +132,12 @@ sites:
 }
 
 func TestEngine_SiteLimitKeptOnReload(t *testing.T) {
-	site := "sites: [{name: a, upstreams: [{name: x, addresses: ['1.2.3.4:80']}], rules: [{name: limit, action: limit, rate: 1/h}]}]"
-	conf, err := config.Parse([]byte("listen-http: ':80'\n" + site))
+	site := "sites: [{name: a, listen-http: ':80', upstreams: [{name: x, addresses: ['1.2.3.4:80']}], rules: [{name: limit, action: limit, rate: 1/h}]}]"
+	conf, err := config.Parse([]byte(site))
 	require.NoError(t, err)
 	e := New(conf, nil)
 	require.Equal(t, "", decidedOn(e, request("GET", "/", "192.0.2.1:1"), "a"))
-	conf, err = config.Parse([]byte("listen-http: ':80'\nrules: [{name: limit, action: limit, rate: 1/h}]\n" + site))
+	conf, err = config.Parse([]byte("rules: [{name: limit, action: limit, rate: 1/h}]\n" + site))
 	require.NoError(t, err)
 	e.Update(conf)
 	require.Equal(t, "a/limit", decidedOn(e, request("GET", "/", "192.0.2.1:1"), "a")) // Not the global one's bucket

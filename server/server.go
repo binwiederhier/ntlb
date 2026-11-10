@@ -38,13 +38,25 @@ type Server struct {
 	certs      *certStore
 	files      *logFiles // Access logs and the ban file
 	metrics    *metrics
-	servers    []*http.Server // Proxying servers (HTTP, HTTPS)
+	public     map[string]*publicServer // Proxying servers by listen address
+	retired    []*publicServer          // Removed by a reload: no new connections, open ones run on
 	admin      *http.Server
 	metricsSrv *http.Server // listen-metrics, if set
 	listeners  map[string]net.Listener
+	serving    bool       // Serve started the servers; ones added later start right away
+	errChan    chan error // A listener that failed; Serve shuts down
+	mu         sync.Mutex // Protects public, retired, listeners, serving
 	reloadMu   sync.Mutex // Serializes reloads
 	stopOnce   sync.Once
 	stopped    chan struct{}
+}
+
+// publicServer is the proxying server of one listen address
+type publicServer struct {
+	srv     *http.Server
+	ln      net.Listener
+	tls     bool
+	retired atomic.Bool // Its listener was closed on purpose
 }
 
 // New loads the config file and binds all listeners, so that a bad address fails right away.
@@ -58,21 +70,21 @@ func New(configFile string) (*Server, error) {
 		configFile: configFile,
 		balancer:   balancer.New(conf),
 		files:      newLogFiles(),
+		public:     make(map[string]*publicServer),
 		listeners:  make(map[string]net.Listener),
+		errChan:    make(chan error, 1),
 		stopped:    make(chan struct{}),
 	}
 	s.config.Store(conf)
 	s.rules = rules.New(conf, s.writeBan)
 	s.metrics = newMetrics(s.balancer)
 	s.proxy = newProxy(s.balancer, s.metrics, conf)
-	if conf.ListenHTTPS != "" {
-		certs, err := loadCerts(conf)
-		if err != nil {
-			return nil, err
-		}
-		s.certs = &certStore{}
-		s.certs.store(certs)
+	certs, err := loadCerts(conf)
+	if err != nil {
+		return nil, err
 	}
+	s.certs = &certStore{}
+	s.certs.store(certs)
 	files, err := openLogFiles(logPaths(conf))
 	if err != nil {
 		return nil, err
@@ -90,28 +102,18 @@ func New(configFile string) (*Server, error) {
 // background loops.
 func (s *Server) Serve(ctx context.Context) error {
 	s.balancer.Start(ctx)
-	errChan := make(chan error, len(s.listeners))
-	serve := func(name string, srv *http.Server, ln net.Listener, tls bool) {
-		slog.Info("Listening", "listener", name, "addr", ln.Addr().String())
-		var err error
-		if tls {
-			err = srv.ServeTLS(ln, "", "")
-		} else {
-			err = srv.Serve(ln)
-		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errChan <- fmt.Errorf("%s listener: %w", name, err)
-		}
+	s.mu.Lock()
+	s.serving = true
+	for _, ps := range s.public {
+		go s.servePublic(ps)
 	}
-	for _, srv := range s.servers {
-		go serve(srv.Addr, srv, s.listeners[srv.Addr], srv.TLSConfig != nil)
-	}
-	go serve(listenerAdmin, s.admin, s.listeners[listenerAdmin], false)
+	go s.serve(listenerAdmin, s.admin, s.listeners[listenerAdmin], false)
 	if s.metricsSrv != nil {
-		go serve(listenerMetrics, s.metricsSrv, s.listeners[listenerMetrics], false)
+		go s.serve(listenerMetrics, s.metricsSrv, s.listeners[listenerMetrics], false)
 	}
+	s.mu.Unlock()
 	select {
-	case err := <-errChan:
+	case err := <-s.errChan:
 		s.Shutdown(0)
 		return err
 	case <-s.stopped:
@@ -119,11 +121,48 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// Reload re-reads the config file and the site files it includes, and applies them: sites,
-// upstreams, health checks, timeouts, drain durations, streams, the client key, rules, bans, the
-// certificates and the log files. A broken config (or a certificate or log file that cannot be
-// opened) is rejected as a whole. It returns the changed
-// settings that only a restart applies: listener addresses and client keepalives.
+func (s *Server) servePublic(ps *publicServer) {
+	err := s.serveErr(ps.srv.Addr, ps.srv, ps.ln, ps.tls)
+	if err != nil && !ps.retired.Load() {
+		s.fail(err)
+	}
+}
+
+func (s *Server) serve(name string, srv *http.Server, ln net.Listener, tls bool) {
+	if err := s.serveErr(name, srv, ln, tls); err != nil {
+		s.fail(err)
+	}
+}
+
+// serveErr serves until the server or its listener is closed; it returns an unexpected error
+func (s *Server) serveErr(name string, srv *http.Server, ln net.Listener, tls bool) error {
+	slog.Info("Listening", "listener", name, "addr", ln.Addr().String())
+	var err error
+	if tls {
+		err = srv.ServeTLS(ln, "", "")
+	} else {
+		err = srv.Serve(ln)
+	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("%s listener: %w", name, err)
+	}
+	return nil
+}
+
+// fail hands a listener's error to Serve, which shuts down
+func (s *Server) fail(err error) {
+	select {
+	case s.errChan <- err:
+	default: // Already failing
+	}
+}
+
+// Reload re-reads the config file and the files it includes, and applies them: sites and their
+// listen addresses, upstreams, health checks, timeouts, drain durations, streams, the client
+// key, rules, bans, the certificates and the log files. A new listen address is bound before
+// anything changes; one that no site uses any more stops taking connections, while the ones it
+// has run on. A broken config (or a certificate, log file or address that cannot be opened) is
+// rejected as a whole. It returns the changed settings that only a restart applies.
 func (s *Server) Reload() ([]string, error) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
@@ -138,24 +177,26 @@ func (s *Server) Reload() ([]string, error) {
 	}
 
 	// Open everything that can fail first, then apply
-	var certs []*tls.Certificate
-	if s.certs != nil {
-		if certs, err = loadCerts(conf); err != nil {
-			return nil, err
-		}
-	}
-	files, err := openLogFiles(logPaths(conf))
+	certs, err := loadCerts(conf)
 	if err != nil {
 		return nil, err
 	}
-	if s.certs != nil {
-		s.certs.store(certs)
+	added, err := s.bindAdded(conf)
+	if err != nil {
+		return nil, err
 	}
+	files, err := openLogFiles(logPaths(conf))
+	if err != nil {
+		closePublic(added)
+		return nil, err
+	}
+	s.certs.store(certs)
 	s.files.swap(files)
 	s.rules.Update(conf)
 	s.balancer.Update(conf)
 	s.proxy.update(conf)
 	s.config.Store(conf)
+	s.swapPublic(conf, added)
 	slog.Info("Config reloaded", "sites", len(conf.Sites), "upstreams", conf.UpstreamCount())
 	return restart, nil
 }
@@ -179,11 +220,19 @@ func (s *Server) Shutdown(d time.Duration) {
 			slog.Warn("Requests still open after closing them", "error", err)
 		}
 		var wg sync.WaitGroup
-		others := []*http.Server{s.admin}
+		servers := []*http.Server{s.admin}
 		if s.metricsSrv != nil {
-			others = append(others, s.metricsSrv)
+			servers = append(servers, s.metricsSrv)
 		}
-		for _, srv := range append(s.servers, others...) {
+		s.mu.Lock()
+		for _, ps := range s.public {
+			servers = append(servers, ps.srv)
+		}
+		for _, ps := range s.retired {
+			servers = append(servers, ps.srv)
+		}
+		s.mu.Unlock()
+		for _, srv := range servers {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -201,22 +250,26 @@ func (s *Server) Shutdown(d time.Duration) {
 // observe wraps the proxy to see every request's outcome, for the access logs, the response rules
 // and the metrics, and answers the requests that a rule decides itself. The outcome is recorded
 // by a finisher, when the request ends, which for a detached stream is after the handler returned.
-func (s *Server) observe(next http.Handler) http.Handler {
+// listen is the listener's configured address, which decides the sites the request can go to.
+func (s *Server) observe(listen string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		conf := s.config.Load()
 		env := match.NewEnv(r)
-		if site := conf.SiteFor(r.Host); site != nil {
+		site := conf.SiteFor(listen, r.Host)
+		if site != nil {
 			env.Site = site.Name
 		}
 		respEnv := match.NewResponseEnv(env) // Strings only, so the request can be let go
+		accessLogs := conf.AccessLogsFor(site)
 		var entry *accessLogEntry
-		if len(conf.AccessLogs) > 0 {
+		if len(accessLogs) > 0 {
 			entry = newAccessLogEntry(r, start)
 		}
 		pr := &proxyRequest{
-			env:  env,
-			site: env.Site,
+			env:      env,
+			site:     env.Site,
+			siteConf: site,
 		}
 		sw := &statusWriter{ResponseWriter: w}
 		rule := s.rules.Check(r, env)
@@ -228,7 +281,7 @@ func (s *Server) observe(next http.Handler) http.Handler {
 			status := pr.finalStatus() // Must not use sw: it references the server's connection state
 			respEnv.Status, respEnv.UpstreamStatus, respEnv.Rule = status, pr.upstreamStatus, pr.rule
 			if entry != nil {
-				s.writeAccessLog(entry, pr, respEnv)
+				s.writeAccessLog(accessLogs, entry, pr, respEnv)
 			}
 			s.rules.CheckResponse(respEnv)
 			s.metrics.observe(pr, status, start)
@@ -250,8 +303,8 @@ func (s *Server) observe(next http.Handler) http.Handler {
 }
 
 // writeAccessLog writes the request to the first access log whose match is true
-func (s *Server) writeAccessLog(entry *accessLogEntry, pr *proxyRequest, env *match.ResponseEnv) {
-	for _, l := range s.config.Load().AccessLogs {
+func (s *Server) writeAccessLog(logs []*config.AccessLog, entry *accessLogEntry, pr *proxyRequest, env *match.ResponseEnv) {
+	for _, l := range logs {
 		if l.Program == nil || l.Program.Match(env) {
 			if log := s.files.get(l.File); log != nil {
 				log.write(entry, pr, env.Status)
@@ -271,14 +324,19 @@ func (s *Server) writeBan(line string) {
 	}
 }
 
-// HTTPAddr returns the address the HTTP listener is bound to, or "" if there is none
+// HTTPAddr returns the address the first HTTP listener is bound to, or "" if there is none
 func (s *Server) HTTPAddr() string {
-	return s.listenerAddr(listenerHTTP)
+	return s.firstListenerAddr(false)
 }
 
-// HTTPSAddr returns the address the HTTPS listener is bound to, or "" if there is none
+// HTTPSAddr returns the address the first HTTPS listener is bound to, or "" if there is none
 func (s *Server) HTTPSAddr() string {
-	return s.listenerAddr(listenerHTTPS)
+	return s.firstListenerAddr(true)
+}
+
+// ListenerAddr returns the address a listener (by its configured address) is bound to, or ""
+func (s *Server) ListenerAddr(listen string) string {
+	return s.listenerAddr(listen)
 }
 
 // MetricsAddr returns the address the metrics listener is bound to, or "" if there is none
@@ -291,44 +349,21 @@ func (s *Server) AdminAddr() string {
 	return s.listenerAddr(listenerAdmin)
 }
 
-// Listener names, also the http.Server.Addr of each server
+// Names of the admin and metrics listeners; the public ones are named by their address
 const (
-	listenerHTTP    = "http"
-	listenerHTTPS   = "https"
 	listenerAdmin   = "admin"
 	listenerMetrics = "metrics"
 )
 
 func (s *Server) listen(conf *config.Config) error {
-	// Proxying listeners, with the configured TCP keepalives towards the clients
-	ka := conf.ClientKeepalive.KeepAliveConfig()
-	lc := &net.ListenConfig{
-		KeepAliveConfig: ka,
+	// Public listeners, one per address of the sites
+	public, err := s.bindPublic(conf, conf.Listeners)
+	if err != nil {
+		return err
 	}
-	if !ka.Enable {
-		lc.KeepAlive = -1
-	}
-	handler := s.observe(s.proxy)
-	if conf.ListenHTTP != "" {
-		ln, err := lc.Listen(context.Background(), "tcp", conf.ListenHTTP)
-		if err != nil {
-			return err
-		}
-		s.listeners[listenerHTTP] = ln
-		s.servers = append(s.servers, newHTTPServer(listenerHTTP, handler))
-	}
-	if conf.ListenHTTPS != "" {
-		ln, err := lc.Listen(context.Background(), "tcp", conf.ListenHTTPS)
-		if err != nil {
-			return err
-		}
-		s.listeners[listenerHTTPS] = ln
-		srv := newHTTPServer(listenerHTTPS, handler)
-		srv.TLSConfig = &tls.Config{
-			MinVersion:     tls.VersionTLS12,
-			GetCertificate: s.certs.get,
-		}
-		s.servers = append(s.servers, srv)
+	for addr, ps := range public {
+		s.public[addr] = ps
+		s.listeners[addr] = ps.ln
 	}
 
 	// Admin listener
@@ -351,6 +386,95 @@ func (s *Server) listen(conf *config.Config) error {
 	return nil
 }
 
+// bindPublic binds the proxying servers of listeners, with the configured TCP keepalives towards
+// the clients; on an error it closes the ones it bound
+func (s *Server) bindPublic(conf *config.Config, listeners []*config.Listener) (map[string]*publicServer, error) {
+	ka := conf.ClientKeepalive.KeepAliveConfig()
+	lc := &net.ListenConfig{
+		KeepAliveConfig: ka,
+	}
+	if !ka.Enable {
+		lc.KeepAlive = -1
+	}
+	public := make(map[string]*publicServer)
+	for _, l := range listeners {
+		ln, err := lc.Listen(context.Background(), "tcp", l.Addr)
+		if err != nil {
+			closePublic(public)
+			return nil, err
+		}
+		srv := newHTTPServer(l.Addr, s.observe(l.Addr, s.proxy))
+		if l.TLS {
+			srv.TLSConfig = &tls.Config{
+				MinVersion:     tls.VersionTLS12,
+				GetCertificate: s.certs.getter(l.Addr),
+			}
+		}
+		public[l.Addr] = &publicServer{
+			srv: srv,
+			ln:  ln,
+			tls: l.TLS,
+		}
+	}
+	return public, nil
+}
+
+// bindAdded binds the listen addresses that conf adds. An address that switches between HTTP and
+// HTTPS cannot be bound twice, so it needs a restart.
+func (s *Server) bindAdded(conf *config.Config) (map[string]*publicServer, error) {
+	s.mu.Lock()
+	var added []*config.Listener
+	for _, l := range conf.Listeners {
+		if ps, ok := s.public[l.Addr]; !ok {
+			added = append(added, l)
+		} else if ps.tls != l.TLS {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("listener %s switches between listen-http and listen-https: restart ntlb for that", l.Addr)
+		}
+	}
+	s.mu.Unlock()
+	return s.bindPublic(conf, added)
+}
+
+// swapPublic starts the added servers and retires the ones conf no longer has: their listener is
+// closed, their connections run on until they end or Shutdown
+func (s *Server) swapPublic(conf *config.Config, added map[string]*publicServer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for addr, ps := range added {
+		s.public[addr] = ps
+		s.listeners[addr] = ps.ln
+		if s.serving {
+			go s.servePublic(ps)
+		}
+	}
+	for addr, ps := range s.public {
+		if conf.Listener(addr) == nil {
+			slog.Info("Listener removed, closing it", "listener", addr)
+			ps.retired.Store(true)
+			ps.ln.Close()
+			s.retired = append(s.retired, ps)
+			delete(s.public, addr)
+			delete(s.listeners, addr)
+		}
+	}
+}
+
+func (s *Server) firstListenerAddr(tls bool) string {
+	for _, l := range s.config.Load().Listeners {
+		if l.TLS == tls {
+			return s.listenerAddr(l.Addr)
+		}
+	}
+	return ""
+}
+
+func closePublic(public map[string]*publicServer) {
+	for _, ps := range public {
+		ps.ln.Close()
+	}
+}
+
 func (s *Server) closeListeners() {
 	for _, ln := range s.listeners {
 		ln.Close()
@@ -358,6 +482,8 @@ func (s *Server) closeListeners() {
 }
 
 func (s *Server) listenerAddr(name string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if ln, ok := s.listeners[name]; ok {
 		return ln.Addr().String()
 	}

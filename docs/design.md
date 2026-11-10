@@ -172,15 +172,28 @@ request: the outermost handler (`finishUnlessDetached`), or the stream goroutine
 not reference the `ResponseWriter` or the request (the access log copies what it needs into an
 `accessLogEntry` upfront), or they pin the very server state the detach frees.
 
-## Sites (`config/sites.go`, `server/certs.go`)
+## Sites (`config/sites.go`, `server/certs.go`, `server/server.go`)
 
-A site is a set of hosts with its own certificate, health check, streams, upstreams and rules.
-`Config.SiteFor` maps a `Host` header (lowercased, port and trailing dot stripped) to a site:
-exact names, then the longest `*.name` wildcard suffix (any depth, like nginx), then the one site
-without hosts. No site means 404 (global rules still run first, so abuse is still blocked and
-struck). Sites come from `sites:` in the main file and from the `include` globs (relative to the
-main file, sorted per glob, one site per file, named after the file unless it sets `name`), so a
-deploy can drop a file into `sites.d/` and reload.
+A site is a set of listen addresses and hosts with its own certificate, access logs, health
+check, streams, upstreams and rules. `Config.Listeners` collects the sites' addresses (in order
+of first use; an address is either HTTP or HTTPS) and indexes each one's sites by host.
+`Config.SiteFor(listen, host)` maps a request's listener and `Host` header (lowercased, port and
+trailing dot stripped) to a site: exact names, then the longest `*.name` wildcard suffix (any
+depth, like nginx), then the listener's one site without hosts. No site means 404 (global rules
+still run first, so abuse is still blocked and struck).
+
+`include` globs (relative to the main file, sorted per glob, only in the main file) name files
+that are merged into the main file as if it were one: slices (sites, rules, access logs,
+include) are appended, any other field may be set in one file only (`mergeFile`, by reflection
+over `Config`). So a deploy can drop a file with a `sites:` list (or global rules) into
+`sites.d/` and reload.
+
+The server runs one `http.Server` per listen address, its handler bound to that address
+(`observe(listen, ...)`). A reload binds the addresses the new config adds before anything else
+changes (a failure rejects the reload), starts them after the config swap, and retires the ones
+no site uses any more: their listener closes, so no new connections, but their open connections
+run on (a new request on one gets a 404) until they end or `Shutdown`. An address cannot switch
+between HTTP and HTTPS without a restart, since it cannot be bound twice.
 
 There is still one `Balancer`: upstreams are keyed by `site/name`, `Pick(site, key)` ranks only
 the site's upstreams, and it hashes the bare names, so a site's name does not move clients. Drains
@@ -189,14 +202,15 @@ The load balancer drain, sessions and readiness stay global. Each upstream carri
 health check; the health loop wakes at the shortest interval and probes the upstreams whose
 interval (minus half a round) has passed.
 
-The HTTPS listener has one certificate store for all sites: on each handshake it picks the first
-certificate that `ClientHelloInfo.SupportsCertificate` accepts for the SNI name (SANs, not CN),
-else the first site's, like nginx's default server. A reload loads all of them first, so an
-unreadable one rejects the reload.
+Each HTTPS listener picks, on each handshake, the first certificate of its sites that
+`ClientHelloInfo.SupportsCertificate` accepts for the SNI name (SANs, not CN), else its first
+site's, like nginx's default server. A reload loads all of them first, so an unreadable one
+rejects the reload.
 
 Rules have an ID: the name for global rules, `site/name` for a site's, used for limit buckets,
 access logs (`rule=`), metrics and ban lines. `site` is an expression field (request and
-response), so global rules and access logs can tell sites apart.
+response), so global rules and access logs can tell sites apart. A site's `access-logs`, if any,
+replace the global ones for its requests (`Config.AccessLogsFor`).
 
 ## Rules and bans (`rules/`, `match/`, `config/rules.go`, `server/rules.go`)
 

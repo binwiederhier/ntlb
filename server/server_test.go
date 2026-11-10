@@ -224,7 +224,7 @@ func (u *testUpstream) addr() string {
 }
 
 // siteKeys are the settings writeConfig moves from extra into the site
-var siteKeys = []string{"streams:", "cert-file:", "key-file:"}
+var siteKeys = []string{"streams:", "cert-file:", "key-file:", "listen-https:"}
 
 func isSiteSetting(line string) bool {
 	for _, key := range siteKeys {
@@ -243,7 +243,7 @@ func upstreamsYAML(upstreams ...*testUpstream) string {
 // siteYAML is a site "s" with the settings (one per line) and the upstreams
 func siteYAML(settings []string, upstreams ...*testUpstream) string {
 	var b strings.Builder
-	b.WriteString("sites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    health-check: {interval: 1h, timeout: 1s}\n")
 	for _, setting := range settings {
 		b.WriteString("    " + setting + "\n")
 	}
@@ -265,7 +265,7 @@ func writeConfig(t *testing.T, filename, extra string, upstreams ...*testUpstrea
 			global = append(global, line)
 		}
 	}
-	conf := "listen-http: '127.0.0.1:0'\nlisten-admin: '127.0.0.1:0'\n" + strings.Join(global, "\n") + "\n" + siteYAML(site, upstreams...)
+	conf := "listen-admin: '127.0.0.1:0'\n" + strings.Join(global, "\n") + "\n" + siteYAML(site, upstreams...)
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 }
 
@@ -422,7 +422,7 @@ func TestServer_ReloadRemovesAndAddsUpstreams(t *testing.T) {
 	})
 
 	// A broken config is rejected and changes nothing
-	require.NoError(t, os.WriteFile(filename, []byte("listen-http: ':80'\nsites: [{name: s, upstreams: []}]"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstreams: []}]"), 0600))
 	_, err := s.Reload()
 	require.Error(t, err)
 	require.Len(t, s.balancer.Status().Upstreams, 2)
@@ -457,7 +457,7 @@ func TestServer_HTTPSAndCertReload(t *testing.T) {
 	dir := t.TempDir()
 	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 	writeTestCert(t, certFile, keyFile, "first")
-	s, _ := newTestServer(t, fmt.Sprintf("listen-https: '127.0.0.1:0'\ncert-file: %s\nkey-file: %s", certFile, keyFile), app1)
+	s, _ := newTestServer(t, fmt.Sprintf("listen-https: '127.0.0.3:0'\ncert-file: %s\nkey-file: %s", certFile, keyFile), app1)
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
@@ -529,14 +529,68 @@ func requireReload(t *testing.T, s *Server) {
 func TestServer_ReloadReportsRestartRequired(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	s, filename := newTestServer(t, "", app1)
-	conf := "listen-http: '127.0.0.1:1'\nlisten-admin: '127.0.0.1:0'\nclient-keepalive: {idle: 7m}\ndrain-duration: 9m\n" + upstreamsYAML(app1)
+	conf := "listen-admin: '127.0.0.1:0'\nclient-keepalive: {idle: 7m}\ndrain-duration: 9m\n" + upstreamsYAML(app1)
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	restart, err := s.Reload()
 	require.NoError(t, err)
-	require.Equal(t, []string{"listen-http", "client-keepalive"}, restart)
+	require.Equal(t, []string{"client-keepalive"}, restart)
 	require.Equal(t, 9*time.Minute, s.config.Load().DrainDuration) // The rest is applied
 	status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
-	require.Equal(t, http.StatusOK, status) // Still on the old listener
+	require.Equal(t, http.StatusOK, status)
+}
+
+func TestServer_ReloadOpensAndClosesListeners(t *testing.T) {
+	// A site on a new address is served right after the reload; an address no site uses any more
+	// stops taking connections, while the streams on it keep running
+	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "config.yml")
+	siteA := fmt.Sprintf("  - {name: a, listen-http: '127.0.0.1:0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}\n", a1.addr())
+	siteB := fmt.Sprintf("  - {name: b, listen-http: '127.0.0.2:0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}\n", b1.addr())
+	write := func(sites string) {
+		require.NoError(t, os.WriteFile(filename, []byte("listen-admin: '127.0.0.1:0'\nsites:\n"+sites), 0600))
+	}
+	write(siteA)
+	s := startTestServer(t, filename)
+	require.Empty(t, s.ListenerAddr("127.0.0.2:0"))
+
+	// Added
+	write(siteA + siteB)
+	requireReload(t, s)
+	addrB := s.ListenerAddr("127.0.0.2:0")
+	require.NotEmpty(t, addrB)
+	status, _ := get(t, http.DefaultClient, "http://"+addrB+"/name")
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, int64(1), b1.hits.Load())
+	stream, closeStream := openStream(t, http.DefaultClient, "http://"+addrB+"/bcast/json")
+	defer closeStream()
+
+	// Removed: no new connections, the open stream stays
+	write(siteA)
+	requireReload(t, s)
+	require.Empty(t, s.ListenerAddr("127.0.0.2:0"))
+	_, err := http.Get("http://" + addrB + "/name")
+	require.Error(t, err)
+	select {
+	case <-stream.closed:
+		t.Fatal("stream on the removed listener was cut")
+	case <-time.After(300 * time.Millisecond):
+	}
+	require.Equal(t, 1, s.balancer.Status().Streams)
+	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
+	require.Equal(t, http.StatusOK, status)
+
+	// An address cannot switch between HTTP and HTTPS without a restart
+	writeTestCert(t, filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), "a.com")
+	write(fmt.Sprintf("  - {name: a, listen-https: '127.0.0.1:0', cert-file: %s, key-file: %s, upstreams: [{name: app1, addresses: [%q]}]}\n", filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), a1.addr()))
+	_, err = s.Reload()
+	require.ErrorContains(t, err, "restart")
+
+	// A new address that cannot be bound rejects the reload
+	write(siteA + "  - {name: c, listen-http: '192.0.2.1:80', upstreams: [{name: x, addresses: ['127.0.0.1:1']}]}\n")
+	_, err = s.Reload()
+	require.Error(t, err)
+	require.Len(t, s.config.Load().Sites, 1)
 }
 
 func TestServer_ReloadAppliesStreamsAndHash(t *testing.T) {
@@ -642,7 +696,7 @@ func TestServer_NewFailureLeaksNothing(t *testing.T) {
 	require.NoError(t, err)
 	defer busy.Close()
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	conf := fmt.Sprintf("listen-http: '127.0.0.1:0'\nlisten-admin: %q\naccess-logs: [{file: %s}]\n%s", busy.Addr().String(), filepath.Join(t.TempDir(), "access.log"), upstreamsYAML(app1))
+	conf := fmt.Sprintf("listen-admin: %q\naccess-logs: [{file: %s}]\n%s", busy.Addr().String(), filepath.Join(t.TempDir(), "access.log"), upstreamsYAML(app1))
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	before := runtime.NumGoroutine()
 	for i := 0; i < 10; i++ {
@@ -661,10 +715,9 @@ func TestServer_ReloadAddsSiteFile(t *testing.T) {
 	require.NoError(t, os.Mkdir(filepath.Join(dir, "sites.d"), 0700))
 	filename := filepath.Join(dir, "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
-listen-http: '127.0.0.1:0'
 listen-admin: '127.0.0.1:0'
 include: [sites.d/*.yml]
-sites: [{name: a, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}]
+sites: [{name: a, listen-http: '127.0.0.1:0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}]
 `, a1.addr())), 0600))
 	s := startTestServer(t, filename)
 	getHost := func(host string) {
@@ -680,7 +733,7 @@ sites: [{name: a, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: 
 	getHost("b.com")
 	require.Equal(t, int64(1), a1.hits.Load())
 
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("hosts: [b.com]\nhealth-check: {interval: 1h, timeout: 1s}\nupstreams: [{name: app1, addresses: [%q]}]\n", b1.addr())), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}]\n", b1.addr())), 0600))
 	requireReload(t, s)
 	getHost("b.com")
 	require.Equal(t, int64(1), b1.hits.Load())

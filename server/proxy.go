@@ -62,10 +62,11 @@ type proxyRequest struct {
 	kind           string // kindRequest, kindStream or kindWebSocket
 	session        *balancer.Session
 	cancel         context.CancelCauseFunc
-	env            *match.Env // The request as expressions see it, if Server.observe made one
-	site           string     // The site serving the request, "" if none does
-	rule           string     // The rule that decided the request, if any
-	upstream       string     // Set once an upstream answered
+	env            *match.Env   // The request as expressions see it, if Server.observe made one
+	site           string       // The site serving the request, "" if none does
+	siteConf       *config.Site // Set by Server.observe; dropped once the request is under way
+	rule           string       // The rule that decided the request, if any
+	upstream       string       // Set once an upstream answered
 	upstreamStatus int
 	status         int   // Set by the stream path, which may bypass the ResponseWriter
 	bytes          int64 // Body bytes written by the stream path
@@ -328,7 +329,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if env == nil {
 		env = match.NewEnv(r)
 	}
-	site := conf.SiteFor(r.Host)
+	site := pr.siteConf
+	pr.siteConf = nil // A detached stream must not keep an old config alive
 	if site == nil {
 		pr.env, pr.kind = nil, kindRequest
 		http.Error(w, "no site for this host", http.StatusNotFound)

@@ -56,7 +56,7 @@ func (u *testUpstream) addr() string {
 
 func newTestConfig(upstreams ...*testUpstream) *config.Config {
 	var b strings.Builder
-	b.WriteString("listen-http: ':0'\nsites:\n  - name: s\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: ':0'\n    health-check: {interval: 1h, timeout: 1s}\n    upstreams:\n")
 	for _, u := range upstreams {
 		fmt.Fprintf(&b, "      - name: %s\n        addresses: [%q]\n", u.name, u.addr())
 	}
@@ -313,7 +313,7 @@ func TestBalancer_WaitIdle(t *testing.T) {
 }
 
 func TestBalancer_NextAddressLeastLoaded(t *testing.T) {
-	b := New(mustParse(t, "listen-http: ':0'\nsites: [{name: s, upstreams: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}]"))
 	u := b.upstream("app1")
 	s1 := b.NewSession(func(error) {})
 	a1 := u.NextAddress()
@@ -714,7 +714,7 @@ func TestBalancer_UpdateRemovesUpstreamWithCommandDrain(t *testing.T) {
 }
 
 func TestBalancer_UpdateChangesAddressesWithStreams(t *testing.T) {
-	b := New(mustParse(t, "listen-http: ':0'\nsites: [{name: s, upstreams: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}]"))
 	u := b.upstream("app1")
 	attach := func() *Session {
 		s := b.NewSession(func(error) {})
@@ -726,7 +726,7 @@ func TestBalancer_UpdateChangesAddressesWithStreams(t *testing.T) {
 	require.Equal(t, 1, u.addrStreams["10.0.0.1:2"])
 
 	// :1 goes away, :3 is new: new streams go to the empty :3, the existing ones stay counted
-	b.Update(mustParse(t, "listen-http: ':0'\nsites: [{name: s, health-check: {timeout: 50ms}, upstreams: [{name: app1, addresses: ['10.0.0.1:2', '10.0.0.1:3']}]}]"))
+	b.Update(mustParse(t, "sites: [{name: s, listen-http: ':0', health-check: {timeout: 50ms}, upstreams: [{name: app1, addresses: ['10.0.0.1:2', '10.0.0.1:3']}]}]"))
 	require.Same(t, u, b.upstream("app1"))
 	require.Equal(t, []string{"10.0.0.1:2", "10.0.0.1:3"}, b.Status().Upstreams[0].Addresses)
 	require.Equal(t, 3, b.Status().Upstreams[0].Streams)
@@ -967,7 +967,7 @@ func TestBalancer_ConcurrencyStress(t *testing.T) {
 func TestBalancer_ReserveSpreadsInFlightAttempts(t *testing.T) {
 	// Attempts still connecting count, so a reconnect storm spreads over the addresses instead
 	// of piling onto the one with the fewest attached streams
-	b := New(mustParse(t, "listen-http: ':0'\nsites: [{name: s, upstreams: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2', '10.0.0.1:3']}]}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2', '10.0.0.1:3']}]}]"))
 	u := b.upstream("app1")
 	var sessions []*Session
 	counts := make(map[string]int)
@@ -999,7 +999,7 @@ func TestBalancer_ReserveSpreadsInFlightAttempts(t *testing.T) {
 
 func TestBalancer_ReserveRetryOnAnotherUpstream(t *testing.T) {
 	// A retry on the next upstream releases the reservation on the first one
-	b := New(mustParse(t, "listen-http: ':0'\nsites: [{name: s, upstreams: [{name: app1, addresses: ['10.0.0.1:1']}, {name: app2, addresses: ['10.0.0.2:1']}]}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: [{name: app1, addresses: ['10.0.0.1:1']}, {name: app2, addresses: ['10.0.0.2:1']}]}]"))
 	u1, u2 := b.upstream("app1"), b.upstream("app2")
 	s := b.NewSession(func(error) {})
 	b.Reserve(s, u1)
@@ -1024,7 +1024,7 @@ func TestBalancer_ReserveRetryOnAnotherUpstream(t *testing.T) {
 func TestBalancer_AddressBackoff(t *testing.T) {
 	// A failed address is skipped for a while, even with zero streams, since the health check
 	// only probes the first address
-	b := New(mustParse(t, "listen-http: ':0'\nsites: [{name: s, upstreams: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}]"))
 	u := b.upstream("app1")
 	for i := 0; i < 3; i++ {
 		s := b.NewSession(func(error) {})
@@ -1119,10 +1119,9 @@ func TestBalancer_Sites(t *testing.T) {
 	// Two sites with an upstream of the same name: each site picks its own
 	a1, b1, b2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
 	b := New(mustParse(t, fmt.Sprintf(`
-listen-http: ':0'
 sites:
-  - {name: a, hosts: [a.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
-  - {name: b, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}, {name: app2, addresses: [%q]}]}
+  - {name: a, listen-http: ':0', hosts: [a.com], health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}
+  - {name: b, listen-http: ':0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}, {name: app2, addresses: [%q]}]}
 `, a1.addr(), b1.addr(), b2.addr())))
 	b.checkHealth(context.Background())
 	key := []byte{192, 0, 2, 1}
@@ -1150,7 +1149,7 @@ sites:
 	require.Equal(t, []string{b1.addr()}, addressesOf(b.Pick("b", key)))
 
 	// A site that leaves the config drains its upstreams; the other site's app1 is untouched
-	conf := mustParse(t, fmt.Sprintf("listen-http: ':0'\nsites: [{name: a, health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}]", a1.addr()))
+	conf := mustParse(t, fmt.Sprintf("sites: [{name: a, listen-http: ':0', health-check: {interval: 1h, timeout: 1s}, upstreams: [{name: app1, addresses: [%q]}]}]", a1.addr()))
 	b.Update(conf)
 	status = b.Status()
 	require.Len(t, status.Upstreams, 3)
