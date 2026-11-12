@@ -106,8 +106,9 @@ func (e *Engine) Update(conf *config.Config) {
 	e.state.Store(next)
 }
 
-// Check returns the rule that decides the request, or nil if it is to be proxied: the global
-// rules first, then those of the request's site (env.Site)
+// Check returns the rule that decides the request, or nil if it is to be proxied to the site's
+// default upstream: the global rules first, then those of the request's site (env.Site). A proxy rule
+// decides that the request is proxied to the upstream it names.
 func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 	s := e.state.Load()
 	var key string
@@ -121,7 +122,7 @@ func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 		case config.ActionBlock:
 			e.strike(s.bansFor(env.Site), remoteAddr(r), rl.conf)
 			return rl.conf
-		case config.ActionRedirect, config.ActionStatic:
+		case config.ActionRedirect, config.ActionStatic, config.ActionProxy:
 			return rl.conf
 		case config.ActionLimit:
 			if key == "" {

@@ -202,11 +202,11 @@ func TestProxy_DrainingRefusesNewSubscriptions(t *testing.T) {
 }
 
 func TestIsSubscription(t *testing.T) {
-	ntfy, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: '" + testStreamsMatch + "'}, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
+	ntfy, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: '" + testStreamsMatch + "'}, upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]"))
 	require.NoError(t, err)
-	custom, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
+	custom, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'method == \"GET\" && path == \"/events\" && !flag(\"once\")'}, upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]"))
 	require.NoError(t, err)
-	disabled, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'false'}, upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
+	disabled, err := config.Parse([]byte("sites: [{name: s, listen-http: ':80', streams: {match: 'false'}, upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]"))
 	require.NoError(t, err)
 	tests := []struct {
 		name    string
@@ -353,8 +353,8 @@ func TestProxy_ReadTimeoutPerSite(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], upstream: {timeouts: {read: 200ms}, `+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
-  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], upstreams: {default: {timeouts: {read: 200ms}, `+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
+  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
 `, app1.addr(), app1.addr())), 0600))
 	s := startTestServer(t, filename)
 	getHost := func(host string) int {
@@ -630,7 +630,7 @@ func TestProxy_ReloadUnderLoad(t *testing.T) {
 func clientForRank(t *testing.T, s *Server, names ...string) *http.Client {
 	for i := 1; i < 250; i++ {
 		ip := fmt.Sprintf("127.0.2.%d", i)
-		candidates := s.balancer.Pick("s", clientKey(ip+":1", s.config.Load().ClientKey))
+		candidates := s.balancer.Pick("s", "", clientKey(ip+":1", s.config.Load().ClientKey))
 		ok := len(candidates) >= len(names)
 		for j := 0; ok && j < len(names); j++ {
 			ok = candidates[j].Name() == names[j]
@@ -754,7 +754,7 @@ func TestProxy_DeadAddressTriesSameUpstreamFirst(t *testing.T) {
 	deadAddr := dead.Addr().String()
 	dead.Close()
 	filename := filepath.Join(t.TempDir(), "config.yml")
-	conf := fmt.Sprintf("listen-admin: '127.0.0.1:0'\nsites:\n  - {name: s, listen-http: '127.0.0.1:0', "+testNtfySite+", upstream: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q, %q]}, {name: app2, addresses: [%q]}]}}\n", app1.addr(), deadAddr, app2.addr())
+	conf := fmt.Sprintf("listen-admin: '127.0.0.1:0'\nsites:\n  - {name: s, listen-http: '127.0.0.1:0', "+testNtfySite+", upstreams: {default: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q, %q]}, {name: app2, addresses: [%q]}]}}}\n", app1.addr(), deadAddr, app2.addr())
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	s := startTestServer(t, filename) // Health checks probe the first address, which is alive
 	client := clientForRank(t, s, "app1", "app2")
@@ -861,12 +861,12 @@ sites:
     listen-http: '127.0.0.1:0'
     hosts: [a.com]
     streams: {match: '`+testStreamsMatch+`'}
-    upstream: {balance: hash, health-check: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}
+    upstreams: {default: {balance: hash, healthcheck: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}
   - name: b
     listen-http: '127.0.0.1:0'
     hosts: ["*.b.com"]
     streams: {match: '`+testStreamsMatch+`'}
-    upstream: {balance: hash, health-check: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}
+    upstreams: {default: {balance: hash, healthcheck: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}
     rules: [{name: blocked, match: 'query == "blocked"', action: block, status: 451}]
 `, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
@@ -915,8 +915,8 @@ func TestProxy_SiteStreams(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
-  - {name: b, listen-http: '127.0.0.1:0', streams: {match: 'false'}, upstream: {balance: hash, health-check: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
+  - {name: b, listen-http: '127.0.0.1:0', streams: {match: 'false'}, upstreams: {default: {balance: hash, healthcheck: {path: /v1/ready, interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}}
 `, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
 	for _, host := range []string{"a.com", "other.com"} {
@@ -940,8 +940,8 @@ func TestProxy_SitesPerListener(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
-  - {name: b, listen-http: '127.0.0.2:0', hosts: [b.com], `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
+  - {name: b, listen-http: '127.0.0.2:0', hosts: [b.com], `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
 `, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
 	getHost := func(addr, host string) int {
@@ -1016,7 +1016,7 @@ func echoServer(t *testing.T, e *echoUpstream) *Server {
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
-sites: [{name: s, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: e, addresses: [%q]}]}}]
+sites: [{name: s, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: e, addresses: [%q]}]}}}]
 `, strings.TrimPrefix(e.srv.URL, "http://"))), 0600))
 	return startTestServer(t, filename)
 }
@@ -1377,10 +1377,10 @@ func TestProxy_WebSocketSmallCopyBuffers(t *testing.T) {
 }
 
 func TestProxy_UpdateKeepsUnchangedConns(t *testing.T) {
-	// A reload keeps a site's upstream connections unless its timeouts or keepalive changed, so a
+	// A reload keeps the connections of a site's upstream unless its timeouts or keepalive changed, so a
 	// reload (e.g. a certificate renewal) does not drop the idle connections to the servers
 	parse := func(read string) *config.Config {
-		conf, err := config.Parse([]byte("sites:\n  - {name: a, listen-http: ':0', upstream: {timeouts: {read: " + read + "}, servers: [{name: x, addresses: ['127.0.0.1:1']}]}}\n  - {name: b, listen-http: ':1', upstream: {servers: [{name: x, addresses: ['127.0.0.1:1']}]}}"))
+		conf, err := config.Parse([]byte("sites:\n  - {name: a, listen-http: ':0', upstreams: {default: {timeouts: {read: " + read + "}, servers: [{name: x, addresses: ['127.0.0.1:1']}]}}}\n  - {name: b, listen-http: ':1', upstreams: {default: {servers: [{name: x, addresses: ['127.0.0.1:1']}]}}}"))
 		require.NoError(t, err)
 		return conf
 	}
@@ -1389,11 +1389,161 @@ func TestProxy_UpdateKeepsUnchangedConns(t *testing.T) {
 	before := *p.conns.Load()
 	p.update(parse("1m"))
 	same := *p.conns.Load()
-	require.Same(t, before["a"], same["a"])
-	require.Same(t, before["b"], same["b"])
+	require.Same(t, before["a/default"], same["a/default"])
+	require.Same(t, before["b/default"], same["b/default"])
 	p.update(parse("2m"))
 	changed := *p.conns.Load()
-	require.NotSame(t, before["a"], changed["a"])
-	require.Equal(t, 2*time.Minute, changed["a"].transport.ResponseHeaderTimeout)
-	require.Same(t, before["b"], changed["b"])
+	require.NotSame(t, before["a/default"], changed["a/default"])
+	require.Equal(t, 2*time.Minute, changed["a/default"].transport.ResponseHeaderTimeout)
+	require.Same(t, before["b/default"], changed["b/default"])
+}
+
+func BenchmarkProxy_NtfyPublish(b *testing.B) {
+	// A publish through the shipped ntfy config (all its rules, access logs, gzip), with keep-alive
+	t := &testing.T{}
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/mytopic", func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		io.WriteString(w, `{"id":"abc","event":"message"}`)
+	})
+	s, _ := newNtfyPackagedServer(t, app1)
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.41")}, // Exempt from the limit
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext:         dialer.DialContext,
+			MaxIdleConnsPerHost: 1,
+		},
+	}
+	url := "http://" + s.HTTPAddr() + "/mytopic"
+	b.ReportAllocs()
+	for b.Loop() {
+		req, _ := http.NewRequest(http.MethodPut, url, strings.NewReader("hello"))
+		req.Host = "ntfy.sh"
+		resp, err := client.Do(req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b.Fatal(resp.Status)
+		}
+	}
+}
+
+// routedConfig is a site whose default upstream takes what no rule routes, and whose upstreams app1
+// and app2 take /app1/ and /app2/
+func routedConfig(t *testing.T, filename string, web *testUpstream, app1, app2 []*testUpstream) {
+	servers := func(indent string, upstreams []*testUpstream) string {
+		var b strings.Builder
+		for _, u := range upstreams {
+			fmt.Fprintf(&b, "%s- {name: %s, addresses: [%q]}\n", indent, u.name, u.addr())
+		}
+		return b.String()
+	}
+	conf := `listen-admin: '127.0.0.1:0'
+sites:
+  - name: s
+    listen-http: '127.0.0.1:0'
+    upstreams:
+      default:
+        healthcheck: {path: /v1/ready, interval: 1h, timeout: 1s}
+        servers:
+` + servers("          ", []*testUpstream{web}) + `      app1:
+        healthcheck: {path: /v1/ready, interval: 1h, timeout: 1s, fails: 1}
+        servers:
+` + servers("          ", app1)
+	if len(app2) > 0 {
+		conf += `      app2:
+        timeouts: {read: 100ms}
+        healthcheck: {path: /v1/ready, interval: 1h, timeout: 1s}
+        servers:
+` + servers("          ", app2)
+	}
+	conf += `    rules:
+      - {name: to-app1, match: 'path startsWith "/app1/"', action: proxy, upstream: app1}
+`
+	if len(app2) > 0 {
+		conf += `      - {name: to-app2, match: 'path startsWith "/app2/"', action: proxy, upstream: app2}
+`
+	}
+	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
+}
+
+func TestProxy_RulesRouteToNamedUpstreams(t *testing.T) {
+	web := newTestUpstream(t, "web")
+	a1, a2, b1 := newTestUpstream(t, "a1"), newTestUpstream(t, "a2"), newTestUpstream(t, "b1")
+	for _, u := range []*testUpstream{web, a1, a2, b1} {
+		for _, path := range []string{"/app1/x", "/app2/x", "/other", "/app2/slow"} {
+			u.on(path, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/app2/slow" {
+					time.Sleep(300 * time.Millisecond)
+				}
+				io.WriteString(w, u.name)
+			})
+		}
+	}
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	routedConfig(t, filename, web, []*testUpstream{a1, a2}, []*testUpstream{b1})
+	s := startTestServer(t, filename)
+	picks := func(path string, n int) map[string]int {
+		counts := make(map[string]int)
+		for range n {
+			_, name := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+path)
+			counts[name]++
+		}
+		return counts
+	}
+
+	// Each path goes to its upstream, balanced among its servers; the rest to the site's upstream
+	require.Equal(t, map[string]int{"a1": 2, "a2": 2}, picks("/app1/x", 4))
+	require.Equal(t, map[string]int{"b1": 3}, picks("/app2/x", 3))
+	require.Equal(t, map[string]int{"web": 3}, picks("/other", 3))
+
+	// Each upstream has its own timeouts: app2's read timeout cuts the slow answer
+	status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/app2/slow")
+	require.Equal(t, http.StatusGatewayTimeout, status)
+
+	// The status knows each server's upstream; the rule that routed counts as a match
+	_, body := adminDo(t, s, http.MethodGet, "/v1/status", "")
+	require.Contains(t, body, `"name":"a1","pool":"app1"`)
+	require.Contains(t, body, `"name":"b1","pool":"app2"`)
+	require.Contains(t, body, `"name":"web","pool":"default"`)
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_rule_matches_total{rule="s/to-app1"} 4`)
+
+	// A reload moves a2 to app2 (with b1) and drops app1 and its rule: /app1/ goes to web now
+	routedConfig(t, filename, web, []*testUpstream{a1}, []*testUpstream{b1, a2})
+	requireReload(t, s)
+	require.Equal(t, map[string]int{"b1": 2, "a2": 2}, picks("/app2/x", 4))
+	_, body = adminDo(t, s, http.MethodGet, "/v1/status", "")
+	require.Contains(t, body, `"name":"a2","pool":"app2"`)
+	routedConfig(t, filename, web, []*testUpstream{a1}, nil)
+	requireReload(t, s)
+	require.Equal(t, map[string]int{"a1": 2}, picks("/app1/x", 2))
+	require.Equal(t, map[string]int{"web": 2}, picks("/app2/x", 2))
+}
+
+func TestProxy_NamedUpstreamHealthIsItsOwn(t *testing.T) {
+	// a1 fails its health check: app1 sends everything to a2, and the site's upstream is untouched
+	web, a1, a2 := newTestUpstream(t, "web"), newTestUpstream(t, "a1"), newTestUpstream(t, "a2")
+	for _, u := range []*testUpstream{web, a1, a2} {
+		u.on("/app1/x", func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, u.name)
+		})
+	}
+	a1.notReady.Store(true)
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	routedConfig(t, filename, web, []*testUpstream{a1, a2}, nil)
+	s := startTestServer(t, filename)
+	for range 4 {
+		_, name := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/app1/x")
+		require.Equal(t, "a2", name)
+	}
+	_, name := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
+	require.Equal(t, "web", name)
+	_, body := adminDo(t, s, http.MethodGet, "/v1/status", "")
+	require.Contains(t, body, `"name":"a1","pool":"app1","state":"unhealthy"`)
 }

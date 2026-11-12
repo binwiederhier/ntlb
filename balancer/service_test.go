@@ -61,9 +61,9 @@ func newTestConfig(upstreams ...*testUpstream) *config.Config {
 // newTestConfigBalance is a site "s" with the upstreams and the given balance
 func newTestConfigBalance(balance string, upstreams ...*testUpstream) *config.Config {
 	var b strings.Builder
-	b.WriteString("sites:\n  - name: s\n    listen-http: ':0'\n    upstream:\n      balance: " + balance + "\n      health-check: {interval: 1h, timeout: 1s}\n      servers:\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: ':0'\n    upstreams:\n      default:\n        balance: " + balance + "\n        healthcheck: {interval: 1h, timeout: 1s}\n        servers:\n")
 	for _, u := range upstreams {
-		fmt.Fprintf(&b, "      - name: %s\n        addresses: [%q]\n", u.name, u.addr())
+		fmt.Fprintf(&b, "        - name: %s\n          addresses: [%q]\n", u.name, u.addr())
 	}
 	conf, err := config.Parse([]byte(b.String()))
 	if err != nil {
@@ -119,7 +119,7 @@ func keyFor(i int) []byte {
 // keyPreferring returns a client key whose first choice is the given upstream
 func keyPreferring(b *Balancer, name string) []byte {
 	for i := 0; ; i++ {
-		if key := keyFor(i); b.Pick("s", key)[0].Name() == name {
+		if key := keyFor(i); b.Pick("s", "", key)[0].Name() == name {
 			return key
 		}
 	}
@@ -135,9 +135,9 @@ func TestBalancer_PickSameAcrossInstances(t *testing.T) {
 	seen := make(map[string]bool)
 	for i := 0; i < 1000; i++ {
 		key := keyFor(i)
-		require.Equal(t, names(b1.Pick("s", key)), names(b2.Pick("s", key)))
-		require.Equal(t, names(b1.Pick("s", key)), names(b1.Pick("s", key)))
-		seen[b1.Pick("s", key)[0].Name()] = true
+		require.Equal(t, names(b1.Pick("s", "", key)), names(b2.Pick("s", "", key)))
+		require.Equal(t, names(b1.Pick("s", "", key)), names(b1.Pick("s", "", key)))
+		seen[b1.Pick("s", "", key)[0].Name()] = true
 	}
 	require.Len(t, seen, 3)
 }
@@ -148,7 +148,7 @@ func TestBalancer_InitialProbe(t *testing.T) {
 	app2.ready.Store(false)
 	b := newTestBalancer(t, app1, app2)
 	for i := 0; i < 100; i++ {
-		require.Equal(t, []string{"app1"}, names(b.Pick("s", keyFor(i))))
+		require.Equal(t, []string{"app1"}, names(b.Pick("s", "", keyFor(i))))
 	}
 	require.Equal(t, StateUnhealthy, b.Status().Upstreams[1].State)
 }
@@ -162,16 +162,16 @@ func TestBalancer_HealthHysteresis(t *testing.T) {
 	app2.ready.Store(false)
 	b.checkHealth(context.Background())
 	b.checkHealth(context.Background())
-	require.Equal(t, "app2", b.Pick("s", key)[0].Name())
+	require.Equal(t, "app2", b.Pick("s", "", key)[0].Name())
 	b.checkHealth(context.Background())
-	require.Equal(t, []string{"app1"}, names(b.Pick("s", key)))
+	require.Equal(t, []string{"app1"}, names(b.Pick("s", "", key)))
 
 	// Comes back after 2 good ones
 	app2.ready.Store(true)
 	b.checkHealth(context.Background())
-	require.Equal(t, []string{"app1"}, names(b.Pick("s", key)))
+	require.Equal(t, []string{"app1"}, names(b.Pick("s", "", key)))
 	b.checkHealth(context.Background())
-	require.Equal(t, "app2", b.Pick("s", key)[0].Name())
+	require.Equal(t, "app2", b.Pick("s", "", key)[0].Name())
 }
 
 func TestBalancer_FailOpen(t *testing.T) {
@@ -180,7 +180,7 @@ func TestBalancer_FailOpen(t *testing.T) {
 	app1.ready.Store(false)
 	app2.ready.Store(false)
 	b := newTestBalancer(t, app1, app2)
-	require.Len(t, b.Pick("s", keyFor(1)), 2)
+	require.Len(t, b.Pick("s", "", keyFor(1)), 2)
 	require.False(t, b.Healthy())
 	require.False(t, b.Status().Ready)
 }
@@ -198,7 +198,7 @@ func TestBalancer_DrainUpstreamPaced(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, b.DrainUpstream("app1", 10*time.Second))
 	for i := 0; i < 100; i++ {
-		require.Equal(t, []string{"app2"}, names(b.Pick("s", keyFor(i))))
+		require.Equal(t, []string{"app2"}, names(b.Pick("s", "", keyFor(i))))
 	}
 	require.Equal(t, StateDraining, b.Status().Upstreams[0].State)
 
@@ -236,7 +236,7 @@ func TestBalancer_UpdateRemovesUpstream(t *testing.T) {
 
 	// Out of rotation, but still listed and its stream still running
 	for i := 0; i < 100; i++ {
-		require.Equal(t, []string{"app1"}, names(b.Pick("s", keyFor(i))))
+		require.Equal(t, []string{"app1"}, names(b.Pick("s", "", keyFor(i))))
 	}
 	status := b.Status()
 	require.Len(t, status.Upstreams, 2)
@@ -270,7 +270,7 @@ func TestBalancer_UpdateAddsUpstream(t *testing.T) {
 	b.Update(newTestConfig(app1, app2, app3))
 	keyPreferring(b, "app2")
 	for i := 0; i < 100; i++ {
-		require.NotContains(t, names(b.Pick("s", keyFor(i))), "app3")
+		require.NotContains(t, names(b.Pick("s", "", keyFor(i))), "app3")
 	}
 }
 
@@ -318,7 +318,7 @@ func TestBalancer_WaitIdle(t *testing.T) {
 }
 
 func TestBalancer_NextAddressLeastLoaded(t *testing.T) {
-	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstream: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}}}]"))
 	u := b.upstream("app1")
 	s1 := b.NewSession(func(error) {})
 	a1 := u.NextAddress()
@@ -573,7 +573,7 @@ func TestBalancer_PickExcludesDrainingAndUnhealthy(t *testing.T) {
 				want = append(want, name)
 			}
 		}
-		require.Equal(t, want, names(b.Pick("s", key)))
+		require.Equal(t, want, names(b.Pick("s", "", key)))
 	}
 }
 
@@ -587,7 +587,7 @@ func TestBalancer_PickFailOpenExcludesDraining(t *testing.T) {
 	require.False(t, b.Healthy())
 	for i := 0; i < 200; i++ {
 		key := keyFor(i)
-		require.Equal(t, rank(key, []string{"app1", "app2"}), names(b.Pick("s", key)))
+		require.Equal(t, rank(key, []string{"app1", "app2"}), names(b.Pick("s", "", key)))
 	}
 }
 
@@ -603,13 +603,13 @@ func TestBalancer_PickFailOpenAtRuntime(t *testing.T) {
 	}
 	require.False(t, b.Healthy())
 	key := keyFor(1)
-	require.Equal(t, rank(key, []string{"app1", "app2"}), names(b.Pick("s", key)))
+	require.Equal(t, rank(key, []string{"app1", "app2"}), names(b.Pick("s", "", key)))
 	app2.ready.Store(true)
 	b.checkHealth(context.Background())
 	b.checkHealth(context.Background())
 	require.True(t, b.Healthy())
 	for i := 0; i < 100; i++ {
-		require.Equal(t, []string{"app2"}, names(b.Pick("s", keyFor(i))))
+		require.Equal(t, []string{"app2"}, names(b.Pick("s", "", keyFor(i))))
 	}
 }
 
@@ -620,7 +620,7 @@ func TestBalancer_PickNothingWhenAllDraining(t *testing.T) {
 	require.NoError(t, b.DrainUpstream("app1", time.Minute))
 	require.NoError(t, b.DrainUpstream("app2", time.Minute))
 	for i := 0; i < 100; i++ {
-		require.Empty(t, b.Pick("s", keyFor(i)))
+		require.Empty(t, b.Pick("s", "", keyFor(i)))
 	}
 	require.False(t, b.Healthy())
 	require.False(t, b.Status().Ready)
@@ -628,9 +628,9 @@ func TestBalancer_PickNothingWhenAllDraining(t *testing.T) {
 	// Removed upstreams count as draining
 	conf := newTestConfig(app1)
 	b.Update(conf)
-	require.Empty(t, b.Pick("s", keyFor(1)))
+	require.Empty(t, b.Pick("s", "", keyFor(1)))
 	require.NoError(t, b.UndrainUpstream("app1"))
-	require.Equal(t, []string{"app1"}, names(b.Pick("s", keyFor(1))))
+	require.Equal(t, []string{"app1"}, names(b.Pick("s", "", keyFor(1))))
 }
 
 func TestBalancer_PickIgnoresLoadBalancerDrain(t *testing.T) {
@@ -638,7 +638,7 @@ func TestBalancer_PickIgnoresLoadBalancerDrain(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	b := newTestBalancer(t, app1)
 	b.Drain(time.Minute)
-	require.Equal(t, []string{"app1"}, names(b.Pick("s", keyFor(1))))
+	require.Equal(t, []string{"app1"}, names(b.Pick("s", "", keyFor(1))))
 }
 
 func TestBalancer_UpdateRemoveAndReaddMidDrain(t *testing.T) {
@@ -706,7 +706,7 @@ func TestBalancer_UpdateRemovesUpstreamWithCommandDrain(t *testing.T) {
 	require.False(t, status.Removed)
 	require.Equal(t, StateDraining, status.State)
 	for i := 0; i < 100; i++ {
-		require.Equal(t, []string{"app1"}, names(b.Pick("s", keyFor(i))))
+		require.Equal(t, []string{"app1"}, names(b.Pick("s", "", keyFor(i))))
 	}
 
 	// Removed again and past the command's deadline: closed and forgotten
@@ -719,7 +719,7 @@ func TestBalancer_UpdateRemovesUpstreamWithCommandDrain(t *testing.T) {
 }
 
 func TestBalancer_UpdateChangesAddressesWithStreams(t *testing.T) {
-	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstream: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}}}]"))
 	u := b.upstream("app1")
 	attach := func() *Session {
 		s := b.NewSession(func(error) {})
@@ -731,7 +731,7 @@ func TestBalancer_UpdateChangesAddressesWithStreams(t *testing.T) {
 	require.Equal(t, 1, u.addrStreams["10.0.0.1:2"])
 
 	// :1 goes away, :3 is new: new streams go to the empty :3, the existing ones stay counted
-	b.Update(mustParse(t, "sites: [{name: s, listen-http: ':0', upstream: {health-check: {timeout: 50ms}, servers: [{name: app1, addresses: ['10.0.0.1:2', '10.0.0.1:3']}]}}]"))
+	b.Update(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {healthcheck: {timeout: 50ms}, servers: [{name: app1, addresses: ['10.0.0.1:2', '10.0.0.1:3']}]}}}]"))
 	require.Same(t, u, b.upstream("app1"))
 	require.Equal(t, []string{"10.0.0.1:2", "10.0.0.1:3"}, b.Status().Upstreams[0].Addresses)
 	require.Equal(t, 3, b.Status().Upstreams[0].Streams)
@@ -877,7 +877,7 @@ func TestBalancer_ConcurrencyStress(t *testing.T) {
 			s := b.NewSession(func(cause error) {
 				canceled.Store(true)
 			})
-			for j, u := range b.Pick("s", keyFor(c*100000+i)) {
+			for j, u := range b.Pick("s", "", keyFor(c*100000+i)) {
 				seenMu.Lock()
 				seen[u] = true
 				seenMu.Unlock()
@@ -972,7 +972,7 @@ func TestBalancer_ConcurrencyStress(t *testing.T) {
 func TestBalancer_ReserveSpreadsInFlightAttempts(t *testing.T) {
 	// Attempts still connecting count, so a reconnect storm spreads over the addresses instead
 	// of piling onto the one with the fewest attached streams
-	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstream: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2', '10.0.0.1:3']}]}}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2', '10.0.0.1:3']}]}}}]"))
 	u := b.upstream("app1")
 	var sessions []*Session
 	counts := make(map[string]int)
@@ -1004,7 +1004,7 @@ func TestBalancer_ReserveSpreadsInFlightAttempts(t *testing.T) {
 
 func TestBalancer_ReserveRetryOnAnotherUpstream(t *testing.T) {
 	// A retry on the next upstream releases the reservation on the first one
-	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstream: {servers: [{name: app1, addresses: ['10.0.0.1:1']}, {name: app2, addresses: ['10.0.0.2:1']}]}}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:1']}, {name: app2, addresses: ['10.0.0.2:1']}]}}}]"))
 	u1, u2 := b.upstream("app1"), b.upstream("app2")
 	s := b.NewSession(func(error) {})
 	b.Reserve(s, u1)
@@ -1029,7 +1029,7 @@ func TestBalancer_ReserveRetryOnAnotherUpstream(t *testing.T) {
 func TestBalancer_AddressBackoff(t *testing.T) {
 	// A failed address is skipped for a while, even with zero streams, since the health check
 	// only probes the first address
-	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstream: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}}]"))
+	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}}}]"))
 	u := b.upstream("app1")
 	for i := 0; i < 3; i++ {
 		s := b.NewSession(func(error) {})
@@ -1103,7 +1103,7 @@ func TestBalancer_UpdateAddressChangeResetsHealth(t *testing.T) {
 	require.False(t, s.canceled())
 	require.Same(t, u2, b.upstream("app2"))
 	for i := 0; i < 100; i++ {
-		require.Equal(t, []string{"app1"}, names(b.Pick("s", keyFor(i))))
+		require.Equal(t, []string{"app1"}, names(b.Pick("s", "", keyFor(i))))
 	}
 
 	// And back to a healthy address: in rotation right away, no passes needed
@@ -1125,14 +1125,14 @@ func TestBalancer_Sites(t *testing.T) {
 	a1, b1, b2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
 	b := New(mustParse(t, fmt.Sprintf(`
 sites:
-  - {name: a, listen-http: ':0', hosts: [a.com], upstream: {health-check: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}
-  - {name: b, listen-http: ':0', upstream: {health-check: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}, {name: app2, addresses: [%q]}]}}
+  - {name: a, listen-http: ':0', hosts: [a.com], upstreams: {default: {healthcheck: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}}
+  - {name: b, listen-http: ':0', upstreams: {default: {healthcheck: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}, {name: app2, addresses: [%q]}]}}}
 `, a1.addr(), b1.addr(), b2.addr())))
 	b.checkHealth(context.Background())
 	key := []byte{192, 0, 2, 1}
-	require.Equal(t, []string{a1.addr()}, addressesOf(b.Pick("a", key)))
-	require.ElementsMatch(t, []string{b1.addr(), b2.addr()}, addressesOf(b.Pick("b", key)))
-	require.Empty(t, b.Pick("c", key))
+	require.Equal(t, []string{a1.addr()}, addressesOf(b.Pick("a", "", key)))
+	require.ElementsMatch(t, []string{b1.addr(), b2.addr()}, addressesOf(b.Pick("b", "", key)))
+	require.Empty(t, b.Pick("c", "", key))
 
 	// The status names the site of each upstream
 	status := b.Status()
@@ -1147,21 +1147,21 @@ sites:
 	require.ErrorIs(t, b.DrainUpstream("a/app2", time.Hour), ErrUpstreamNotFound)
 	require.NoError(t, b.DrainUpstream("b/app1", time.Hour))
 	require.NoError(t, b.DrainUpstream("app2", time.Hour))
-	require.Empty(t, b.Pick("b", key))
-	require.Len(t, b.Pick("a", key), 1)
+	require.Empty(t, b.Pick("b", "", key))
+	require.Len(t, b.Pick("a", "", key), 1)
 	require.ErrorIs(t, b.UndrainUpstream("app1"), ErrUpstreamAmbiguous)
 	require.NoError(t, b.UndrainUpstream("b/app1"))
-	require.Equal(t, []string{b1.addr()}, addressesOf(b.Pick("b", key)))
+	require.Equal(t, []string{b1.addr()}, addressesOf(b.Pick("b", "", key)))
 
 	// A site that leaves the config drains its upstreams; the other site's app1 is untouched
-	conf := mustParse(t, fmt.Sprintf("sites: [{name: a, listen-http: ':0', upstream: {health-check: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}]", a1.addr()))
+	conf := mustParse(t, fmt.Sprintf("sites: [{name: a, listen-http: ':0', upstreams: {default: {healthcheck: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}}]", a1.addr()))
 	b.Update(conf)
 	status = b.Status()
 	require.Len(t, status.Upstreams, 3)
 	require.False(t, status.Upstreams[0].Removed)
 	require.True(t, status.Upstreams[1].Removed)
 	require.True(t, status.Upstreams[2].Removed)
-	require.Empty(t, b.Pick("b", key))
+	require.Empty(t, b.Pick("b", "", key))
 	require.NoError(t, b.DrainUpstream("app1", time.Hour)) // Only a's is left
 }
 
@@ -1191,4 +1191,40 @@ func (b *Balancer) upstream(name string) *Upstream {
 		}
 	}
 	return nil
+}
+
+func TestBalancer_PickPerPool(t *testing.T) {
+	// A site's upstreams are separate pools: each picks among its own servers, with its own balance
+	// and its own round-robin turn
+	web, a1, a2, b1 := newTestUpstream(t, "web"), newTestUpstream(t, "a1"), newTestUpstream(t, "a2"), newTestUpstream(t, "b1")
+	b := New(mustParse(t, fmt.Sprintf(`
+sites:
+  - name: s
+    listen-http: ':0'
+    upstreams:
+      default:
+        healthcheck: {interval: 1h, timeout: 1s}
+        servers: [{name: web, addresses: [%q]}]
+      app1:
+        healthcheck: {interval: 1h, timeout: 1s}
+        servers: [{name: a1, addresses: [%q]}, {name: a2, addresses: [%q]}]
+      app2:
+        balance: hash
+        healthcheck: {interval: 1h, timeout: 1s}
+        servers: [{name: b1, addresses: [%q]}]
+`, web.addr(), a1.addr(), a2.addr(), b1.addr())))
+	b.checkHealth(context.Background())
+	require.Equal(t, []string{"web"}, names(b.Pick("s", "", keyFor(1))))
+	require.Equal(t, []string{"a1", "a2"}, names(b.Pick("s", "app1", keyFor(1))))
+	require.Equal(t, []string{"web"}, names(b.Pick("s", "", keyFor(1)))) // Not app1's turn
+	require.Equal(t, []string{"a2", "a1"}, names(b.Pick("s", "app1", keyFor(1))))
+	require.Equal(t, []string{"b1"}, names(b.Pick("s", "app2", keyFor(1))))
+	require.Empty(t, b.Pick("s", "gone", keyFor(1)))
+
+	// The status says which pool a server is in
+	pools := make(map[string]string)
+	for _, u := range b.Status().Upstreams {
+		pools[u.Name] = u.Pool
+	}
+	require.Equal(t, map[string]string{"web": "default", "a1": "app1", "a2": "app1", "b1": "app2"}, pools)
 }

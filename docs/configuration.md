@@ -9,7 +9,8 @@ ntfy.sh setup). How it works inside is in [architecture.md](architecture.md) and
 - [Config files](#config-files)
 - [Global settings](#global-settings)
 - [Sites](#sites)
-- [Upstream: servers, balancing and timeouts](#upstream-servers-balancing-and-timeouts)
+- [Upstreams: servers, balancing and timeouts](#upstreams-servers-balancing-and-timeouts)
+- [Routing by path](#routing-by-path)
 - [Health checks, and what happens when one goes bad](#health-checks-and-what-happens-when-one-goes-bad)
 - [Streams](#streams)
 - [Access logs](#access-logs)
@@ -79,12 +80,13 @@ A minimal config, one site in front of two app servers:
 sites:
   - name: app
     listen-http: ":80"
-    upstream:
-      servers:
-        - name: app1
-          addresses: ["10.0.0.11:8080"]
-        - name: app2
-          addresses: ["10.0.0.12:8080"]
+    upstreams:
+      default:
+        servers:
+          - name: app1
+            addresses: ["10.0.0.11:8080"]
+          - name: app2
+            addresses: ["10.0.0.12:8080"]
 ```
 
 That balances round-robin, probes `GET /` on every address every 5s, proxies WebSockets and
@@ -102,7 +104,7 @@ balancing, timeouts, health checks), streams, rules and (optionally) logs, bans 
 | `listen-https` | | The same, for TLS (HTTP/2 and HTTP/1.1). Needs `cert-file` and `key-file`. |
 | `hosts` | all | Host names this site serves: exact (`example.com`) or wildcard (`"*.example.com"`: any subdomain). Leave out to take every host no other site on these addresses serves. |
 | `cert-file`, `key-file` | | PEM certificate (full chain) and key, re-read on every reload. |
-| `upstream` | required | The servers and how requests reach them: `balance`, `timeouts`, `keepalive`, `health-check`, `servers`. See [Upstream](#upstream-servers-balancing-and-timeouts). |
+| `upstreams` | required | The servers and how requests reach them, by name; `default` is required and takes every request no `proxy` rule routes. Each has `balance`, `timeouts`, `keepalive`, `healthcheck`, `servers`. See [Upstreams](#upstreams-servers-balancing-and-timeouts) and [Routing by path](#routing-by-path). |
 | `streams` | none | Which requests are long-lived streams. See [Streams](#streams). |
 | `rules` | none | Checked after the global rules; named `<site>/<name>` in logs and metrics. |
 | `access-logs`, `bans`, `gzip` | the global ones | Replace the global setting for this site's requests. |
@@ -133,52 +135,57 @@ sites:
     hosts: [example.com, www.example.com]
     cert-file: /etc/ntlb/certs/example.com/fullchain.pem
     key-file: /etc/ntlb/certs/example.com/privkey.pem
-    upstream:
-      servers: [{name: web1, addresses: ["10.0.0.21:3000"]}]
+    upstreams:
+      default:
+        servers: [{name: web1, addresses: ["10.0.0.21:3000"]}]
   - name: api
     listen-http: ":80"
     listen-https: ":443"
     hosts: ["*.api.example.com", api.example.com]
     cert-file: /etc/ntlb/certs/api.example.com/fullchain.pem
     key-file: /etc/ntlb/certs/api.example.com/privkey.pem
-    upstream:
-      balance: least-conn
-      servers:
-        - {name: api1, addresses: ["10.0.0.31:8080"]}
-        - {name: api2, addresses: ["10.0.0.32:8080"]}
+    upstreams:
+      default:
+        balance: least-conn
+        servers:
+          - {name: api1, addresses: ["10.0.0.31:8080"]}
+          - {name: api2, addresses: ["10.0.0.32:8080"]}
   - name: default                     # every other host on :80 and :443
     listen-http: ":80"
     listen-https: ":443"
     cert-file: /etc/ntlb/certs/example.com/fullchain.pem
     key-file: /etc/ntlb/certs/example.com/privkey.pem
-    upstream:
-      servers: [{name: web1, addresses: ["10.0.0.21:3000"]}]   # names are per site
+    upstreams:
+      default:
+        servers: [{name: web1, addresses: ["10.0.0.21:3000"]}]   # names are per site
     rules:
       - name: unknown-host
         action: block                 # no match: every request
         status: 404
 ```
 
-## Upstream: servers, balancing and timeouts
+## Upstreams: servers, balancing and timeouts
 
-A site's `upstream` block holds everything about its backend servers, like nginx's `upstream {}`
-block plus its `proxy_*_timeout` settings:
+A site's `upstreams` are its backend servers by name, each block like nginx's `upstream {}` plus
+its `proxy_*_timeout` settings. `default` is required and takes every request; more blocks are for
+[routing by path](#routing-by-path). A site with one backend only has `default`:
 
 ```yaml
-upstream:
-  balance: hash                 # default round-robin
-  timeouts:
-    connect: 5s                 # default 5s
-    read: 3m                    # default 60s
-  keepalive: {idle: 1m, interval: 15s, count: 4}
-  health-check: {path: /healthz}
-  servers:
-    - name: app1
-      addresses: ["10.0.0.11:8080"]
-    - name: app2
-      addresses: ["10.0.0.12:8080", "10.0.0.12:8081"]
-    - name: app3
-      addresses: ["10.0.0.13:25010-25017"]   # 8 addresses
+upstreams:
+  default:
+    balance: hash                 # default round-robin
+    timeouts:
+      connect: 5s                 # default 5s
+      read: 3m                    # default 60s
+    keepalive: {idle: 1m, interval: 15s, count: 4}
+    healthcheck: {path: /healthz}
+    servers:
+      - name: app1
+        addresses: ["10.0.0.11:8080"]
+      - name: app2
+        addresses: ["10.0.0.12:8080", "10.0.0.12:8081"]
+      - name: app3
+        addresses: ["10.0.0.13:25010-25017"]   # 8 addresses
 ```
 
 | Setting | Default | |
@@ -187,12 +194,12 @@ upstream:
 | `timeouts.connect` | `5s` | A server address that does not accept within this is down for the request; the next one is tried. |
 | `timeouts.read` | `60s` | Cut a response (or a WebSocket) after this long without a byte. Streams need their server to send keepalives within it. Also bounds a client that stops reading, also one of the site's own answers (static files, blocks, redirects); a stalled upload is cut after 60s, or this if shorter. |
 | `keepalive` | `{idle: 1m, interval: 15s, count: 4}` | TCP keepalive towards the servers; a dead peer is noticed after `idle + interval * count`. `{disable: true}` turns it off. |
-| `health-check` | `{path: /, interval: 5s, timeout: 3s, fails: 3, passes: 2}` | See [Health checks](#health-checks-and-what-happens-when-one-goes-bad). |
+| `healthcheck` | `{path: /, interval: 5s, timeout: 3s, fails: 3, passes: 2}` | See [Health checks](#health-checks-and-what-happens-when-one-goes-bad). |
 | `servers` | required | The backend nodes: a `name`, one or more `addresses`, and optionally a `weight` (1 to 1000, default 1) and `backup: true`. Names are per site. At least one server must not be a backup. |
 
-Each site has its own connections to its servers, so sites can differ: ntfy's 3m read timeout next
-to a site with the default. A reload keeps a site's idle connections unless its `timeouts` or
-`keepalive` changed.
+Each upstream block has its own connections to its servers, so they can differ: ntfy's 3m read
+timeout next to a site with the default. A reload keeps a block's idle connections unless its
+`timeouts` or `keepalive` changed.
 
 An address may be a port range, `"10.0.0.11:25010-25017"`, which is one address per port (each
 address holds ~63k connections from one source IP, so a node with many long-lived clients listens
@@ -214,13 +221,14 @@ failing its health checks nor backing off after a failure.
 **Weights and backups** work with every `balance`:
 
 ```yaml
-upstream:
-  balance: least-conn
-  servers:
-    - {name: big, addresses: ["10.0.0.11:8080"], weight: 3}   # 3 times the share of small
-    - {name: small, addresses: ["10.0.0.12:8080"]}            # weight 1
-    - {name: canary, addresses: ["10.0.0.13:8080"], weight: 1}
-    - {name: spare, addresses: ["10.0.0.14:8080"], backup: true}
+upstreams:
+  default:
+    balance: least-conn
+    servers:
+      - {name: big, addresses: ["10.0.0.11:8080"], weight: 3}   # 3 times the share of small
+      - {name: small, addresses: ["10.0.0.12:8080"]}            # weight 1
+      - {name: canary, addresses: ["10.0.0.13:8080"], weight: 1}
+      - {name: spare, addresses: ["10.0.0.14:8080"], backup: true}
 ```
 
 - `weight` is a server's share relative to the others, like nginx's `weight=`. `round-robin` gives
@@ -284,6 +292,72 @@ A request whose body was partly sent is never resent (there is no copy). The las
 answer or error goes to the client: `502` for an error, `504` for a timeout, `503` if every
 server is draining.
 
+## Routing by path
+
+A site can have more upstream blocks next to `default`, and send requests to them with `proxy`
+rules: `/app1/` to one set of servers, `/app2/` to another, the rest to `default`. Each block has
+its own `balance`, `timeouts`, `keepalive`, `healthcheck` and `servers`, and is balanced, health
+checked and connected to on its own.
+
+```yaml
+sites:
+  - name: example
+    listen-https: ":443"
+    hosts: [example.com]
+    cert-file: /etc/ntlb/certs/example.com/fullchain.pem
+    key-file: /etc/ntlb/certs/example.com/privkey.pem
+    upstreams:
+      default:                         # what no proxy rule routes
+        servers:
+          - {name: web1, addresses: ["10.0.0.1:8080"]}
+      app1:
+        balance: least-conn
+        healthcheck: {path: /healthz}
+        servers:
+          - {name: a1, addresses: ["10.0.1.1:9000"]}
+          - {name: a2, addresses: ["10.0.1.2:9000"]}
+      app2:
+        timeouts: {read: 5m}           # long polls
+        servers:
+          - {name: b1, addresses: ["10.0.2.1:9000"]}
+    rules:
+      - name: limit                    # before the routes: applies to all of them
+        action: limit
+        rate: 600/m
+      - name: to-app1
+        match: path startsWith "/app1/"
+        action: proxy
+        upstream: app1
+      - name: to-app2
+        match: path startsWith "/app2/" || host == "api.example.com"
+        action: proxy
+        upstream: app2
+```
+
+```mermaid
+flowchart LR
+    req["request"] --> rules{"site's rules,<br>in order"}
+    rules -- "to-app1: /app1/..." --> p1["upstreams.app1<br>a1, a2 (least-conn)"]
+    rules -- "to-app2: /app2/..." --> p2["upstreams.app2<br>b1"]
+    rules -- "no proxy rule matched" --> p0["upstreams.default<br>web1"]
+```
+
+- A `proxy` rule decides like `allow`: the first one whose `match` is true sends the request to
+  its `upstream`, and the rules after it are not checked. Put limits and blocks before the routes.
+- No rule has to name `default`: what no `proxy` rule matches goes there. `upstream: default` in a
+  `proxy` rule sends a path there before a broader route catches it.
+- The path is sent as it is (`/app1/x` reaches the server as `/app1/x`).
+- `proxy` rules go in a site's `rules` only; global rules cannot name a site's upstreams.
+- Server names are per site over all its upstream blocks: a server is `site/name` in
+  `ntlb status`, drains and metrics wherever it is. `ntlb status` notes its block
+  (`upstreams.app1`).
+- The request is a match of its rule: `rule` in access logs and response rules is the proxy rule's
+  name, and it counts in `ntlb_rule_matches_total`.
+- **Reloads**: each upstream block keeps its health, round-robin turn and connections. A server
+  that moves from one upstream block to another (same name) keeps
+  its health and open streams; new requests follow the new rules. A server that leaves the config
+  drains as usual.
+
 ## Health checks, and what happens when one goes bad
 
 Every address of every server is probed every `interval`: `GET http://<address><path>` on a new
@@ -292,14 +366,15 @@ passes a round if **any** of its addresses passed; the addresses that failed are
 others are up.
 
 ```yaml
-upstream:
-  health-check:
-    path: /healthz    # default /
-    interval: 5s
-    timeout: 3s
-    fails: 3          # failed rounds in a row before the server leaves the rotation
-    passes: 2         # good rounds in a row before it comes back
-  servers: [...]
+upstreams:
+  default:
+    healthcheck:
+      path: /healthz    # default /
+      interval: 5s
+      timeout: 3s
+      fails: 3          # failed rounds in a row before the server leaves the rotation
+      passes: 2         # good rounds in a row before it comes back
+    servers: [...]
 ```
 
 The very first probe (at start, or when a reload adds a server or changes its addresses)
@@ -430,7 +505,7 @@ without `match` takes the rest. A reload reopens the files (for logrotate).
 
 ```yaml
 access-logs:
-  - {file: /var/log/ntlb/blocked.log, match: 'rule != "" && status >= 400'}   # rules that blocked or limited
+  - {file: /var/log/ntlb/blocked.log, match: 'rule != "" && upstream_status == 0 && status >= 400'}   # rules that blocked or limited
   - {file: /var/log/ntlb/bad.log, match: status == 400 && upstream_status == 0}   # unparseable requests
   - {file: /var/log/ntlb/access.log, match: status < 400}
   - {file: /var/log/ntlb/error.log}                                           # everything else
@@ -461,7 +536,7 @@ flowchart TD
     req["request"] --> g["global rules, in order"]
     g --> s["the site's rules, in order"]
     s --> proxy["proxied to an upstream"]
-    g -. "block / allow / redirect / static matched,<br>or a limit exceeded" .-> decided["decided: answered (or proxied, for allow)"]
+    g -. "block / allow / redirect / static matched,<br>or a limit exceeded" .-> decided["decided: answered (or proxied, for allow and proxy)"]
     s -. same .-> decided
     proxy --> ended["request ended"]
     decided --> ended
@@ -469,8 +544,8 @@ flowchart TD
     resp --> log["access log"]
 ```
 
-Request rules are checked in order, the global ones first. The first `block`, `allow`, `redirect`
-or `static` whose `match` is true decides; a `limit` decides only when exceeded (under the limit,
+Request rules are checked in order, the global ones first. The first `block`, `allow`, `redirect`,
+`static` or `proxy` whose `match` is true decides; a `limit` decides only when exceeded (under the limit,
 checking goes on). A request no rule decides is proxied. A rule without `match` matches every
 request.
 
@@ -479,6 +554,7 @@ request.
 | `block` | `status` (default 403), `strike` | Answers `status` with a short text body. |
 | `limit` | `rate` (required), `burst` (default 0), `status` (default 429), `strike` | A token bucket per client key and rule: `rate` requests per `s`, `m` or `h`, plus `burst` at once (nginx's `limit_req burst=N nodelay`). Over it, answers `status`; `strike` counts per limited request. |
 | `allow` | none | Stops checking and proxies. For exemptions: put it before the rules it exempts from. |
+| `proxy` | `upstream` (required: a name in the site's `upstreams`) | Stops checking and proxies to that upstream. Site rules only. See [Routing by path](#routing-by-path). |
 | `redirect` | `location` (required, a string expression), `status` (default 302; 300-399) | Answers a redirect. |
 | `static` | `root` (required), `fallback` | Serves the file at the request path under `root`, else `fallback` (a path under `root`, like nginx's `try_files $uri /index.html`), else 404. Directories serve the fallback. Paths with `.`, `..` or empty segments, dotfiles (so also `/.well-known/`) and symlinks out of `root` are refused. |
 
@@ -851,13 +927,14 @@ sites:
     key-file: /etc/ntlb/certs/app.example.com/privkey.pem
     streams:
       match: method == "GET" && path == "/api/events"
-    upstream:
-      balance: least-conn
-      timeouts: {read: 5m}             # the event stream sends a keepalive every minute
-      health-check: {path: /api/health}
-      servers:
-        - {name: api1, addresses: ["10.0.0.31:8080"]}
-        - {name: api2, addresses: ["10.0.0.32:8080"]}
+    upstreams:
+      default:
+        balance: least-conn
+        timeouts: {read: 5m}             # the event stream sends a keepalive every minute
+        healthcheck: {path: /api/health}
+        servers:
+          - {name: api1, addresses: ["10.0.0.31:8080"]}
+          - {name: api2, addresses: ["10.0.0.32:8080"]}
     rules:
       - name: spa
         match: method in ["GET", "HEAD"] && !(path startsWith "/api/")
@@ -888,11 +965,12 @@ client-key:
   ipv6-prefix-bits: 56
 sites:
   - name: chat
-    upstream:
-      balance: hash                     # same names on every load balancer -> same node
-      servers:
-        - {name: chat-a, addresses: ["10.0.0.41:9000"]}
-        - {name: chat-b, addresses: ["10.0.0.42:9000"]}
+    upstreams:
+      default:
+        balance: hash                     # same names on every load balancer -> same node
+        servers:
+          - {name: chat-a, addresses: ["10.0.0.41:9000"]}
+          - {name: chat-b, addresses: ["10.0.0.42:9000"]}
     # ...
 ```
 

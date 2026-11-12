@@ -52,6 +52,9 @@ const (
 	// DefaultStreamsMatch is no request: which ones are long-lived streams depends on the app (see
 	// packaging/sites.d/ntfy.yml for ntfy's subscriptions)
 	DefaultStreamsMatch = "false"
+
+	// UpstreamDefault is the upstream of a site that takes every request no proxy rule routes
+	UpstreamDefault = "default"
 )
 
 var (
@@ -136,11 +139,12 @@ type Gzip struct {
 // Upstream is a site's backend servers and how requests reach them, like nginx's upstream block
 // and its proxy_*_timeout settings
 type Upstream struct {
-	Balance     string       `yaml:"balance"`      // round-robin (default), least-conn, random-two or hash
-	Timeouts    *Timeouts    `yaml:"timeouts"`     //
-	Keepalive   *Keepalive   `yaml:"keepalive"`    // TCP keepalive towards the servers
-	HealthCheck *HealthCheck `yaml:"health-check"` // Active health checks against every server
-	Servers     []*Server    `yaml:"servers"`      // Server names are per site
+	Name        string       `yaml:"-"`           // Its key in the site's upstreams
+	Balance     string       `yaml:"balance"`     // round-robin (default), least-conn, random-two or hash
+	Timeouts    *Timeouts    `yaml:"timeouts"`    //
+	Keepalive   *Keepalive   `yaml:"keepalive"`   // TCP keepalive towards the servers
+	HealthCheck *HealthCheck `yaml:"healthcheck"` // Active health checks against every server
+	Servers     []*Server    `yaml:"servers"`     // Server names are per site
 }
 
 // Timeouts bound the connections to a site's servers
@@ -286,7 +290,7 @@ func (c *Config) validate() error {
 	if err := validateBans(c.Bans); err != nil {
 		return err
 	}
-	if err := validateRules(c.Rules, "", c.anyBans()); err != nil {
+	if err := validateRules(c.Rules, nil, c.anyBans()); err != nil {
 		return err
 	}
 	return c.validateSites()
@@ -447,17 +451,17 @@ func (h *HealthCheck) applyDefaults() {
 }
 
 // validate checks the values after defaulting. A non-positive interval would probe in a tight loop.
-func (h *HealthCheck) validate() error {
+func (h *HealthCheck) validate(section string) error {
 	if h.Interval <= 0 {
-		return errors.New("upstream.health-check.interval must be positive")
+		return fmt.Errorf("%s.interval must be positive", section)
 	} else if h.Timeout <= 0 {
-		return errors.New("upstream.health-check.timeout must be positive")
+		return fmt.Errorf("%s.timeout must be positive", section)
 	} else if h.Timeout >= h.Interval {
-		return errors.New("upstream.health-check.timeout must be shorter than its interval")
+		return fmt.Errorf("%s.timeout must be shorter than its interval", section)
 	} else if h.Fails <= 0 {
-		return errors.New("upstream.health-check.fails must be positive")
+		return fmt.Errorf("%s.fails must be positive", section)
 	} else if h.Passes <= 0 {
-		return errors.New("upstream.health-check.passes must be positive")
+		return fmt.Errorf("%s.passes must be positive", section)
 	}
 	return nil
 }

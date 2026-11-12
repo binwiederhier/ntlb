@@ -133,7 +133,7 @@ type upstreamStream struct {
 // the proxy's RoundTrip (no body, so any error before the response is safe to retry), trying the
 // other addresses of an upstream first if one does not accept the connection
 func (p *proxy) connectStream(r *http.Request, pr *proxyRequest) (*upstreamStream, error) {
-	candidates := p.balancer.Pick(pr.site, pr.key)
+	candidates := p.balancer.Pick(pr.site, pr.pool, pr.key)
 	if len(candidates) == 0 || pr.conns == nil {
 		return nil, errNoUpstream
 	}

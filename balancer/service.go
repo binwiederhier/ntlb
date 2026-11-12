@@ -23,9 +23,10 @@ const (
 	addressBackoffMax = 30 * time.Second
 )
 
-// Balancer routes requests to the healthy upstreams of their site, by the site's balance (round
-// robin, least connections, random two, or rendezvous hashing of the client), and owns the health
-// checks and the drains. Upstreams are keyed by their ID, "<site>/<name>".
+// Balancer routes requests to the healthy upstreams of one of their site's upstream blocks (a
+// pool: default, or one a proxy rule named), by the pool's balance (round robin, least
+// connections, random two, or rendezvous hashing of the client), and owns the health checks and
+// the drains. Upstreams are keyed by their ID, "<site>/<name>": names are unique over a site's pools.
 type Balancer struct {
 	config    *config.Config
 	upstreams map[string]*Upstream
@@ -33,7 +34,7 @@ type Balancer struct {
 	sessions  map[uint64]*Session
 	nextID    uint64
 	drain     *drainState // Draining the load balancer itself
-	turns     sync.Map    // Site name -> *atomic.Uint64, the next turn of round-robin and least-conn
+	turns     sync.Map    // Pool key (see PoolKey) -> *atomic.Uint64, the next turn of round-robin and least-conn
 	client    *http.Client
 	mu        sync.RWMutex // Protects config, upstreams, order, sessions, nextID, drain, and each Upstream's removed and drain
 }
@@ -44,6 +45,7 @@ type Upstream struct {
 	id          string // site/name
 	site        string
 	name        string
+	pool        string      // The name of the site's upstream block it is in; protected by Balancer.mu
 	removed     bool        // Protected by Balancer.mu
 	drain       *drainState // Protected by Balancer.mu
 	weight      int         // Protected by Balancer.mu
@@ -57,7 +59,7 @@ type Upstream struct {
 	addrFails   map[string]int       // Consecutive failures per address
 	addrRetry   map[string]time.Time // An address that failed is skipped until then
 	addrDown    map[string]bool      // Failed its last health check: skipped while others are up
-	health      *config.HealthCheck  // The site's health check
+	health      *config.HealthCheck  // The pool's health check
 	lastProbe   time.Time            // Start of the last probe round that included the upstream
 	probing     bool                 // A probe round is running
 	healthy     bool
@@ -84,12 +86,10 @@ func New(conf *config.Config) *Balancer {
 			},
 		},
 	}
-	for _, site := range conf.Sites {
-		for _, uc := range site.Upstream.Servers {
-			u := newUpstream(site, uc)
-			b.upstreams[u.id] = u
-			b.order = append(b.order, u.id)
-		}
+	for _, ps := range servers(conf) {
+		u := newUpstream(ps.site, ps.pool, ps.server)
+		b.upstreams[u.id] = u
+		b.order = append(b.order, u.id)
 	}
 	return b
 }
@@ -102,23 +102,28 @@ func (b *Balancer) Start(ctx context.Context) {
 	go b.drainLoop(ctx.Done())
 }
 
-// Pick returns the upstreams of a site to try, best first: the healthy upstreams that are not
-// draining, then the healthy backups as the last retries; the healthy backups alone if no other
-// upstream is healthy. If none is healthy, it fails open and returns every upstream that is not
-// draining (backups last), since a problem shared by all nodes (e.g. their database) is no reason
-// to turn every client away. Returns nothing only if every upstream of the site is draining. The
-// order is the site's balance (strategy.go); the client key matters for balance hash only.
-func (b *Balancer) Pick(site string, key []byte) []*Upstream {
+// Pick returns the upstreams of a site's pool (the name of one of its upstream blocks, "" for
+// default) to try, best first: the healthy upstreams that are not draining, then
+// the healthy backups as the last retries; the healthy backups alone if no other upstream is
+// healthy. If none is healthy, it fails open and returns every upstream that is not draining
+// (backups last), since a problem shared by all nodes (e.g. their database) is no reason to turn
+// every client away. Returns nothing only if every upstream of the pool is draining, or the pool
+// is gone. The order is the pool's balance (strategy.go); the client key matters for balance hash only.
+func (b *Balancer) Pick(site, pool string, key []byte) []*Upstream {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	siteConf := b.config.Site(site)
 	if siteConf == nil {
 		return nil
 	}
+	poolConf := siteConf.UpstreamNamed(pool)
+	if poolConf == nil {
+		return nil
+	}
 	var healthy, healthyBackups, unhealthy, unhealthyBackups []*Upstream
 	for _, id := range b.order {
 		u := b.upstreams[id]
-		if u.site != site || u.removed || u.drain != nil {
+		if u.site != site || u.pool != poolConf.Name || u.removed || u.drain != nil {
 			continue
 		}
 		switch ok := u.isHealthy(); {
@@ -133,22 +138,22 @@ func (b *Balancer) Pick(site string, key []byte) []*Upstream {
 		}
 	}
 	var turn uint64
-	if balance := siteConf.Upstream.Balance; balance == config.BalanceRoundRobin || balance == config.BalanceLeastConn {
-		turn = b.nextTurn(site)
+	if balance := poolConf.Balance; balance == config.BalanceRoundRobin || balance == config.BalanceLeastConn {
+		turn = b.nextTurn(PoolKey(site, poolConf.Name))
 	}
 	switch {
 	case len(healthy) > 0:
-		return sorted(siteConf, key, turn, healthy, healthyBackups)
+		return sorted(poolConf, key, turn, healthy, healthyBackups)
 	case len(healthyBackups) > 0:
-		return sorted(siteConf, key, turn, healthyBackups, nil)
+		return sorted(poolConf, key, turn, healthyBackups, nil)
 	}
-	return sorted(siteConf, key, turn, unhealthy, unhealthyBackups) // Fail open
+	return sorted(poolConf, key, turn, unhealthy, unhealthyBackups) // Fail open
 }
 
-// sorted returns the upstreams sorted by the site's balance, then the backups sorted the same way
-func sorted(site *config.Site, key []byte, turn uint64, upstreams, backups []*Upstream) []*Upstream {
-	sortFor(site, key, turn, upstreams)
-	sortFor(site, key, turn, backups)
+// sorted returns the upstreams sorted by the pool's balance, then the backups sorted the same way
+func sorted(pool *config.Upstream, key []byte, turn uint64, upstreams, backups []*Upstream) []*Upstream {
+	sortFor(pool, key, turn, upstreams)
+	sortFor(pool, key, turn, backups)
 	return append(upstreams, backups...)
 }
 
@@ -259,17 +264,16 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	var added, changed []*Upstream
 	addedIDs := make(map[string]bool)
 	changedByID := make(map[string]*Upstream)
-	for _, site := range conf.Sites {
-		for _, uc := range site.Upstream.Servers {
-			id := upstreamID(site.Name, uc.Name)
-			if u, ok := b.upstreams[id]; !ok {
-				added = append(added, newUpstream(site, uc))
-				addedIDs[id] = true
-			} else if !u.hasAddresses(uc.Addresses) {
-				probed := newUpstream(site, uc)
-				changed = append(changed, probed)
-				changedByID[id] = probed
-			}
+	for _, ps := range servers(conf) {
+		site, pool, uc := ps.site, ps.pool, ps.server
+		id := upstreamID(site, uc.Name)
+		if u, ok := b.upstreams[id]; !ok {
+			added = append(added, newUpstream(site, pool, uc))
+			addedIDs[id] = true
+		} else if !u.hasAddresses(uc.Addresses) {
+			probed := newUpstream(site, pool, uc)
+			changed = append(changed, probed)
+			changedByID[id] = probed
 		}
 	}
 	b.mu.RUnlock()
@@ -278,28 +282,25 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	// Swap in the new set, unless an upstream went away or changed in between
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, site := range conf.Sites {
-		for _, uc := range site.Upstream.Servers {
-			id := upstreamID(site.Name, uc.Name)
-			u, ok := b.upstreams[id]
-			if !ok && !addedIDs[id] {
-				return false
-			} else if ok && !u.hasAddresses(uc.Addresses) && changedByID[id] == nil {
-				return false
-			}
+	for _, ps := range servers(conf) {
+		id := upstreamID(ps.site, ps.server.Name)
+		u, ok := b.upstreams[id]
+		if !ok && !addedIDs[id] {
+			return false
+		} else if ok && !u.hasAddresses(ps.server.Addresses) && changedByID[id] == nil {
+			return false
 		}
 	}
 	now := time.Now()
 	wanted := make(map[string]bool)
 	order := make([]string, 0, conf.UpstreamCount())
-	for _, site := range conf.Sites {
-		for _, uc := range site.Upstream.Servers {
-			id := upstreamID(site.Name, uc.Name)
-			wanted[id] = true
-			order = append(order, id)
-			if u, ok := b.upstreams[id]; ok {
-				u.updateNoLock(site, uc, changedByID[id])
-			}
+	for _, ps := range servers(conf) {
+		site, pool, uc := ps.site, ps.pool, ps.server
+		id := upstreamID(site, uc.Name)
+		wanted[id] = true
+		order = append(order, id)
+		if u, ok := b.upstreams[id]; ok {
+			u.updateNoLock(pool, uc, changedByID[id])
 		}
 	}
 	for _, u := range added {
@@ -322,18 +323,25 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	}
 	b.order = order
 	b.config = conf
-	b.turns.Range(func(site, _ any) bool {
-		if conf.Site(site.(string)) == nil {
-			b.turns.Delete(site) // The site is gone; a site of that name later starts over
+	pools := make(map[string]bool)
+	for _, site := range conf.Sites {
+		for _, pool := range site.AllUpstreams() {
+			pools[PoolKey(site.Name, pool.Name)] = true
+		}
+	}
+	b.turns.Range(func(key, _ any) bool {
+		if !pools[key.(string)] {
+			b.turns.Delete(key) // The pool is gone; a pool of that name later starts over
 		}
 		return true
 	})
 	return true
 }
 
-// updateNoLock applies an upstream's reloaded config: back from removal, the site's health check, and
-// the addresses and first-probe health of probed, if they changed. The caller must hold Balancer.mu.
-func (u *Upstream) updateNoLock(site *config.Site, uc *config.Server, probed *Upstream) {
+// updateNoLock applies an upstream's reloaded config: back from removal, its pool (it may move to
+// another of the site's pools) and the pool's health check, and the addresses and first-probe
+// health of probed, if they changed. The caller must hold Balancer.mu.
+func (u *Upstream) updateNoLock(pool *config.Upstream, uc *config.Server, probed *Upstream) {
 	if u.removed {
 		slog.Info("Upstream re-added", "site", u.site, "upstream", u.name)
 		u.removed = false
@@ -345,10 +353,13 @@ func (u *Upstream) updateNoLock(site *config.Site, uc *config.Server, probed *Up
 		slog.Info("Upstream addresses changed", "site", u.site, "upstream", u.name, "addresses", uc.Addresses, "healthy", probed.isHealthy())
 		u.replaceAddressesNoLock(probed)
 	}
-	u.weight, u.backup = uc.Weight, uc.Backup
+	if u.pool != pool.Name {
+		slog.Info("Upstream moved to another upstream block", "site", u.site, "upstream", u.name, "from", u.pool, "to", pool.Name)
+	}
+	u.pool, u.weight, u.backup = pool.Name, uc.Weight, uc.Backup
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.health = site.Upstream.HealthCheck
+	u.health = pool.HealthCheck
 }
 
 // DrainUpstream takes an upstream ("site/name", or the name if only one site has it) out of
@@ -467,14 +478,20 @@ func (u *Upstream) AddressCount() int {
 	return len(u.addresses)
 }
 
-func newUpstream(site *config.Site, uc *config.Server) *Upstream {
+// PoolKey identifies one of a site's upstream blocks (a pool), "<site>/<name>"
+func PoolKey(site, pool string) string {
+	return site + "/" + pool
+}
+
+func newUpstream(site string, pool *config.Upstream, uc *config.Server) *Upstream {
 	return &Upstream{
-		id:          upstreamID(site.Name, uc.Name),
-		site:        site.Name,
+		id:          upstreamID(site, uc.Name),
+		site:        site,
 		name:        uc.Name,
+		pool:        pool.Name,
 		weight:      uc.Weight,
 		backup:      uc.Backup,
-		health:      site.Upstream.HealthCheck,
+		health:      pool.HealthCheck,
 		addresses:   slices.Clone(uc.Addresses),
 		addrStreams: make(map[string]int),
 		addrPending: make(map[string]int),
@@ -519,6 +536,24 @@ func upstreamID(site, name string) string {
 	return site + "/" + name
 }
 
+// servers returns every server of the config with its site's name and the pool it is in, in
+// config order (a site's upstream first, then its named upstreams by name)
+func servers(conf *config.Config) []*poolServer {
+	all := make([]*poolServer, 0, conf.UpstreamCount())
+	for _, site := range conf.Sites {
+		for _, pool := range site.AllUpstreams() {
+			for _, srv := range pool.Servers {
+				all = append(all, &poolServer{
+					site:   site.Name,
+					pool:   pool,
+					server: srv,
+				})
+			}
+		}
+	}
+	return all
+}
+
 // statusNoLock returns the upstream's snapshot. The caller must hold Balancer.mu.
 func (u *Upstream) statusNoLock(now time.Time) *UpstreamStatus {
 	u.mu.Lock()
@@ -526,6 +561,7 @@ func (u *Upstream) statusNoLock(now time.Time) *UpstreamStatus {
 	s := &UpstreamStatus{
 		Site:      u.site,
 		Name:      u.name,
+		Pool:      u.pool,
 		Healthy:   u.healthy,
 		Removed:   u.removed,
 		Weight:    u.weight,

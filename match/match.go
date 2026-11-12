@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -21,8 +22,16 @@ import (
 
 // ipInFunc is ipIn(ip, network...): whether ip is in any of the networks (CIDR prefixes or single
 // addresses). The networks must be string literals, so they are parsed once, at compile time.
+// header(name) and flag(name...) are rewritten to headerFunc($env, name) and flagFunc($env,
+// name...) at compile time: an expr function is a plain call, a func field of the env a reflect
+// call (~half the cost of ntfy's streams match).
 const (
-	ipInFunc = "ipIn"
+	ipInFunc   = "ipIn"
+	headerName = "header"
+	flagName   = "flag"
+	headerFunc = "_header"
+	flagFunc   = "_flag"
+	envName    = "$env"
 )
 
 var (
@@ -45,16 +54,18 @@ const (
 
 // Env is what a request expression sees
 type Env struct {
-	Method string                     `expr:"method"`
-	Path   string                     `expr:"path"`   // Decoded, without the query
-	Query  string                     `expr:"query"`  // Raw query string
-	URI    string                     `expr:"uri"`    // Path (escaped as sent) and query
-	Host   string                     `expr:"host"`   // The Host header
-	Scheme string                     `expr:"scheme"` // "http" or "https"
-	IP     string                     `expr:"ip"`     // Client address; IPv4-mapped IPv6 as IPv4
-	Site   string                     `expr:"site"`   // The site serving the host, "" if none does
-	Header func(name string) string   `expr:"header"` // First value of a header, "" if missing
-	Flag   func(names ...string) bool `expr:"flag"`   // See flag
+	Method string `expr:"method"`
+	Path   string `expr:"path"`   // Decoded, without the query
+	Query  string `expr:"query"`  // Raw query string
+	URI    string `expr:"uri"`    // Path (escaped as sent) and query
+	Host   string `expr:"host"`   // The Host header
+	Scheme string `expr:"scheme"` // "http" or "https"
+	IP     string `expr:"ip"`     // Client address; IPv4-mapped IPv6 as IPv4
+	Site   string `expr:"site"`   // The site serving the host, "" if none does
+
+	// header(name) is the first value of a header, "" if missing; flag(name...) see flag
+	req   *http.Request
+	query url.Values // The parsed query, once a flag needed it (an env serves one request at a time)
 }
 
 // ResponseEnv is what a response expression sees when a request ended: the request without its
@@ -97,13 +108,18 @@ func Compile(expression string, kind Kind) (*Program, error) {
 		expr.Patch(nets),
 		expr.Function(ipInFunc, nets.ipIn, new(func(string, ...string) bool)),
 	}
+	requestFuncs := []expr.Option{
+		expr.Patch(&requestCalls{}),
+		expr.Function(headerFunc, headerOf, new(func(Env, string) string)),
+		expr.Function(flagFunc, flagOf, new(func(Env, ...string) bool)),
+	}
 	switch kind {
 	case Request:
-		opts = append(opts, expr.Env(Env{}), expr.AsBool())
+		opts = append(append(opts, requestFuncs...), expr.Env(Env{}), expr.AsBool())
 	case Response:
 		opts = append(opts, expr.Env(ResponseEnv{}), expr.AsBool())
 	default:
-		opts = append(opts, expr.Env(Env{}), expr.AsKind(reflect.String))
+		opts = append(append(opts, requestFuncs...), expr.Env(Env{}), expr.AsKind(reflect.String))
 	}
 	program, err := expr.Compile(expression, opts...)
 	if err != nil {
@@ -130,10 +146,7 @@ func NewEnv(r *http.Request) *Env {
 		Host:   r.Host,
 		Scheme: scheme,
 		IP:     clientIP(r.RemoteAddr),
-		Header: r.Header.Get,
-		Flag: func(names ...string) bool {
-			return flag(r, names)
-		},
+		req:    r,
 	}
 }
 
@@ -173,6 +186,44 @@ func (p *Program) run(env any) any {
 		return nil
 	}
 	return out
+}
+
+// requestCalls rewrites header(...) and flag(...) to their functions, with the env as the first
+// argument (see headerFunc)
+type requestCalls struct{}
+
+func (requestCalls) Visit(node *ast.Node) {
+	call, ok := (*node).(*ast.CallNode)
+	if !ok {
+		return
+	}
+	callee, ok := call.Callee.(*ast.IdentifierNode)
+	if !ok {
+		return
+	}
+	switch callee.Value {
+	case headerName:
+		callee.Value = headerFunc
+	case flagName:
+		callee.Value = flagFunc
+	default:
+		return
+	}
+	call.Arguments = append([]ast.Node{&ast.IdentifierNode{Value: envName}}, call.Arguments...)
+}
+
+// headerOf is header(name) at runtime: the env and the name, as the type checker guarantees
+func headerOf(params ...any) (any, error) {
+	return params[0].(*Env).req.Header.Get(params[1].(string)), nil
+}
+
+// flagOf is flag(name...) at runtime
+func flagOf(params ...any) (any, error) {
+	names := make([]string, len(params)-1)
+	for i, p := range params[1:] {
+		names[i] = p.(string)
+	}
+	return params[0].(*Env).flag(names), nil
 }
 
 // Visit checks and parses the networks of every ipIn call; the first error fails the compile
@@ -247,15 +298,17 @@ func parsePrefix(s string) (netip.Prefix, error) {
 
 // flag is flag(name...), like ntfy's readParam for a boolean: the first of the names that is set
 // as a header, else the first set as a query parameter, decides; it is true if 1, yes or true
-func flag(r *http.Request, names []string) bool {
+func (e *Env) flag(names []string) bool {
 	for _, name := range names {
-		if v := strings.TrimSpace(r.Header.Get(name)); v != "" {
+		if v := strings.TrimSpace(e.req.Header.Get(name)); v != "" {
 			return isTrue(v)
 		}
 	}
-	query := r.URL.Query()
+	if e.query == nil {
+		e.query = e.req.URL.Query()
+	}
 	for _, name := range names {
-		if v := strings.TrimSpace(query.Get(name)); v != "" {
+		if v := strings.TrimSpace(e.query.Get(name)); v != "" {
 			return isTrue(v)
 		}
 	}

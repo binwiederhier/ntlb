@@ -8,10 +8,10 @@ import (
 	"heckel.io/ntlb/config"
 )
 
-// sortFor sorts some of a site's upstreams (in config order) by the site's balance, best first.
-// turn is the site's round-robin turn for this pick (see nextTurn), for round-robin and least-conn.
-func sortFor(site *config.Site, key []byte, turn uint64, upstreams []*Upstream) {
-	switch site.Upstream.Balance {
+// sortFor sorts some of a pool's upstreams (in config order) by the pool's balance, best first.
+// turn is the pool's round-robin turn for this pick (see nextTurn), for round-robin and least-conn.
+func sortFor(pool *config.Upstream, key []byte, turn uint64, upstreams []*Upstream) {
+	switch pool.Balance {
 	case config.BalanceHash:
 		byName := make(map[string]*Upstream, len(upstreams))
 		names := make([]string, len(upstreams))
@@ -32,11 +32,11 @@ func sortFor(site *config.Site, key []byte, turn uint64, upstreams []*Upstream) 
 	}
 }
 
-// nextTurn returns the site's next round-robin turn
-func (b *Balancer) nextTurn(site string) uint64 {
-	turn, ok := b.turns.Load(site)
+// nextTurn returns a pool's next round-robin turn (key: see PoolKey)
+func (b *Balancer) nextTurn(key string) uint64 {
+	turn, ok := b.turns.Load(key)
 	if !ok {
-		turn, _ = b.turns.LoadOrStore(site, &atomic.Uint64{})
+		turn, _ = b.turns.LoadOrStore(key, &atomic.Uint64{})
 	}
 	return turn.(*atomic.Uint64).Add(1) - 1
 }

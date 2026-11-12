@@ -38,7 +38,7 @@ access-logs:
   - file: /var/log/ntlb/access_error.log
 
 # TCP keepalive probes towards the clients. Dead peers are detected after idle + interval*count.
-# Set "disable: true" to turn them off. (Towards the servers: a site's upstream.keepalive.)
+# Set "disable: true" to turn them off. (Towards the servers: each upstream's keepalive.)
 client-keepalive:
   idle: 1m
   interval: 15s
@@ -84,7 +84,7 @@ gzip:
     - image/svg+xml
 
 # Rules. Request rules are checked in order before a request is proxied: these global rules first,
-# then the site's own. The first block, allow, redirect or static whose match is true decides, and
+# then the site's own. The first block, allow, redirect, static or proxy whose match is true decides, and
 # so does a limit that is exceeded. Anything no rule decides is proxied. Response rules ("on: response") are all checked when a request ended,
 # and only add strikes. A rule without match matches every request. A site's rules are named
 # "<site>/<name>" in logs and metrics.

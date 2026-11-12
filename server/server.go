@@ -364,6 +364,10 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			pr.rule, pr.kind = rule.ID, kindRequest
 			s.metrics.ruleMatches.WithLabelValues(rule.ID).Inc()
 		}
+		if rule != nil && rule.Action == config.ActionProxy {
+			pr.pool = rule.Upstream
+			rule = nil // Proxied like any other request, only to that upstream
+		}
 		pr.onFinish(func() {
 			status := pr.finalStatus() // Must not use sw: it references the server's connection state
 			respEnv.Status, respEnv.UpstreamStatus, respEnv.Rule = status, pr.upstreamStatus, pr.rule
@@ -408,7 +412,7 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 func boundAnswer(sw *statusWriter, r *http.Request, site *config.Site) http.ResponseWriter {
 	timeout := config.DefaultUpstreamReadTimeout
 	if site != nil {
-		timeout = site.Upstream.Timeouts.Read
+		timeout = site.DefaultUpstream().Timeouts.Read
 	}
 	if r.ContentLength != 0 {
 		sw.Header().Set(headerConnection, connectionClose)

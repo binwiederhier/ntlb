@@ -34,8 +34,8 @@ func TestNewEnv(t *testing.T) {
 	require.Equal(t, "/%6Ez_x/json?since=10m&poll=1", env.URI) // As sent
 	require.Equal(t, "http", env.Scheme)
 	require.Equal(t, "203.0.113.9", env.IP) // Unmapped
-	require.Equal(t, "ntfy/1.0", env.Header("user-agent"))
-	require.Equal(t, "", env.Header("X-Missing"))
+	require.Equal(t, "ntfy/1.0", env.req.Header.Get("user-agent"))
+	require.True(t, matches(t, `header("X-Missing") == ""`, r))
 
 	require.Equal(t, "2001:db8::1", NewEnv(testRequest("GET", "/", "[2001:db8::1]:80")).IP)
 	require.Equal(t, "192.0.2.1", NewEnv(testRequest("GET", "/", "192.0.2.1:80")).IP)
@@ -227,4 +227,41 @@ func TestSite(t *testing.T) {
 	p, err = Compile(`site == "ntfy"`, Response)
 	require.NoError(t, err)
 	require.True(t, p.Match(NewResponseEnv(env)))
+}
+
+func FuzzCompile(f *testing.F) {
+	// An expression either compiles or is an error, and a compiled one never panics on a request
+	f.Add(`method in ["GET", "POST"] && (ipIn(ip, "10.0.0.0/8") || path matches "^/x")`)
+	f.Add(`"https://" + host + uri`)
+	f.Add(`int(header("Content-Length")) > 10 && flag("poll", "po")`)
+	r := testRequest("POST", "/a,b/json?poll=1&x=%20", "[2001:db8::1]:1", "User-Agent", "x", "Content-Length", "abc")
+	env := NewEnv(r)
+	f.Fuzz(func(t *testing.T, expression string) {
+		for _, kind := range []Kind{Request, Response, String} {
+			p, err := Compile(expression, kind)
+			if err != nil {
+				continue
+			}
+			switch kind {
+			case Request:
+				p.Match(env)
+			case Response:
+				p.Match(NewResponseEnv(env))
+			default:
+				p.String(env)
+			}
+		}
+	})
+}
+
+func BenchmarkMatch_HeaderAndFlag(b *testing.B) {
+	// ntfy's streams match and abuse rule call header() and flag() on every request
+	p, err := Compile(`header("User-Agent") matches "(?i)ntfy-spy" || (method == "GET" && !flag("x-poll", "poll", "po"))`, Request)
+	require.NoError(b, err)
+	r := testRequest("GET", "/mytopic/json?since=10m", "192.0.2.1:1", "User-Agent", "ntfy/1.21")
+	for b.Loop() {
+		if !p.Match(NewEnv(r)) { // A new env per request, like the server
+			b.Fatal("expected a match")
+		}
+	}
 }

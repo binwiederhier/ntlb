@@ -112,8 +112,8 @@ func TestAccessLog_PerSite(t *testing.T) {
 listen-admin: '127.0.0.1:0'
 access-logs: [{file: %s}]
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], access-logs: [{file: %s}], `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
-  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], access-logs: [{file: %s}], `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
+  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
 `, global, siteLog, a1.addr(), b1.addr())), 0600))
 	s := startTestServer(t, filename)
 	for _, host := range []string{"a.com", "b.com", "c.com"} {
@@ -193,4 +193,42 @@ func TestAccessLog_LongFieldsTruncated(t *testing.T) {
 	require.LessOrEqual(t, len(e.request), len("GET ")+maxLogField+len("...")+len(" HTTP/1.1"))
 	require.True(t, strings.HasSuffix(e.userAgent, "..."))
 	require.LessOrEqual(t, len(e.userAgent), maxLogField+len("..."))
+}
+
+func FuzzAccessLog_Escape(f *testing.F) {
+	// No field can end its quotes or the line, whatever a client sends; an unquoted one has no
+	// spaces either, and every field stays bounded
+	f.Add("GET /a b \"x\" \\ \x00\xff\n")
+	f.Add(strings.Repeat("\x01", 5000))
+	f.Fuzz(func(t *testing.T, s string) {
+		for _, out := range []string{escape(s), escapeUnquoted(s)} {
+			require.LessOrEqual(t, len(out), maxLogField+4+3) // One escape past the limit, then "..."
+			for i := 0; i < len(out); i++ {
+				c := out[i]
+				require.True(t, c >= 0x20 && c <= 0x7e && c != '"', "byte %q in %q", c, out)
+				if c == '\\' {
+					require.Equal(t, byte('x'), out[i+1], out)
+				}
+			}
+		}
+		require.NotContains(t, escapeUnquoted(s), " ")
+	})
+}
+
+func FuzzAccessLog_RedactAuth(f *testing.F) {
+	f.Add("/t/json?auth=secret&x=1")
+	f.Add("/t/json?AUTH=a=b&auth")
+	f.Fuzz(func(t *testing.T, uri string) {
+		out := redactAuth(uri)
+		_, query, ok := strings.Cut(out, "?")
+		if !ok {
+			require.Equal(t, uri, out)
+			return
+		}
+		for p := range strings.SplitSeq(query, "&") {
+			if key, value, ok := strings.Cut(p, "="); ok && strings.EqualFold(key, "auth") {
+				require.Equal(t, "REDACTED", value)
+			}
+		}
+	})
 }

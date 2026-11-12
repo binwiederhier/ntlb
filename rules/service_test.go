@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	testBase = "sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]\n"
+	testBase = "sites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]\n"
 )
 
 func testConfig(t *testing.T, rules string) *config.Config {
@@ -79,7 +79,7 @@ sites:
   - name: a
     listen-http: ':80'
     hosts: [a.com]
-    upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}
+    upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}
     rules:
       - {name: abuse, match: 'path == "/site-abuse"', action: block, strike: 11}
       - {name: limit, action: limit, rate: 1/h}
@@ -87,7 +87,7 @@ sites:
   - name: b
     listen-http: ':80'
     hosts: [b.com]
-    upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}
+    upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}
     rules:
       - {name: limit, action: limit, rate: 1/h}
 `))
@@ -134,7 +134,7 @@ sites:
 }
 
 func TestEngine_SiteLimitKeptOnReload(t *testing.T) {
-	site := "sites: [{name: a, listen-http: ':80', upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}, rules: [{name: limit, action: limit, rate: 1/h}]}]"
+	site := "sites: [{name: a, listen-http: ':80', upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}, rules: [{name: limit, action: limit, rate: 1/h}]}]"
 	conf, err := config.Parse([]byte(site))
 	require.NoError(t, err)
 	e := New(conf, nil)
@@ -376,8 +376,8 @@ func TestBans_PerSite(t *testing.T) {
 bans: {file: /tmp/ban.log, threshold: 10}
 rules: [{name: abuse, match: 'path == "/abuse"', action: block, strike: 6}]
 sites:
-  - {name: a, listen-http: ':80', hosts: [a.com], bans: {file: /tmp/a-ban.log, threshold: 1}, upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}
-  - {name: b, listen-http: ':80', upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}
+  - {name: a, listen-http: ':80', hosts: [a.com], bans: {file: /tmp/a-ban.log, threshold: 1}, upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}}
+  - {name: b, listen-http: ':80', upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}}
 `))
 	require.NoError(t, err)
 	var bans []string

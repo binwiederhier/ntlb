@@ -31,11 +31,11 @@ func writeTestConfig(t *testing.T, extra string, handler http.Handler, names ...
 	var b strings.Builder
 	b.WriteString("listen-admin: '127.0.0.1:0'\n")
 	b.WriteString(extra)
-	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    upstream:\n      health-check: {interval: 1h, timeout: 1s}\n      servers:\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: '127.0.0.1:0'\n    upstreams:\n      default:\n        healthcheck: {interval: 1h, timeout: 1s}\n        servers:\n")
 	for _, name := range names {
 		upstream := httptest.NewServer(handler)
 		t.Cleanup(upstream.Close)
-		fmt.Fprintf(&b, "      - name: %s\n        addresses: [%q]\n", name, strings.TrimPrefix(upstream.URL, "http://"))
+		fmt.Fprintf(&b, "        - name: %s\n          addresses: [%q]\n", name, strings.TrimPrefix(upstream.URL, "http://"))
 	}
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(b.String()), 0600))
@@ -191,6 +191,11 @@ func TestUpstreamNote(t *testing.T) {
 			name:     "weighted backup",
 			upstream: &balancer.UpstreamStatus{State: balancer.StateHealthy, Healthy: true, Weight: 3, Backup: true},
 			note:     `^backup; weight 3$`,
+		},
+		{
+			name:     "in a named upstream",
+			upstream: &balancer.UpstreamStatus{State: balancer.StateHealthy, Healthy: true, Pool: "app1", Weight: 2},
+			note:     `^upstreams\.app1; weight 2$`,
 		},
 		{
 			name:     "weight 1 is no note",

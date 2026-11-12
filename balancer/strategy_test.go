@@ -22,9 +22,9 @@ func newStrategyBalancer(t *testing.T, balance string, upstreams ...*testUpstrea
 func newWeightedBalancer(t *testing.T, balance string, upstreams []*testUpstream, settings []string) *Balancer {
 	t.Helper()
 	var b strings.Builder
-	b.WriteString("sites:\n  - name: s\n    listen-http: ':0'\n    upstream:\n      balance: " + balance + "\n      health-check: {interval: 1h, timeout: 1s}\n      servers:\n")
+	b.WriteString("sites:\n  - name: s\n    listen-http: ':0'\n    upstreams:\n      default:\n        balance: " + balance + "\n        healthcheck: {interval: 1h, timeout: 1s}\n        servers:\n")
 	for i, u := range upstreams {
-		fmt.Fprintf(&b, "      - {name: %s, addresses: [%q]", u.name, u.addr())
+		fmt.Fprintf(&b, "        - {name: %s, addresses: [%q]", u.name, u.addr())
 		if settings[i] != "" {
 			b.WriteString(", " + settings[i])
 		}
@@ -39,7 +39,7 @@ func newWeightedBalancer(t *testing.T, balance string, upstreams []*testUpstream
 func firstPicks(b *Balancer, n int) map[string]int {
 	picks := make(map[string]int)
 	for i := range n {
-		picks[b.Pick("s", keyFor(i))[0].Name()]++
+		picks[b.Pick("s", "", keyFor(i))[0].Name()]++
 	}
 	return picks
 }
@@ -49,8 +49,8 @@ func TestStrategy_RoundRobin(t *testing.T) {
 	app1, app2, app3 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2"), newTestUpstream(t, "app3")
 	b := newStrategyBalancer(t, config.BalanceRoundRobin, app1, app2, app3)
 	require.Equal(t, map[string]int{"app1": 2, "app2": 2, "app3": 2}, firstPicks(b, 6))
-	first := names(b.Pick("s", keyFor(1)))
-	second := names(b.Pick("s", keyFor(1)))
+	first := names(b.Pick("s", "", keyFor(1)))
+	second := names(b.Pick("s", "", keyFor(1)))
 	require.Len(t, first, 3)
 	require.NotEqual(t, first[0], second[0]) // The same client too
 
@@ -60,7 +60,7 @@ func TestStrategy_RoundRobin(t *testing.T) {
 	b.checkHealth(context.Background())
 	b.checkHealth(context.Background())
 	require.Equal(t, map[string]int{"app1": 5, "app3": 5}, firstPicks(b, 10))
-	require.NotContains(t, names(b.Pick("s", keyFor(1))), "app2")
+	require.NotContains(t, names(b.Pick("s", "", keyFor(1))), "app2")
 }
 
 func TestStrategy_LeastConn(t *testing.T) {
@@ -71,13 +71,13 @@ func TestStrategy_LeastConn(t *testing.T) {
 	newTestSession(b, "app1")
 	newTestSession(b, "app1")
 	newTestSession(b, "app3")
-	require.Equal(t, []string{"app2", "app3", "app1"}, names(b.Pick("s", keyFor(1))))
+	require.Equal(t, []string{"app2", "app3", "app1"}, names(b.Pick("s", "", keyFor(1))))
 
 	// A reserved attempt counts as well: a burst of new requests spreads before any attaches
 	s := b.NewSession(func(error) {})
 	b.Reserve(s, b.upstream("app2"))
 	b.Reserve(b.NewSession(func(error) {}), b.upstream("app2"))
-	require.Equal(t, "app3", names(b.Pick("s", keyFor(1)))[0]) // 1, then app1 and app2 with 2 each
+	require.Equal(t, "app3", names(b.Pick("s", "", keyFor(1)))[0]) // 1, then app1 and app2 with 2 each
 	b.Close(s)
 	require.Equal(t, map[string]int{"app2": 1, "app3": 1}, firstPicks(b, 2)) // 1 each now: in turn
 }
@@ -93,7 +93,7 @@ func TestStrategy_RandomTwo(t *testing.T) {
 	require.Zero(t, picks["app1"])
 	require.Greater(t, picks["app2"], 350)
 	require.Greater(t, picks["app3"], 350)
-	require.Len(t, b.Pick("s", keyFor(1)), 3)
+	require.Len(t, b.Pick("s", "", keyFor(1)), 3)
 
 	// Two upstreams: always the less busy one
 	b = newStrategyBalancer(t, config.BalanceRandomTwo, app1, app2)
@@ -107,8 +107,8 @@ func TestStrategy_Hash(t *testing.T) {
 	b := newStrategyBalancer(t, config.BalanceHash, app1, app2, app3)
 	other := newStrategyBalancer(t, config.BalanceHash, app3, app2, app1)
 	for i := range 100 {
-		require.Equal(t, names(b.Pick("s", keyFor(i))), names(b.Pick("s", keyFor(i))))
-		require.Equal(t, names(b.Pick("s", keyFor(i))), names(other.Pick("s", keyFor(i))))
+		require.Equal(t, names(b.Pick("s", "", keyFor(i))), names(b.Pick("s", "", keyFor(i))))
+		require.Equal(t, names(b.Pick("s", "", keyFor(i))), names(other.Pick("s", "", keyFor(i))))
 	}
 	picks := firstPicks(b, 3000)
 	for _, name := range []string{"app1", "app2", "app3"} {
@@ -119,12 +119,12 @@ func TestStrategy_Hash(t *testing.T) {
 func TestStrategy_TurnsOfRemovedSitesForgotten(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	b := newStrategyBalancer(t, config.BalanceRoundRobin, app1, newTestUpstream(t, "app2"))
-	b.Pick("s", nil)
-	_, ok := b.turns.Load("s")
+	b.Pick("s", "", nil)
+	_, ok := b.turns.Load("s/default")
 	require.True(t, ok)
-	conf := mustParse(t, "sites: [{name: other, listen-http: ':0', upstream: {balance: round-robin, health-check: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: ['"+app1.addr()+"']}]}}]")
+	conf := mustParse(t, "sites: [{name: other, listen-http: ':0', upstreams: {default: {balance: round-robin, healthcheck: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: ['"+app1.addr()+"']}]}}}]")
 	b.Update(conf)
-	_, ok = b.turns.Load("s")
+	_, ok = b.turns.Load("s/default")
 	require.False(t, ok)
 }
 
@@ -133,7 +133,7 @@ func TestStrategy_WeightedRoundRobin(t *testing.T) {
 	app1, app2, app3 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2"), newTestUpstream(t, "app3")
 	b := newWeightedBalancer(t, config.BalanceRoundRobin, []*testUpstream{app1, app2, app3}, []string{"weight: 3", "", "weight: 2"})
 	require.Equal(t, map[string]int{"app1": 300, "app2": 100, "app3": 200}, firstPicks(b, 600))
-	require.Len(t, b.Pick("s", keyFor(1)), 3) // The others are still the retries
+	require.Len(t, b.Pick("s", "", keyFor(1)), 3) // The others are still the retries
 }
 
 func TestStrategy_WeightedLeastConn(t *testing.T) {
@@ -143,7 +143,7 @@ func TestStrategy_WeightedLeastConn(t *testing.T) {
 	newTestSession(b, "app1")
 	newTestSession(b, "app1")
 	newTestSession(b, "app2")
-	require.Equal(t, []string{"app1", "app2"}, names(b.Pick("s", keyFor(1))))
+	require.Equal(t, []string{"app1", "app2"}, names(b.Pick("s", "", keyFor(1))))
 }
 
 func TestStrategy_WeightedRandomTwo(t *testing.T) {
@@ -165,8 +165,8 @@ func TestStrategy_WeightedHash(t *testing.T) {
 	equal := newWeightedBalancer(t, config.BalanceHash, []*testUpstream{app1, app2}, []string{"weight: 2", "weight: 2"})
 	unweighted := newStrategyBalancer(t, config.BalanceHash, app1, app2)
 	for i := range 200 {
-		require.Equal(t, names(b.Pick("s", keyFor(i))), names(other.Pick("s", keyFor(i))))
-		require.Equal(t, names(unweighted.Pick("s", keyFor(i))), names(equal.Pick("s", keyFor(i))))
+		require.Equal(t, names(b.Pick("s", "", keyFor(i))), names(other.Pick("s", "", keyFor(i))))
+		require.Equal(t, names(unweighted.Pick("s", "", keyFor(i))), names(equal.Pick("s", "", keyFor(i))))
 	}
 }
 
@@ -175,7 +175,7 @@ func TestStrategy_Backup(t *testing.T) {
 	app1, app2, app3 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2"), newTestUpstream(t, "app3")
 	b := newWeightedBalancer(t, config.BalanceRoundRobin, []*testUpstream{app1, app2, app3}, []string{"", "backup: true", ""})
 	require.Equal(t, map[string]int{"app1": 50, "app3": 50}, firstPicks(b, 100))
-	require.Equal(t, "app2", names(b.Pick("s", keyFor(1)))[2])
+	require.Equal(t, "app2", names(b.Pick("s", "", keyFor(1)))[2])
 
 	// The others down: the backup only
 	app1.ready.Store(false)
@@ -183,14 +183,14 @@ func TestStrategy_Backup(t *testing.T) {
 	for range 3 {
 		b.checkHealth(context.Background())
 	}
-	require.Equal(t, []string{"app2"}, names(b.Pick("s", keyFor(1))))
+	require.Equal(t, []string{"app2"}, names(b.Pick("s", "", keyFor(1))))
 
 	// All down: fail open, the backup last
 	app2.ready.Store(false)
 	for range 3 {
 		b.checkHealth(context.Background())
 	}
-	require.Equal(t, "app2", names(b.Pick("s", keyFor(1)))[2])
+	require.Equal(t, "app2", names(b.Pick("s", "", keyFor(1)))[2])
 }
 
 func TestStrategy_WeightAndBackupInStatus(t *testing.T) {

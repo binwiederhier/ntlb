@@ -231,7 +231,7 @@ const (
 	testStreamsMatch = `method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")`
 	testHealthPath   = "/v1/ready" // ntfy's readiness, which the test upstreams answer
 	testNtfySite     = "streams: {match: '" + testStreamsMatch + "'}"
-	testNtfyUpstream = "balance: hash, health-check: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}"
+	testNtfyUpstream = "balance: hash, healthcheck: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}"
 )
 
 // siteKeys are the settings writeConfig moves from extra into the site, upstreamKeys those it
@@ -277,13 +277,13 @@ func siteYAML(settings []string, upstreams ...*testUpstream) string {
 	if !streams {
 		b.WriteString("    streams: {match: '" + testStreamsMatch + "'}\n")
 	}
-	b.WriteString("    upstream:\n      balance: hash\n      health-check: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}\n")
+	b.WriteString("    upstreams:\n      default:\n        balance: hash\n        healthcheck: {path: " + testHealthPath + ", interval: 1h, timeout: 1s}\n")
 	for _, setting := range upstream {
-		b.WriteString("      " + setting + "\n")
+		b.WriteString("        " + setting + "\n")
 	}
-	b.WriteString("      servers:\n")
+	b.WriteString("        servers:\n")
 	for _, u := range upstreams {
-		fmt.Fprintf(&b, "      - name: %s\n        addresses: [%q]\n", u.name, u.addr())
+		fmt.Fprintf(&b, "        - name: %s\n          addresses: [%q]\n", u.name, u.addr())
 	}
 	return b.String()
 }
@@ -456,7 +456,7 @@ func TestServer_ReloadRemovesAndAddsUpstreams(t *testing.T) {
 	})
 
 	// A broken config is rejected and changes nothing
-	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstream: {servers: []}}]"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {servers: []}}}]"), 0600))
 	_, err := s.Reload()
 	require.Error(t, err)
 	require.Len(t, s.balancer.Status().Upstreams, 2)
@@ -579,8 +579,8 @@ func TestServer_ReloadOpensAndClosesListeners(t *testing.T) {
 	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
 	dir := t.TempDir()
 	filename := filepath.Join(dir, "config.yml")
-	siteA := fmt.Sprintf("  - {name: a, listen-http: '127.0.0.1:0', "+testNtfySite+", upstream: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}\n", a1.addr())
-	siteB := fmt.Sprintf("  - {name: b, listen-http: '127.0.0.2:0', "+testNtfySite+", upstream: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}\n", b1.addr())
+	siteA := fmt.Sprintf("  - {name: a, listen-http: '127.0.0.1:0', "+testNtfySite+", upstreams: {default: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}}\n", a1.addr())
+	siteB := fmt.Sprintf("  - {name: b, listen-http: '127.0.0.2:0', "+testNtfySite+", upstreams: {default: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}}\n", b1.addr())
 	write := func(sites string) {
 		require.NoError(t, os.WriteFile(filename, []byte("listen-admin: '127.0.0.1:0'\nsites:\n"+sites), 0600))
 	}
@@ -641,12 +641,12 @@ func TestServer_ReloadOpensAndClosesListeners(t *testing.T) {
 
 	// An address cannot switch between HTTP and HTTPS without a restart
 	writeTestCert(t, filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), "a.com")
-	write(fmt.Sprintf("  - {name: a, listen-https: '127.0.0.1:0', cert-file: %s, key-file: %s, upstream: {servers: [{name: app1, addresses: [%q]}]}}\n", filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), a1.addr()))
+	write(fmt.Sprintf("  - {name: a, listen-https: '127.0.0.1:0', cert-file: %s, key-file: %s, upstreams: {default: {servers: [{name: app1, addresses: [%q]}]}}}\n", filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), a1.addr()))
 	_, err = s.Reload()
 	require.ErrorContains(t, err, "restart")
 
 	// A new address that cannot be bound rejects the reload
-	write(siteA + "  - {name: c, listen-http: '192.0.2.1:80', upstream: {servers: [{name: x, addresses: ['127.0.0.1:1']}]}}\n")
+	write(siteA + "  - {name: c, listen-http: '192.0.2.1:80', upstreams: {default: {servers: [{name: x, addresses: ['127.0.0.1:1']}]}}}\n")
 	_, err = s.Reload()
 	require.Error(t, err)
 	require.Len(t, s.config.Load().Sites, 1)
@@ -776,7 +776,7 @@ func TestServer_ReloadAddsSiteFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 include: [sites.d/*.yml]
-sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}]
+sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}]
 `, a1.addr())), 0600))
 	s := startTestServer(t, filename)
 	getHost := func(host string) {
@@ -792,7 +792,7 @@ sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstream: {`+tes
 	getHost("b.com")
 	require.Equal(t, int64(1), a1.hits.Load())
 
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], "+testNtfySite+", upstream: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}]\n", b1.addr())), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], "+testNtfySite+", upstreams: {default: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}}]\n", b1.addr())), 0600))
 	requireReload(t, s)
 	getHost("b.com")
 	require.Equal(t, int64(1), b1.hits.Load())
@@ -922,7 +922,7 @@ func newNtfyPackagedServer(t *testing.T, upstreams ...*testUpstream) (*Server, s
 	).Replace(string(main))
 	var servers strings.Builder
 	for _, u := range upstreams {
-		fmt.Fprintf(&servers, "        - name: %s\n          addresses: [%q]\n", u.name, u.addr())
+		fmt.Fprintf(&servers, "          - name: %s\n            addresses: [%q]\n", u.name, u.addr())
 	}
 	siteConf := strings.NewReplacer(
 		`listen-http: ":80"`, `listen-http: "127.0.0.1:0"`,
@@ -932,10 +932,10 @@ func newNtfyPackagedServer(t *testing.T, upstreams ...*testUpstream) (*Server, s
 		`"198.51.100.7", "203.0.113.0/24"`, `"127.0.0.41", "203.0.113.0/24"`,
 		"burst: 1000", "burst: 3",
 	).Replace(string(site))
-	i := strings.Index(siteConf, "      servers:\n")
+	i := strings.Index(siteConf, "        servers:\n")
 	j := strings.Index(siteConf, "\n\n    # Rules of this site")
 	require.True(t, i > 0 && j > i, "servers section not found")
-	siteConf = siteConf[:i] + "      servers:\n" + servers.String() + siteConf[j+1:]
+	siteConf = siteConf[:i] + "        servers:\n" + servers.String() + siteConf[j+1:]
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yml"), []byte(mainConf), 0600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "ntfy.yml"), []byte(siteConf), 0600))
 	return startTestServer(t, filepath.Join(dir, "config.yml")), dir
@@ -1133,14 +1133,15 @@ func TestServer_HotReloadUpstreamSettings(t *testing.T) {
 sites:
   - name: s
     listen-http: '127.0.0.1:0'
-    upstream:
-      balance: round-robin
-      health-check: {path: /v1/ready, interval: 1h, timeout: 1s}
+    upstreams:
+      default:
+        balance: round-robin
+        healthcheck: {path: /v1/ready, interval: 1h, timeout: 1s}
 %s`, upstream)
 		require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	}
 	servers := func(app1Settings, app2Settings string) string {
-		return fmt.Sprintf("      servers:\n        - {name: app1, addresses: [%q]%s}\n        - {name: app2, addresses: [%q]%s}\n", app1.addr(), app1Settings, app2.addr(), app2Settings)
+		return fmt.Sprintf("        servers:\n          - {name: app1, addresses: [%q]%s}\n          - {name: app2, addresses: [%q]%s}\n", app1.addr(), app1Settings, app2.addr(), app2Settings)
 	}
 	picks := func(s *Server, n int) map[string]int {
 		counts := make(map[string]int)
@@ -1169,7 +1170,7 @@ sites:
 	require.Equal(t, http.StatusOK, status)
 
 	// A shorter read timeout: the slow answer is a 504 now
-	write("      timeouts: {read: 100ms}\n" + servers(", backup: true", ""))
+	write("        timeouts: {read: 100ms}\n" + servers(", backup: true", ""))
 	requireReload(t, s)
 	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/slow")
 	require.Equal(t, http.StatusGatewayTimeout, status)
@@ -1187,11 +1188,12 @@ func TestServer_BackupTakesOverWhenOthersFail(t *testing.T) {
 sites:
   - name: s
     listen-http: '127.0.0.1:0'
-    upstream:
-      health-check: {path: /v1/ready, interval: 1h, timeout: 1s, fails: 1}
-      servers:
-        - {name: app1, addresses: [%q]}
-        - {name: spare, addresses: [%q], backup: true}
+    upstreams:
+      default:
+        healthcheck: {path: /v1/ready, interval: 1h, timeout: 1s, fails: 1}
+        servers:
+          - {name: app1, addresses: [%q]}
+          - {name: spare, addresses: [%q], backup: true}
 `, app1.addr(), app2.addr())), 0600))
 	s := startTestServer(t, filename)
 	_, name := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")

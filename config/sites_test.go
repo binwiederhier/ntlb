@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	testUp = "upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}"
+	testUp = "upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}"
 )
 
 func TestParse_Sites(t *testing.T) {
@@ -20,27 +20,27 @@ sites:
   - name: ntfy
     listen-http: ":80"
     hosts: [ntfy.sh, "*.ntfy.sh"]
-    upstream: {servers: [{name: app1, addresses: ['10.0.0.1:2586']}]}
+    upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:2586']}]}}
     rules: [{name: limit, action: limit, rate: 1/s}]
   - name: other
     listen-http: [":80", ":8080"]
     hosts: [Example.COM., "*.eu.ntfy.sh"]
     streams: {match: 'false'}
-    upstream: {health-check: {path: /healthz, interval: 10s}, servers: [{name: app1, addresses: ['10.0.0.2:80']}]}
+    upstreams: {default: {healthcheck: {path: /healthz, interval: 10s}, servers: [{name: app1, addresses: ['10.0.0.2:80']}]}}
   - name: fallback
     listen-http: ":80"
-    upstream: {servers: [{name: web, addresses: ['10.0.0.3:80']}]}
+    upstreams: {default: {servers: [{name: web, addresses: ['10.0.0.3:80']}]}}
 `))
 	require.NoError(t, err)
 	require.Len(t, c.Sites, 3)
 
 	// Defaults are per site
 	ntfy, other := c.Sites[0], c.Sites[1]
-	require.Equal(t, DefaultHealthPath, ntfy.Upstream.HealthCheck.Path)
+	require.Equal(t, DefaultHealthPath, ntfy.DefaultUpstream().HealthCheck.Path)
 	require.Equal(t, DefaultStreamsMatch, ntfy.Streams.Match)
-	require.Equal(t, "/healthz", other.Upstream.HealthCheck.Path)
-	require.Equal(t, 10*time.Second, other.Upstream.HealthCheck.Interval)
-	require.Equal(t, DefaultHealthFails, other.Upstream.HealthCheck.Fails)
+	require.Equal(t, "/healthz", other.DefaultUpstream().HealthCheck.Path)
+	require.Equal(t, 10*time.Second, other.DefaultUpstream().HealthCheck.Interval)
+	require.Equal(t, DefaultHealthFails, other.DefaultUpstream().HealthCheck.Fails)
 	require.Equal(t, []string{"example.com", "*.eu.ntfy.sh"}, other.Hosts) // Normalized
 	require.Equal(t, ListenAddrs{":80"}, ntfy.ListenHTTP)                  // A single address or a list
 	require.Equal(t, ListenAddrs{":80", ":8080"}, other.ListenHTTP)
@@ -118,7 +118,7 @@ rules: [{name: limit, action: limit, rate: 1/s, strike: 1}]
 sites:
   - name: a
     listen-http: ':80'
-    upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}
+    upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}
     rules: [{name: limit, action: limit, rate: 2/s, strike: 1}, {name: site, match: 'site == "a"', action: block}]
 `))
 	require.NoError(t, err)
@@ -163,7 +163,7 @@ func TestParse_SitesInvalid(t *testing.T) {
 		"overlapping listeners":    "sites: [{name: a, listen-http: ':80', " + testUp + "}, {name: b, listen-http: '0.0.0.0:80', hosts: [b.com], " + testUp + "}]",
 		"overlapping ipv6":         "sites: [{name: a, listen-http: '[::]:80', " + testUp + "}, {name: b, listen-http: '10.0.0.1:80', hosts: [b.com], " + testUp + "}]",
 		"same address respelled":   "sites: [{name: a, listen-http: '127.0.0.1:80', " + testUp + "}, {name: b, listen-http: '[::ffff:127.0.0.1]:80', hosts: [b.com], " + testUp + "}]",
-		"duplicate upstream":       "sites: [{name: a, listen-http: ':80', upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}, {name: x, addresses: ['1.2.3.5:80']}]}}]",
+		"duplicate upstream":       "sites: [{name: a, listen-http: ':80', upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}, {name: x, addresses: ['1.2.3.5:80']}]}}}]",
 		"two defaults":             "sites: [{name: a, " + up + "}, {name: b, " + up + "}]",
 		"duplicate host":           "sites: [{name: a, hosts: [a.com], " + up + "}, {name: b, hosts: [A.com], " + up + "}]",
 		"duplicate wildcard":       "sites: [{name: a, hosts: ['*.a.com'], " + up + "}, {name: b, hosts: ['*.a.com'], " + up + "}]",
@@ -172,12 +172,12 @@ func TestParse_SitesInvalid(t *testing.T) {
 		"bad wildcard":             "sites: [{name: a, hosts: ['a.*.com'], " + up + "}]",
 		"bare wildcard":            "sites: [{name: a, hosts: ['*'], " + up + "}]",
 		"cert without key":         "sites: [{name: a, cert-file: /x.pem, " + up + "}]",
-		"bad health check":         "sites: [{name: a, health-check: {interval: 1s, timeout: 2s}, " + up + "}]",
+		"bad health check":         "sites: [{name: a, healthcheck: {interval: 1s, timeout: 2s}, " + up + "}]",
 		"bad streams":              "sites: [{name: a, streams: {match: 'status == 1'}, " + up + "}]",
 		"bad site rule":            "sites: [{name: a, rules: [{name: r}], " + up + "}]",
 		"duplicate site rule":      "sites: [{name: a, rules: [{name: r, action: block}, {name: r, action: block}], " + up + "}]",
 		"site rule strike no bans": "sites: [{name: a, rules: [{name: r, action: block, strike: 1}], " + up + "}]",
-		"top-level upstreams gone": "upstream: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}",
+		"top-level upstreams gone": "upstreams: {default: {servers: [{name: x, addresses: ['1.2.3.4:80']}]}}",
 		"top-level listen gone":    "listen-http: ':80'\nsites: [{name: a, " + up + "}]",
 		"unknown site field":       "sites: [{name: a, path: /x, " + up + "}]",
 	}
@@ -238,7 +238,7 @@ sites: [{name: a, listen-http: ':80', hosts: [a.com], `+testUp+`}]
 	require.ErrorContains(t, err, "c.yml")
 	writeFile(t, filepath.Join(dir, "conf.d", "c.yml"), "sites: [{name: c, listen-http: ':80', hosts: [c.com]}]\n")
 	_, err = Load(filepath.Join(dir, "config.yml"))
-	require.ErrorContains(t, err, "site c ("+filepath.Join(dir, "conf.d", "c.yml")+"): upstream is required")
+	require.ErrorContains(t, err, "site c ("+filepath.Join(dir, "conf.d", "c.yml")+"): upstreams.default is required")
 
 	// A site name taken twice, across files
 	writeFile(t, filepath.Join(dir, "conf.d", "c.yml"), "sites: [{name: main, listen-http: ':80', hosts: [c.com], "+testUp+"}]\n")
@@ -356,12 +356,12 @@ sites:
 
 func TestParse_Balance(t *testing.T) {
 	for _, balance := range []string{BalanceRoundRobin, BalanceLeastConn, BalanceRandomTwo, BalanceHash} {
-		c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {balance: " + balance + ", servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
+		c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {balance: " + balance + ", servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]"))
 		require.NoError(t, err, balance)
-		require.Equal(t, balance, c.Sites[0].Upstream.Balance)
+		require.Equal(t, balance, c.Sites[0].DefaultUpstream().Balance)
 	}
-	_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {balance: ip-hash, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}]"))
-	require.ErrorContains(t, err, "site s: invalid upstream.balance \"ip-hash\"")
+	_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {balance: ip-hash, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]"))
+	require.ErrorContains(t, err, "site s: invalid upstreams.default.balance \"ip-hash\"")
 }
 
 func TestParse_Upstream(t *testing.T) {
@@ -371,21 +371,23 @@ func TestParse_Upstream(t *testing.T) {
 sites:
   - name: a
     listen-http: ':80'
-    upstream:
-      balance: least-conn
-      timeouts: {connect: 2s, read: 3m}
-      keepalive: {idle: 30s}
-      health-check: {path: /ready}
-      servers:
-        - name: app1
-          addresses: ['10.0.0.1:1-2']
+    upstreams:
+      default:
+        balance: least-conn
+        timeouts: {connect: 2s, read: 3m}
+        keepalive: {idle: 30s}
+        healthcheck: {path: /ready}
+        servers:
+          - name: app1
+            addresses: ['10.0.0.1:1-2']
   - name: b
     listen-http: ':81'
-    upstream:
-      servers: [{name: app1, addresses: ['10.0.0.2:1']}]
+    upstreams:
+      default:
+        servers: [{name: app1, addresses: ['10.0.0.2:1']}]
 `))
 	require.NoError(t, err)
-	a, b := c.Sites[0].Upstream, c.Sites[1].Upstream
+	a, b := c.Sites[0].DefaultUpstream(), c.Sites[1].DefaultUpstream()
 	require.Equal(t, BalanceLeastConn, a.Balance)
 	require.Equal(t, &Timeouts{Connect: 2 * time.Second, Read: 3 * time.Minute}, a.Timeouts)
 	require.Equal(t, 30*time.Second, a.Keepalive.Idle)
@@ -403,15 +405,15 @@ sites:
 
 func TestParse_UpstreamRequired(t *testing.T) {
 	_, err := Parse([]byte("sites: [{name: a, listen-http: ':80'}]"))
-	require.ErrorContains(t, err, "site a: upstream is required")
-	_, err = Parse([]byte("sites: [{name: a, listen-http: ':80', upstream: {balance: hash}}]"))
-	require.ErrorContains(t, err, "site a: at least one server is required (upstream.servers)")
+	require.ErrorContains(t, err, "site a: upstreams.default is required")
+	_, err = Parse([]byte("sites: [{name: a, listen-http: ':80', upstreams: {default: {balance: hash}}}]"))
+	require.ErrorContains(t, err, "site a: at least one server is required (upstreams.default.servers)")
 }
 
 func TestParse_ServerWeightAndBackup(t *testing.T) {
-	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80'], weight: 3}, {name: b, addresses: ['1.2.3.5:80']}, {name: c, addresses: ['1.2.3.6:80'], backup: true}]}}]"))
+	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80'], weight: 3}, {name: b, addresses: ['1.2.3.5:80']}, {name: c, addresses: ['1.2.3.6:80'], backup: true}]}}}]"))
 	require.NoError(t, err)
-	servers := c.Sites[0].Upstream.Servers
+	servers := c.Sites[0].DefaultUpstream().Servers
 	require.Equal(t, 3, servers[0].Weight)
 	require.Equal(t, 1, servers[1].Weight) // Default
 	require.False(t, servers[1].Backup)
@@ -420,9 +422,91 @@ func TestParse_ServerWeightAndBackup(t *testing.T) {
 		"-1":   "server a: weight must be between 1 and 1000",
 		"1001": "server a: weight must be between 1 and 1000",
 	} {
-		_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80'], weight: " + weight + "}]}}]"))
+		_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80'], weight: " + weight + "}]}}}]"))
 		require.ErrorContains(t, err, errMsg, weight)
 	}
-	_, err = Parse([]byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['1.2.3.4:80'], backup: true}]}}]"))
+	_, err = Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80'], backup: true}]}}}]"))
 	require.ErrorContains(t, err, "site s: at least one server must not be a backup")
+}
+
+func TestParse_NamedUpstreams(t *testing.T) {
+	// A site's upstreams by name: default takes what no rule routes, the others what proxy rules
+	// send there, each with its own balance, timeouts and health check
+	c, err := Parse([]byte(`
+sites:
+  - name: s
+    listen-http: ':80'
+    upstreams:
+      app2:
+        timeouts: {read: 5m}
+        servers: [{name: b1, addresses: ['10.0.2.1:80']}]
+      default:
+        servers: [{name: web, addresses: ['10.0.0.1:80']}]
+      app1:
+        balance: least-conn
+        healthcheck: {path: /healthz}
+        servers:
+          - {name: a1, addresses: ['10.0.1.1:80']}
+          - {name: a2, addresses: ['10.0.1.2:80']}
+    rules:
+      - {name: to-app1, match: 'path startsWith "/app1/"', action: proxy, upstream: app1}
+      - {name: to-default, match: 'path == "/x"', action: proxy, upstream: default}
+`))
+	require.NoError(t, err)
+	site := c.Sites[0]
+
+	// The default first, then the others by name, all with their defaults applied
+	upstreams := site.AllUpstreams()
+	require.Len(t, upstreams, 3)
+	require.Equal(t, []string{UpstreamDefault, "app1", "app2"}, []string{upstreams[0].Name, upstreams[1].Name, upstreams[2].Name})
+	require.Same(t, site.Upstreams[UpstreamDefault], site.DefaultUpstream())
+	app1, app2 := site.Upstreams["app1"], site.Upstreams["app2"]
+	require.Equal(t, BalanceLeastConn, app1.Balance)
+	require.Equal(t, "/healthz", app1.HealthCheck.Path)
+	require.Equal(t, DefaultHealthInterval, app1.HealthCheck.Interval)
+	require.Equal(t, DefaultBalance, app2.Balance)
+	require.Equal(t, 5*time.Minute, app2.Timeouts.Read)
+	require.Equal(t, DefaultUpstreamConnectTimeout, app2.Timeouts.Connect)
+	require.Equal(t, 4, c.UpstreamCount())
+
+	// Lookup by name, "" being the default
+	require.Same(t, app1, site.UpstreamNamed("app1"))
+	require.Same(t, site.DefaultUpstream(), site.UpstreamNamed(""))
+	require.Nil(t, site.UpstreamNamed("nope"))
+
+	// Proxy rules name their upstream
+	require.Equal(t, ActionProxy, site.Rules[0].Action)
+	require.Equal(t, "app1", site.Rules[0].Upstream)
+}
+
+func TestParse_NamedUpstreamsInvalid(t *testing.T) {
+	const web = "default: {servers: [{name: web, addresses: ['10.0.0.1:80']}]}"
+	for config, errMsg := range map[string]string{
+		"upstreams: {app1: {servers: [{name: x, addresses: ['10.0.0.2:80']}]}}":               "site s: upstreams.default is required",
+		"upstreams: {" + web + ", 'a b': {servers: [{name: x, addresses: ['10.0.0.2:80']}]}}": `site s: invalid upstream name "a b"`,
+		"upstreams: {default: null}":                      "site s: upstreams.default is empty",
+		"upstreams: {" + web + ", app1: null}":            "site s: upstreams.app1 is empty",
+		"upstreams: {" + web + ", app1: {balance: hash}}": "site s: at least one server is required (upstreams.app1.servers)",
+		"upstreams: {" + web + ", app1: {balance: x, servers: [{name: a, addresses: ['10.0.0.2:80']}]}}":                   `site s: invalid upstreams.app1.balance "x"`,
+		"upstreams: {" + web + ", app1: {healthcheck: {interval: -1s}, servers: [{name: a, addresses: ['10.0.0.2:80']}]}}": "site s: upstreams.app1.healthcheck.interval must be positive",
+		"upstreams: {" + web + ", app1: {timeouts: {read: -1s}, servers: [{name: a, addresses: ['10.0.0.2:80']}]}}":        "site s: upstreams.app1.timeouts.read must be positive",
+		"upstream: {servers: [{name: x, addresses: ['10.0.0.2:80']}]}":                                                     "field upstream not found",
+
+		// Server names are per site, over all its upstreams: they name the node in drains, the
+		// status and the metrics
+		"upstreams: {" + web + ", app1: {servers: [{name: web, addresses: ['10.0.0.2:80']}]}}": `site s: duplicate server name "web"`,
+
+		// A proxy rule names an upstream of its site
+		"upstreams: {" + web + "}, rules: [{name: r, action: proxy, upstream: nope}]":                 `site s: rule s/r: unknown upstream "nope"`,
+		"upstreams: {" + web + "}, rules: [{name: r, action: proxy}]":                                 "site s: rule s/r: proxy needs an upstream",
+		"upstreams: {" + web + "}, rules: [{name: r, action: proxy, upstream: default, status: 404}]": "site s: rule s/r: proxy takes upstream only",
+		"upstreams: {" + web + "}, rules: [{name: r, action: block, upstream: default}]":              "site s: rule s/r: block takes status and strike only",
+	} {
+		_, err := Parse([]byte("sites: [{name: s, listen-http: ':80', " + config + "}]"))
+		require.ErrorContains(t, err, errMsg, config)
+	}
+
+	// Upstreams are per site, so global rules cannot proxy
+	_, err := Parse([]byte("rules: [{name: r, action: proxy, upstream: default}]\nsites: [{name: s, listen-http: ':80', upstreams: {" + web + "}}]"))
+	require.ErrorContains(t, err, "rule r: proxy is only allowed in a site's rules")
 }

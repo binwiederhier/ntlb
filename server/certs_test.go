@@ -22,9 +22,9 @@ func TestCerts_PickedBySNI(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 sites:
-  - {name: a, listen-https: '127.0.0.3:0', hosts: [a.com], cert-file: %[1]s/a.com.pem, key-file: %[1]s/a.com.key, `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%[2]q]}]}}
-  - {name: b, listen-https: '127.0.0.3:0', hosts: [b.com], cert-file: %[1]s/b.com.pem, key-file: %[1]s/b.com.key, `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%[2]q]}]}}
-  - {name: c, listen-https: '127.0.0.2:0', hosts: [c.com], cert-file: %[1]s/b.com.pem, key-file: %[1]s/b.com.key, `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%[2]q]}]}}
+  - {name: a, listen-https: '127.0.0.3:0', hosts: [a.com], cert-file: %[1]s/a.com.pem, key-file: %[1]s/a.com.key, `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%[2]q]}]}}}
+  - {name: b, listen-https: '127.0.0.3:0', hosts: [b.com], cert-file: %[1]s/b.com.pem, key-file: %[1]s/b.com.key, `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%[2]q]}]}}}
+  - {name: c, listen-https: '127.0.0.2:0', hosts: [c.com], cert-file: %[1]s/b.com.pem, key-file: %[1]s/b.com.key, `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%[2]q]}]}}}
 `, dir, app1.addr())), 0600))
 	s := startTestServer(t, filename)
 	served := func(serverName string) string {

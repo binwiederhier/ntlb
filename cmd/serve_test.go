@@ -160,7 +160,7 @@ func TestHandleSignals_Reload(t *testing.T) {
 	require.NoError(t, err)
 
 	// SIGHUP applies a good config
-	added := string(good) + "      - name: app3\n        addresses: ['127.0.0.1:1']\n"
+	added := string(good) + "        - name: app3\n          addresses: ['127.0.0.1:1']\n"
 	require.NoError(t, os.WriteFile(filename, []byte(added), 0600))
 	reload(signals)
 	require.Equal(t, []string{"app1", "app2", "app3"}, upstreamNames(fetchStatus(t, s)))
@@ -364,7 +364,7 @@ func TestCheckConfig_Errors(t *testing.T) {
 	out, err := runApp("check-config", "-c", filename)
 	require.ErrorContains(t, err, "invalid config")
 	require.Empty(t, out)
-	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstream: {servers: [{name: a, addresses: ['nope']}]}}]"), 0600))
+	require.NoError(t, os.WriteFile(filename, []byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['nope']}]}}}]"), 0600))
 	_, err = runApp("check-config", "-c", filename)
 	require.ErrorContains(t, err, `invalid address "nope"`)
 }

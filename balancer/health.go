@@ -19,7 +19,7 @@ const (
 	maxDuration = time.Duration(math.MaxInt64)
 )
 
-// healthLoop probes each upstream every health-check interval of its site. It wakes at the
+// healthLoop probes each upstream every healthcheck interval of its pool. It wakes at the
 // shortest interval and probes the upstreams that are due, give or take half a round, without
 // waiting for the round before: an upstream still being probed is not due. The intervals are
 // read every round, so a reload changes them.
@@ -59,12 +59,14 @@ func (b *Balancer) shortestHealthInterval() time.Duration {
 	defer b.mu.RUnlock()
 	shortest := time.Duration(maxDuration)
 	for _, site := range b.config.Sites {
-		shortest = min(shortest, site.Upstream.HealthCheck.Interval)
+		for _, pool := range site.AllUpstreams() {
+			shortest = min(shortest, pool.HealthCheck.Interval)
+		}
 	}
 	return shortest
 }
 
-// probe checks the given upstreams in parallel, each with its site's health check, and applies
+// probe checks the given upstreams in parallel, each with its pool's health check, and applies
 // the results
 func (b *Balancer) probe(ctx context.Context, upstreams []*Upstream) {
 	var wg sync.WaitGroup

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -26,20 +27,21 @@ var (
 // the listener's site without hosts, if there is one. Global rules are checked before the site's
 // own.
 type Site struct {
-	Name        string       `yaml:"name"`
-	ListenHTTP  ListenAddrs  `yaml:"listen-http"`  // One address or a list; sites may share them
-	ListenHTTPS ListenAddrs  `yaml:"listen-https"` // Needs cert-file and key-file
-	Hosts       []string     `yaml:"hosts"`        // Names and wildcards ("*.ntfy.sh": any subdomain); none: the listeners' default site
-	CertFile    string       `yaml:"cert-file"`    // Picked by SNI among the certificates of a listener's sites
-	KeyFile     string       `yaml:"key-file"`     //
-	AccessLogs  []*AccessLog `yaml:"access-logs"`  // Replace the global access logs for this site
-	Bans        *Bans        `yaml:"bans"`         // Replace the global bans settings for this site (usually there are only global ones)
-	Gzip        *Gzip        `yaml:"gzip"`         // Replace the global gzip settings for this site
-	Streams     *Streams     `yaml:"streams"`      // Which requests are long-lived streams
-	Upstream    *Upstream    `yaml:"upstream"`     // The servers, and how requests reach them
-	Rules       []*Rule      `yaml:"rules"`        // Checked after the global rules
+	Name        string               `yaml:"name"`
+	ListenHTTP  ListenAddrs          `yaml:"listen-http"`  // One address or a list; sites may share them
+	ListenHTTPS ListenAddrs          `yaml:"listen-https"` // Needs cert-file and key-file
+	Hosts       []string             `yaml:"hosts"`        // Names and wildcards ("*.ntfy.sh": any subdomain); none: the listeners' default site
+	CertFile    string               `yaml:"cert-file"`    // Picked by SNI among the certificates of a listener's sites
+	KeyFile     string               `yaml:"key-file"`     //
+	AccessLogs  []*AccessLog         `yaml:"access-logs"`  // Replace the global access logs for this site
+	Bans        *Bans                `yaml:"bans"`         // Replace the global bans settings for this site (usually there are only global ones)
+	Gzip        *Gzip                `yaml:"gzip"`         // Replace the global gzip settings for this site
+	Streams     *Streams             `yaml:"streams"`      // Which requests are long-lived streams
+	Upstreams   map[string]*Upstream `yaml:"upstreams"`    // The servers, and how requests reach them, by name: "default" takes what no proxy rule routes
+	Rules       []*Rule              `yaml:"rules"`        // Checked after the global rules
 
-	file string // The file the site came from, for errors; "" for the main file
+	file      string      // The file the site came from, for errors; "" for the main file
+	upstreams []*Upstream // Upstreams, the default first, then by name
 }
 
 // ListenAddrs are listen addresses, written as one address or a list
@@ -146,13 +148,33 @@ func (c *Config) GzipFor(site *Site) *Gzip {
 	return c.Gzip
 }
 
-// UpstreamCount returns the number of upstreams over all sites
+// UpstreamCount returns the number of servers over all sites and their upstreams
 func (c *Config) UpstreamCount() int {
 	n := 0
 	for _, site := range c.Sites {
-		n += len(site.Upstream.Servers)
+		for _, u := range site.AllUpstreams() {
+			n += len(u.Servers)
+		}
 	}
 	return n
+}
+
+// AllUpstreams returns the site's upstreams, the default first, then the others by name
+func (s *Site) AllUpstreams() []*Upstream {
+	return s.upstreams
+}
+
+// DefaultUpstream returns the site's upstream that takes every request no proxy rule routes
+func (s *Site) DefaultUpstream() *Upstream {
+	return s.Upstreams[UpstreamDefault]
+}
+
+// UpstreamNamed returns the site's upstream with a name ("" for the default), or nil
+func (s *Site) UpstreamNamed(name string) *Upstream {
+	if name == "" {
+		name = UpstreamDefault
+	}
+	return s.Upstreams[name]
 }
 
 // loadIncludes merges the files that the include globs match into c, in file name order per glob.
@@ -211,8 +233,10 @@ func (c *Config) mergeFile(file string) error {
 }
 
 func (s *Site) applyDefaults() {
-	if s.Upstream != nil {
-		s.Upstream.applyDefaults()
+	for _, u := range s.Upstreams {
+		if u != nil {
+			u.applyDefaults()
+		}
 	}
 	if s.Streams == nil {
 		s.Streams = &Streams{}
@@ -284,12 +308,45 @@ func (s *Site) validate(bans *Bans) error {
 	if s.Streams.Program, err = match.Compile(s.Streams.Match, match.Request); err != nil {
 		return fmt.Errorf("invalid streams.match: %w", err)
 	}
-	if s.Upstream == nil {
-		return errors.New("upstream is required")
-	} else if err := s.Upstream.validate(); err != nil {
+	if err := s.validateUpstreams(); err != nil {
 		return err
 	}
-	return validateRules(s.Rules, s.Name, bans != nil || s.Bans != nil)
+	return validateRules(s.Rules, s, bans != nil || s.Bans != nil)
+}
+
+// validateUpstreams checks the site's upstreams, and that server names are unique over all of
+// them: a name is what drains, the status and the metrics know a node by
+func (s *Site) validateUpstreams() error {
+	if _, ok := s.Upstreams[UpstreamDefault]; !ok {
+		return errors.New("upstreams.default is required")
+	}
+	others := slices.DeleteFunc(slices.Sorted(maps.Keys(s.Upstreams)), func(name string) bool {
+		return name == UpstreamDefault
+	})
+	s.upstreams = nil
+	for _, name := range slices.Concat([]string{UpstreamDefault}, others) {
+		u := s.Upstreams[name]
+		if !nameRegex.MatchString(name) {
+			return fmt.Errorf("invalid upstream name %q", name)
+		} else if u == nil {
+			return fmt.Errorf("upstreams.%s is empty", name)
+		}
+		u.Name = name
+		if err := u.validate("upstreams." + name); err != nil {
+			return err
+		}
+		s.upstreams = append(s.upstreams, u)
+	}
+	names := make(map[string]bool)
+	for _, u := range s.upstreams {
+		for _, srv := range u.Servers {
+			if names[srv.Name] {
+				return fmt.Errorf("duplicate server name %q", srv.Name)
+			}
+			names[srv.Name] = true
+		}
+	}
+	return nil
 }
 
 // addListeners adds the site to its listeners, creating those not seen yet
@@ -392,29 +449,30 @@ func (u *Upstream) applyDefaults() {
 	u.HealthCheck.applyDefaults()
 }
 
-func (u *Upstream) validate() error {
+// validate checks the upstream; section is where it is in the site, for errors ("upstreams.<name>")
+func (u *Upstream) validate(section string) error {
 	if !slices.Contains(balances, u.Balance) {
-		return fmt.Errorf("invalid upstream.balance %q, expected one of %s", u.Balance, strings.Join(balances, ", "))
+		return fmt.Errorf("invalid %s.balance %q, expected one of %s", section, u.Balance, strings.Join(balances, ", "))
 	} else if u.Timeouts.Connect <= 0 {
-		return errors.New("upstream.timeouts.connect must be positive")
+		return fmt.Errorf("%s.timeouts.connect must be positive", section)
 	} else if u.Timeouts.Read <= 0 {
-		return errors.New("upstream.timeouts.read must be positive")
-	} else if err := u.Keepalive.validate("upstream.keepalive"); err != nil {
+		return fmt.Errorf("%s.timeouts.read must be positive", section)
+	} else if err := u.Keepalive.validate(section + ".keepalive"); err != nil {
 		return err
-	} else if err := u.HealthCheck.validate(); err != nil {
+	} else if err := u.HealthCheck.validate(section + ".healthcheck"); err != nil {
 		return err
 	}
-	return validateServers(u.Servers)
+	return validateServers(u.Servers, section)
 }
 
-func validateServers(servers []*Server) error {
+func validateServers(servers []*Server, section string) error {
 	if len(servers) == 0 {
-		return errors.New("at least one server is required (upstream.servers)")
+		return fmt.Errorf("at least one server is required (%s.servers)", section)
 	}
 	names := make(map[string]bool)
 	for i, srv := range servers {
 		if srv == nil {
-			return fmt.Errorf("upstream.servers[%d] is empty", i)
+			return fmt.Errorf("%s.servers[%d] is empty", section, i)
 		} else if !nameRegex.MatchString(srv.Name) {
 			return fmt.Errorf("invalid server name %q", srv.Name)
 		} else if names[srv.Name] {

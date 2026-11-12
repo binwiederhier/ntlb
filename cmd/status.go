@@ -64,6 +64,9 @@ func upstreamNote(u *balancer.UpstreamStatus) string {
 	if u.Removed {
 		notes = append(notes, "removed from config")
 	}
+	if u.Pool != "" {
+		notes = append(notes, "upstreams."+u.Pool)
+	}
 	if u.Backup {
 		notes = append(notes, "backup")
 	}

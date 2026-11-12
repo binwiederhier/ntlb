@@ -3,6 +3,8 @@ package balancer
 import (
 	"fmt"
 	"net/netip"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -128,4 +130,22 @@ func TestClientKey_InvalidPrefixBits(t *testing.T) {
 func TestClientKey_InvalidAddr(t *testing.T) {
 	// net/http always sets a valid remote address; an invalid one must not panic
 	require.Empty(t, ClientKey(netip.Addr{}, 32, 64))
+}
+
+func FuzzRankWeighted(f *testing.F) {
+	// The ranking is a permutation of the names that does not depend on their order
+	f.Add([]byte{203, 0, 113, 9}, "app1,app2,app3", uint8(3))
+	f.Fuzz(func(t *testing.T, key []byte, list string, w uint8) {
+		names := slices.Compact(slices.Sorted(strings.SplitSeq(list, ",")))
+		weights := make([]int, len(names))
+		for i := range weights {
+			weights[i] = 1 + (int(w)+i)%7
+		}
+		ranked := rankWeighted(key, names, weights)
+		require.ElementsMatch(t, names, ranked)
+		reversed, reversedWeights := slices.Clone(names), slices.Clone(weights)
+		slices.Reverse(reversed)
+		slices.Reverse(reversedWeights)
+		require.Equal(t, ranked, rankWeighted(key, reversed, reversedWeights))
+	})
 }

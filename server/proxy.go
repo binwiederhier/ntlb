@@ -76,14 +76,14 @@ type proxy struct {
 	balancer *balancer.Balancer
 	metrics  *metrics
 	reverse  *httputil.ReverseProxy
-	conns    atomic.Pointer[map[string]*upstreamConns] // Per site
+	conns    atomic.Pointer[map[string]*upstreamConns] // Per pool, by balancer.PoolKey
 	config   atomic.Pointer[config.Config]
 	active   map[*proxyRequest]struct{}
 	mu       sync.Mutex // Protects active
 }
 
-// upstreamConns are a site's connections to its servers, set up by its upstream timeouts and
-// keepalive
+// upstreamConns are a pool's (a site's upstream or one of its named upstreams) connections to its
+// servers, set up by its timeouts and keepalive
 type upstreamConns struct {
 	transport *http.Transport
 	dialer    *net.Dialer
@@ -98,10 +98,11 @@ type proxyRequest struct {
 	key            []byte
 	kind           string // kindRequest, kindStream or kindWebSocket
 	session        *balancer.Session
-	conns          *upstreamConns // The site's, nil if a reload removed the site meanwhile
+	conns          *upstreamConns // The pool's, nil if a reload removed it meanwhile
 	cancel         context.CancelCauseFunc
 	env            *match.Env   // The request as expressions see it, if Server.observe made one
 	site           string       // The site serving the request, "" if none does
+	pool           string       // The site's upstream a proxy rule sent the request to, "" for default
 	siteConf       *config.Site // Set by Server.observe; dropped once the request is under way
 	rule           string       // The rule that decided the request, if any
 	upstream       string       // Set once an upstream answered
@@ -174,8 +175,16 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancelCause(parent)
 	pr.key, pr.cancel = clientKey(r.RemoteAddr, conf.ClientKey), cancel
-	pr.readTimeout = site.Upstream.Timeouts.Read
-	pr.conns = (*p.conns.Load())[site.Name]
+	pool := site.UpstreamNamed(pr.pool)
+	if pool == nil {
+		// A reload's new rules met the site of the old config, which lacks the upstream they name
+		pr.kind = kindRequest
+		http.Error(w, "no upstream available", http.StatusBadGateway)
+		return
+	}
+	pr.pool = pool.Name
+	pr.readTimeout = pool.Timeouts.Read
+	pr.conns = (*p.conns.Load())[balancer.PoolKey(site.Name, pool.Name)]
 	pr.session = p.balancer.NewSession(cancel)
 	if subscription {
 		gauge := p.metrics.streams.WithLabelValues(streamProtocol(pr.kind, r.ProtoMajor))
@@ -231,7 +240,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // A request whose body was partly sent is never resent, as there is no copy of it.
 func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	pr := proxyRequestFromContext(req.Context())
-	candidates := p.balancer.Pick(pr.site, pr.key)
+	candidates := p.balancer.Pick(pr.site, pr.pool, pr.key)
 	if len(candidates) == 0 || pr.conns == nil {
 		return nil, errNoUpstream
 	}
@@ -244,8 +253,12 @@ func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		last := i == len(candidates)-1
 		for try := 0; ; try++ {
 			addr := p.balancer.Reserve(pr.session, u)
-			out := req.Clone(req.Context())
-			out.URL.Scheme, out.URL.Host = "http", addr
+			// A shallow copy per attempt, with its own URL: req is the reverse proxy's copy already,
+			// and a transport does not change a request's headers (Clone copied them every time)
+			out := req.WithContext(req.Context())
+			target := *req.URL
+			target.Scheme, target.Host = "http", addr
+			out.URL = &target
 			var attempt *attemptBody
 			if body != nil {
 				attempt = body.attempt()
@@ -339,9 +352,9 @@ func (p *proxy) closeAll(ctx context.Context) error {
 	}
 }
 
-// update applies a (re)loaded config to the upstream connections: a site whose upstream timeouts
-// and keepalive did not change keeps its connections; otherwise open connections keep running on
-// the old transport, and its idle ones are closed.
+// update applies a (re)loaded config to the upstream connections: a pool whose timeouts and
+// keepalive did not change keeps its connections; otherwise open connections keep running on the
+// old transport, and its idle ones are closed.
 func (p *proxy) update(conf *config.Config) {
 	var old map[string]*upstreamConns
 	if prev := p.conns.Load(); prev != nil {
@@ -349,10 +362,13 @@ func (p *proxy) update(conf *config.Config) {
 	}
 	conns := make(map[string]*upstreamConns, len(conf.Sites))
 	for _, site := range conf.Sites {
-		if c, ok := old[site.Name]; ok && c.timeouts == *site.Upstream.Timeouts && c.keepalive == *site.Upstream.Keepalive {
-			conns[site.Name] = c
-		} else {
-			conns[site.Name] = newUpstreamConns(site.Upstream)
+		for _, pool := range site.AllUpstreams() {
+			key := balancer.PoolKey(site.Name, pool.Name)
+			if c, ok := old[key]; ok && c.timeouts == *pool.Timeouts && c.keepalive == *pool.Keepalive {
+				conns[key] = c
+			} else {
+				conns[key] = newUpstreamConns(pool)
+			}
 		}
 	}
 	p.config.Store(conf)

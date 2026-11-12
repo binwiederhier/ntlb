@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"heckel.io/ntlb/config"
 )
 
 // State is an upstream's routing state
@@ -43,6 +45,7 @@ type Status struct {
 type UpstreamStatus struct {
 	Site          string     `json:"site"`
 	Name          string     `json:"name"`
+	Pool          string     `json:"pool"` // The name of the site's upstream block it is in
 	State         State      `json:"state"`
 	Healthy       bool       `json:"healthy"`
 	Removed       bool       `json:"removed,omitempty"`
@@ -67,6 +70,13 @@ type Session struct {
 	reserved     *Upstream // Upstream of the attempt in flight (see Reserve), protected by Balancer.mu
 	reservedAddr string    // Protected by Balancer.mu
 	canceled     bool      // Protected by Balancer.mu
+}
+
+// poolServer is a server of the config, with its site and the upstream block (pool) it is in
+type poolServer struct {
+	site   string
+	pool   *config.Upstream
+	server *config.Server
 }
 
 // drainState is a drain in progress (or done) for an upstream or the load balancer itself. The

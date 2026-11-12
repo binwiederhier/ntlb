@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	requestTimeout = 30 * time.Second // A reload probes new upstreams, which takes up to the health-check timeout
+	requestTimeout = 30 * time.Second // A reload probes new upstreams, which takes up to the healthcheck timeout
 )
 
 // Client calls the admin API at a base URL, e.g. http://127.0.0.1:2590

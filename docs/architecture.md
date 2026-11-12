@@ -415,7 +415,7 @@ sequenceDiagram
 ```
 
 **The node hangs** (accepts, never answers). Nothing fails fast, so requests wait for
-`upstream.timeouts.read` and get 504; they are not retried, since the node may have acted on them.
+`upstreams.<name>.timeouts.read` and get 504; they are not retried, since the node may have acted on them.
 The probes time out too, and after `fails` rounds the node is out and new requests skip it.
 
 ```mermaid
@@ -480,7 +480,7 @@ flowchart LR
 
 ### Rules, strikes and bans
 
-Rules decide a request before it is proxied (block, limit, allow, redirect, static), and response
+Rules decide a request before it is proxied (block, limit, allow, redirect, static, proxy), and response
 rules look at the outcome. Both can add strikes per client; a client over the threshold within the
 window gets one line in the ban file, which CrowdSec turns into a firewall ban on every host.
 

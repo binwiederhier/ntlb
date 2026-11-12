@@ -253,7 +253,7 @@ listen-admin: '127.0.0.1:0'
 bans: {file: %s, threshold: 100}
 rules: [{name: abuse, match: 'path startsWith "/nz_"', action: block, strike: 101}]
 sites:
-  - {name: s, listen-http: '127.0.0.1:0', bans: {file: %s, threshold: 1}, `+testNtfySite+`, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: s, listen-http: '127.0.0.1:0', bans: {file: %s, threshold: 1}, `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
 `, globalLog, siteLog, app1.addr())), 0600))
 	s := startTestServer(t, filename)
 	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/nz_x")
@@ -560,8 +560,8 @@ func TestServer_HotReloadSiteRulesAndLogs(t *testing.T) {
 bans: {file: %s, threshold: 1}
 access-logs: %s
 sites:
-  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], rules: %s, upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
-  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], upstream: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}
+  - {name: a, listen-http: '127.0.0.1:0', hosts: [a.com], rules: %s, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
+  - {name: b, listen-http: '127.0.0.1:0', hosts: [b.com], upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
 `, banLog, logs, siteARules, app1.addr(), app1.addr())
 		require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	}

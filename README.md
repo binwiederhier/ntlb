@@ -1,5 +1,11 @@
 # ntlb
 
+> [!WARNING]
+> # EXPERIMENTAL
+> **ntlb is experimental and not production ready.** It has only run in a lab and on throwaway
+> VMs. Its configuration, metrics and behaviour can change at any time without notice or a
+> migration path. Do not run it in front of anything you care about.
+
 A small HTTP load balancer built for [ntfy](https://ntfy.sh): balancing per site (round robin,
 least connections, random two, or sticky hashing of the client IP that every load balancer
 instance agrees on), active health checks, long-lived streams (JSON/SSE/raw, WebSocket, HTTP/2),
@@ -8,7 +14,7 @@ service never makes tens of thousands of clients reconnect at the same second.
 
 It is built for ntfy, but nothing in it is ntfy-only, and its defaults are those of a generic load
 balancer (nginx's where it has one): which requests are long-lived streams (`streams`; default:
-none), the balancing (`upstream.balance`; default: round-robin), the health check path (default `/`) and
+none), the balancing (`upstreams.<name>.balance`; default: round-robin), the health check path (default `/`) and
 the client key (`client-key`) are configurable, so it fits any HTTP backend, also with long-lived
 streams (SSE, long polling, WebSockets). The ntfy site in
 [packaging/sites.d/ntfy.yml](packaging/sites.d/ntfy.yml) sets ntfy's. One instance can serve several **sites** (virtual hosts), each with its own
@@ -29,7 +35,7 @@ flowchart LR
     subgraph ntlb["ntlb"]
         direction TB
         listen["Listeners<br/>TLS by SNI"] --> site["Site by Host"]
-        site --> rules["Rules<br/>block, limit, allow,<br/>redirect, static"]
+        site --> rules["Rules<br/>block, limit, allow,<br/>redirect, static, proxy"]
         rules --> pick["Balancer<br/>round-robin, least-conn,<br/>random-two-least-conn, hash"]
     end
     subgraph upstreams["Upstreams"]
@@ -66,7 +72,10 @@ sequenceDiagram
 
 ## Features
 
-- **Balancing per site** (`upstream.balance`): `round-robin` (default, like nginx), `least-conn` (fewest
+- **Routing by path** (or any expression): a site's upstream blocks by name (`upstreams`), each with
+  its own servers, balance, timeouts and health check, and `proxy` rules that send matching requests
+  to one (`/app1/` to one set of servers, `/app2/` to another, the rest to `default`).
+- **Balancing per site** (`upstreams.<name>.balance`): `round-robin` (default, like nginx), `least-conn` (fewest
   open requests on this load balancer), `random-two-least-conn` (the less busy of two random
   servers, like nginx's `random two least_conn`, which stays balanced with several load balancers), or `hash`:
   sticky, consistent routing by rendezvous (highest random weight) hashing of the client IP (IPv4,
@@ -86,7 +95,7 @@ sequenceDiagram
   to the next upstream for any request (it never reached a node); other errors only for idempotent
   methods; a 503 (a draining ntfy node) only if no body byte was sent. A body that was partly sent
   is never resent. A node's other addresses are tried before the next node.
-- **Long-lived streams**: flushes every write, an upstream idle timeout (`upstream.timeouts.read`,
+- **Long-lived streams**: flushes every write, an upstream idle timeout (`upstreams.<name>.timeouts.read`,
   60s like nginx's `proxy_read_timeout`; 3m in the ntfy config) that also bounds clients that stop reading, a 60s bound on a stalled upload
   (nginx's `client_body_timeout`), WebSocket
   upgrades, HTTP/2 on the TLS listener. Subscriptions (`streams.match`) take a
@@ -154,10 +163,11 @@ two load balancers, through drains, reloads, a load balancer restart and a `kill
 ### Compared to nginx
 
 Same load against both (40,000 streams, 150 publishes/s, 430 polls/s, production protocol mix,
-nginx with the production LB config): both delivered every message with no errors. Memory is
-about even (1.99 vs 2.04 GiB; nginx has ~630 MiB fixed, ntlb more per stream). ntlb uses
-~2x the CPU (0.75 vs 0.35 cores) and has a higher p99 (6-8 ms vs ~4 ms), with p50 equal at
-~1 ms. Details in [docs/design.md](docs/design.md#nginx-comparison-2026-11-05).
+nginx with the production LB config and ntlb with its translation): both delivered every message
+with no errors. Memory is about even (2.00 vs 2.10 GB PSS), so is latency (p50 1.1 vs 1.2 ms,
+worst p99 5.3 vs 5.4 ms); ntlb uses ~2x the CPU (0.70 vs 0.37 cores). All client connections,
+goroutines and fds are released within 90s of the load stopping. Details in
+[docs/design.md](docs/design.md#performance-and-cleanup-2026-11-10).
 
 ### Lab results
 
@@ -225,7 +235,7 @@ cannot be hijacked.
 - A request a rule answers (block, limit, redirect, static) is answered without reading its body,
   and its connection closes after the answer if it had one (nginx reads and discards the body).
 - An upgraded connection (WebSocket) ends when the upstream ends it or after
-  `upstream.timeouts.read` without traffic either way; drains close it without a close frame (the
+  `upstreams.<name>.timeouts.read` without traffic either way; drains close it without a close frame (the
   ntfy clients do not reconnect after one).
 - TLS 1.2 offers only AEAD suites (Mozilla intermediate, as in the nginx config). `action: static`
   serves only clean paths (no `.`, `..` or empty segments, no dotfiles) and no symlink out of root.
@@ -260,7 +270,8 @@ documents everything**:
 - [Config files](docs/configuration.md#config-files)
 - [Global settings](docs/configuration.md#global-settings)
 - [Sites](docs/configuration.md#sites)
-- [Upstream: servers, balancing and timeouts](docs/configuration.md#upstream-servers-balancing-and-timeouts)
+- [Upstreams: servers, balancing and timeouts](docs/configuration.md#upstreams-servers-balancing-and-timeouts)
+- [Routing by path](docs/configuration.md#routing-by-path)
 - [Health checks, and what happens when one goes bad](docs/configuration.md#health-checks-and-what-happens-when-one-goes-bad)
 - [Streams](docs/configuration.md#streams)
 - [Access logs](docs/configuration.md#access-logs)
@@ -308,15 +319,16 @@ sites:
     # access-logs: [{file: /var/log/ntlb/ntfy.log}]   # instead of the global ones
     streams:                          # default none; ntfy's subscriptions, minus polls
       match: method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")
-    upstream:                         # the servers, and how requests reach them
-      balance: hash                   # default round-robin; also least-conn, random-two-least-conn
-      timeouts: {read: 3m}            # default 60s; ntfy sends a keepalive every 45s
-      health-check: {path: /v1/ready} # default /
-      servers:
-        - name: app1                  # the NAME is what clients hash to: keep names equal on all LBs
-          addresses: ["10.108.0.11:25010-25017"]
-        - name: app3
-          addresses: ["10.108.0.13:25010-25017"]
+    upstreams:                        # the servers, and how requests reach them, by name
+      default:                        # takes every request no proxy rule sends elsewhere
+        balance: hash                 # default round-robin; also least-conn, random-two-least-conn
+        timeouts: {read: 3m}          # default 60s; ntfy sends a keepalive every 45s
+        healthcheck: {path: /v1/ready}   # default /
+        servers:
+          - name: app1                # the NAME is what clients hash to: keep names equal on all LBs
+            addresses: ["10.108.0.11:25010-25017"]
+          - name: app3
+            addresses: ["10.108.0.13:25010-25017"]
     rules:                            # after the global rules; logged as "ntfy/<name>"
       - name: https-redirect
         match: scheme == "http" && method == "GET" && path == "/"

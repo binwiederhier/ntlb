@@ -23,6 +23,7 @@ const (
 	ActionAllow    = "allow"    // Stop checking rules and proxy the request, e.g. to exempt clients from a limit
 	ActionRedirect = "redirect" // Answer with a redirect to location (default 302)
 	ActionStatic   = "static"   // Serve a file from root, or fallback if there is none
+	ActionProxy    = "proxy"    // Stop checking rules and proxy the request to one of the site's upstreams
 )
 
 // Rule defaults
@@ -37,7 +38,7 @@ var (
 )
 
 // Rule is one rule. Request rules are checked in order before a request is proxied: the first
-// block, allow, redirect or static whose match is true decides, and so does a limit that is
+// block, allow, redirect, static or proxy whose match is true decides, and so does a limit that is
 // exceeded; a request no rule decides is proxied. Response rules are checked when a request
 // ended, all of them, and only add strikes. A rule without match matches every request.
 type Rule struct {
@@ -51,6 +52,7 @@ type Rule struct {
 	Location string  `yaml:"location"` // redirect: a string expression, e.g. '"https://" + host + uri'
 	Root     string  `yaml:"root"`     // static: the directory to serve
 	Fallback string  `yaml:"fallback"` // static: the file (relative to root) for paths that are no file
+	Upstream string  `yaml:"upstream"` // proxy: the name of the site's upstream to send the request to
 	Strike   float64 `yaml:"strike"`   // Strikes per match (block; limit: per limited request; response rules), see bans
 
 	ID              string         `yaml:"-"` // Name, or site/name for a site's rule
@@ -80,9 +82,9 @@ func applyRuleDefaults(rules []*Rule) {
 	}
 }
 
-// validateRules checks and compiles rules; site is "" for the global rules. Strikes need a bans
-// section that counts them.
-func validateRules(rules []*Rule, site string, canStrike bool) error {
+// validateRules checks and compiles rules; site is nil for the global rules. Strikes need a bans
+// section that counts them, and proxy rules an upstream of their site.
+func validateRules(rules []*Rule, site *Site, canStrike bool) error {
 	names := make(map[string]bool)
 	for i, r := range rules {
 		if r == nil {
@@ -94,13 +96,17 @@ func validateRules(rules []*Rule, site string, canStrike bool) error {
 		}
 		names[r.Name] = true
 		r.ID = r.Name
-		if site != "" {
-			r.ID = site + "/" + r.Name
+		if site != nil {
+			r.ID = site.Name + "/" + r.Name
 		}
 		if err := r.compile(); err != nil {
 			return fmt.Errorf("rule %s: %w", r.ID, err)
 		} else if r.Strike > 0 && !canStrike {
 			return fmt.Errorf("rule %s: strike needs a bans section", r.ID)
+		} else if r.Action == ActionProxy && site == nil {
+			return fmt.Errorf("rule %s: proxy is only allowed in a site's rules", r.ID)
+		} else if r.Action == ActionProxy && site.UpstreamNamed(r.Upstream) == nil {
+			return fmt.Errorf("rule %s: unknown upstream %q", r.ID, r.Upstream)
 		}
 	}
 	return nil
@@ -119,7 +125,7 @@ func (r *Rule) compile() error {
 		}
 	case OnResponse:
 		kind = match.Response
-		if r.Action != "" || r.Status != 0 || r.Rate != "" || r.Burst != 0 || r.Location != "" || r.Root != "" || r.Fallback != "" {
+		if r.Action != "" || r.Status != 0 || r.Rate != "" || r.Burst != 0 || r.Location != "" || r.Root != "" || r.Fallback != "" || r.Upstream != "" {
 			return errors.New("a response rule takes match and strike only")
 		} else if r.Strike == 0 {
 			return errors.New("a response rule needs a strike")
@@ -141,13 +147,14 @@ func (r *Rule) compile() error {
 func (r *Rule) compileAction() error {
 	hasRate := r.Rate != "" || r.Burst != 0
 	hasStatic := r.Root != "" || r.Fallback != ""
+	hasUpstream := r.Upstream != ""
 	switch r.Action {
 	case ActionBlock:
-		if hasRate || r.Location != "" || hasStatic {
+		if hasRate || r.Location != "" || hasStatic || hasUpstream {
 			return errors.New("block takes status and strike only")
 		}
 	case ActionLimit:
-		if r.Location != "" || hasStatic {
+		if r.Location != "" || hasStatic || hasUpstream {
 			return errors.New("limit takes rate, burst, status and strike only")
 		}
 		perSecond, err := parseRate(r.Rate)
@@ -158,11 +165,11 @@ func (r *Rule) compileAction() error {
 		}
 		r.RatePerSecond = perSecond
 	case ActionAllow:
-		if r.Status != 0 || hasRate || r.Location != "" || hasStatic || r.Strike != 0 {
+		if r.Status != 0 || hasRate || r.Location != "" || hasStatic || hasUpstream || r.Strike != 0 {
 			return errors.New("allow takes no settings")
 		}
 	case ActionRedirect:
-		if hasRate || hasStatic || r.Strike != 0 {
+		if hasRate || hasStatic || hasUpstream || r.Strike != 0 {
 			return errors.New("redirect takes location and status only")
 		} else if r.Location == "" {
 			return errors.New("redirect needs a location")
@@ -175,17 +182,23 @@ func (r *Rule) compileAction() error {
 		}
 		r.LocationProgram = program
 	case ActionStatic:
-		if r.Status != 0 || hasRate || r.Location != "" || r.Strike != 0 {
+		if r.Status != 0 || hasRate || r.Location != "" || hasUpstream || r.Strike != 0 {
 			return errors.New("static takes root and fallback only")
 		} else if r.Root == "" {
 			return errors.New("static needs a root")
 		} else if r.Fallback != "" && !strings.HasPrefix(r.Fallback, "/") {
 			return errors.New("fallback must start with /")
 		}
+	case ActionProxy:
+		if r.Status != 0 || hasRate || r.Location != "" || hasStatic || r.Strike != 0 {
+			return errors.New("proxy takes upstream only")
+		} else if r.Upstream == "" {
+			return errors.New("proxy needs an upstream")
+		}
 	case "":
-		return errors.New("action is required (block, limit, allow, redirect or static)")
+		return errors.New("action is required (block, limit, allow, redirect, static or proxy)")
 	default:
-		return fmt.Errorf("unknown action %q, expected block, limit, allow, redirect or static", r.Action)
+		return fmt.Errorf("unknown action %q, expected block, limit, allow, redirect, static or proxy", r.Action)
 	}
 	if r.Status != 0 && (r.Status < 100 || r.Status > 599) {
 		return fmt.Errorf("invalid status %d", r.Status)

@@ -15,9 +15,10 @@ docs are in the [README](../README.md).
 
 ## Routing (`balancer/strategy.go`, `balancer/hash.go`)
 
-`Balancer.Pick(site, key)` collects the site's upstreams that are in the config and not draining,
-in config order, keeps the healthy ones (all of them if none is: fail open, like lbagent), and
-orders them by the site's `upstream.balance`; the first is the choice, the rest are the retries. Only if
+`Balancer.Pick(site, pool, key)` collects the servers of one of the site's upstream blocks (a pool:
+`default`, or the one a `proxy` rule named) that are in the config and not draining, in config
+order, keeps the healthy ones (all of them if none is: fail open, like lbagent), and orders them by
+the block's `balance`; the first is the choice, the rest are the retries. Only if
 every upstream is draining does it return nothing (-> 503).
 
 - `round-robin`: rotated by a per-site turn (`Balancer.turns`, a `sync.Map` of `atomic.Uint64`),
@@ -111,7 +112,7 @@ every second (2% of the CPU, 5% of the allocations in the 2026-11-10 lab), with 
 ## Proxy (`server/proxy.go`)
 
 Each site has its own `http.Transport` and dialer (`upstreamConns`), built from its
-`upstream.timeouts` and `upstream.keepalive`; `ServeHTTP` takes the site's at the start of a
+`upstreams.<name>.timeouts` and `upstreams.<name>.keepalive`; `ServeHTTP` takes the site's at the start of a
 request (`proxyRequest.conns`), so a reload mid-request does not mix two sites' settings. A reload
 keeps a site's conns, and so its idle connections, unless those settings changed.
 
@@ -129,11 +130,11 @@ keeps a site's conns, and so its idle connections, unless those settings changed
   node" is detectable and retried for any method
 - other errors are retried for GET/HEAD/OPTIONS with an untouched body; a 503 with an untouched
   body is retried unless it is the last candidate (then it is passed on)
-- the response body is wrapped in `idleTimeoutBody` (cancel after `upstream.timeouts.read` without
+- the response body is wrapped in `idleTimeoutBody` (cancel after `upstreams.<name>.timeouts.read` without
   a byte); not for 101 responses, whose body must stay an `io.ReadWriteCloser`
 
 `FlushInterval: -1` flushes every write. Reads from the client body and writes to the client have
-an inactivity deadline of `upstream.timeouts.read` (`clientBody`, `deadlineWriter`), and canceling
+an inactivity deadline of `upstreams.<name>.timeouts.read` (`clientBody`, `deadlineWriter`), and canceling
 the request (drain) sets both deadlines to now, so a stalled upload or a client that stops reading
 neither holds a handler forever nor survives a drain. `BufferPool` hands out 4 KiB copy buffers: a stream holds
 its buffer while it waits, and the default 32 KiB was half of a stream's heap. The transport is
@@ -177,7 +178,7 @@ not WebSocket upgrades) bypass
 - **Waiting**: `waitReadable` parks in the netpoller via `RawConn.Read` holding no buffer, then a
   pooled 4 KiB buffer is used for one read+write. It peeks a byte with `MSG_PEEK|MSG_DONTWAIT`
   first: the netpoller is edge-triggered, so it may only wait after seeing `EAGAIN`, or it could
-  sleep on data that is already buffered. The read deadline (`upstream.timeouts.read`) bounds the
+  sleep on data that is already buffered. The read deadline (`upstreams.<name>.timeouts.read`) bounds the
   wait. A socket error seen by the peek (e.g. a reset) is returned there, since the peek consumes
   it and the next read would only see EOF; that made a reset look like a clean end until the tests
   caught it.
@@ -188,7 +189,7 @@ not WebSocket upgrades) bypass
   latest ntfy's 45s keepalive message, or by TCP keepalive. `ServeHTTP` uses
   `context.WithoutCancel` for these, since the server cancels the request context when the handler
   returns. Canceling the request (drain) closes the client connection too, so a blocked write
-  cannot outlive a drain; every write has a deadline of `upstream.timeouts.read`.
+  cannot outlive a drain; every write has a deadline of `upstreams.<name>.timeouts.read`.
 - **HTTP/2 clients**: cannot be hijacked; written through the `ResponseWriter`. A client going away
   resets the stream, which cancels the context and closes the upstream connection. An upstream
   that breaks mid-stream (reset, read timeout, drain) resets the HTTP/2 stream
@@ -479,6 +480,67 @@ headers are cut after 30s (nginx: 60s). The replay found two ntlb bugs, both fix
 a query were refused, and a stalled body was only cut after 3m (now 60s, like
 `client_body_timeout`). A first nginx run failed on a lab mistake: one node's two ports listed as
 two upstream servers sent half the clients to it, over ntfy's global topic limit (429s).
+
+## Performance and cleanup (2026-11-10)
+
+Same lab, load and config as above, 35 minutes per run, steady state after 10 minutes. Run 1 is
+before the profiling fixes, run 2 after them (the drain tick scanned every session every second,
+2% of the CPU and 5% of the allocations with nothing to drain; small WebSocket copy buffers;
+throttled sweeps), run 3 is `5ee5b2d` (per-site upstream block, weights, the Codex fixes).
+
+| | Run 1 | Run 2 | Run 3 | nginx |
+|---|---|---|---|---|
+| CPU | 0.71 cores | 0.70 cores | 0.70 cores | 0.37 cores |
+| Memory (PSS, avg) | 2.10 GB | 1.99 GB | 2.00 GB | 2.10 GB |
+| Delivery p50 / max p99 | 1.1 / 11.2 ms | 1.1 / 4.7 ms | 1.1 / 5.3 ms | 1.2 / 5.4 ms |
+| Lost, publish/poll/subscribe errors | 0 | 0 | 0 | 0 |
+
+In-use heap at 40k streams went from 681 to 628 MB. The remaining CPU is mostly syscalls (~20%:
+one read and one write per message per stream) and the scheduler (~13%).
+
+After the load stopped (run 3): within 90s 0 client connections, 25 goroutines and 21 fds were
+left, from ~11k each at the stop; RSS went from 2.07 to 0.98 GB and stays there (Go returns
+memory to the OS lazily).
+
+Go runtime settings, 15-minute runs (5 minutes of steady state, so rougher):
+
+| Setting | CPU | Memory (PSS) | max p99 |
+|---|---|---|---|
+| default | 0.70 cores | 2.00 GB | 4.7 ms |
+| `GOMAXPROCS=2` (of 6) | 0.58 cores | 1.97 GB | 14.8 ms |
+| `GOGC=200` | 0.65 cores | 2.77 GB | 4.8 ms |
+
+Neither is worth it as a default: fewer threads trade CPU for tail latency, a laxer GC trades
+CPU for 40% more memory.
+
+Where the CPU goes at 40k streams: syscalls ~20% (a read and a write per message per stream),
+the scheduler ~22% (goroutine hand-offs, mostly HTTP/2's frame writer), TLS handshakes ~6.5% (a
+third of it the hybrid post-quantum key exchange), GC ~8%, expressions ~5.5%. Expressions now call
+`header()` and `flag()` as plain functions (a reflect call each before) and parse the query once
+per request (-27% per ntfy match), and the proxy no longer clones a request's headers per attempt;
+together ~1% (run 4: 0.69 cores). The rest is Go's net/http and crypto/tls.
+
+## Faults under load (2026-11-11)
+
+The same 40k-stream load, with one fault every few minutes (lab ntfy nodes, not clustered).
+
+| Fault | What happened |
+|---|---|
+| `kill -9` of a node (systemd restarts it) | Its 13,246 streams ended in one 10s interval and reconnected; 3 publish errors, 0 lost. The node was back before the health checks noticed. |
+| A node frozen (SIGSTOP, 90s): accepts, never answers | Out of rotation after 17s (3 probes, 3s timeout each), back 9s after SIGCONT. Its open streams stayed (health never moves one) and ended on the clients' keepalive timeout. The clients that moved got 429s from the other nodes: they went over ntfy's default `global-topic-limit` (15,000 topics a node, ~13k each before). |
+| 100ms delay, 2% loss on one node, 3m | Delivery p99 +100ms, poll p99 230ms, no errors. |
+| 60 reloads 2s apart, alternating more and fewer ban rules, one broken config | No errors, no stream closed, p99 unchanged; the broken config was rejected. |
+| Upstream drain over 2m (20k streams) | 6,526 streams closed at a steady 52/s, 0 errors. |
+
+After all of it: 0 panics, and 90s after the load stopped 0 client connections, 25 goroutines
+and 21 fds.
+
+Lab-only effect: messages arrive late or count as lost when a client's subscription and its
+publishes are on different nodes, which in the lab (independent nodes) loses them, and in
+production (one ntfy cluster) does not. It happens after a node recovers (new requests go back,
+moved streams stay where they are) and during an upstream drain (a drained client's publishes go
+to its next node at once, its subscription only when its turn in the drain comes): delivery p99
+up to the drain duration.
 
 ## Lab tools
 
