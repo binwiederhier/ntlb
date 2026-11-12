@@ -13,30 +13,30 @@ const (
 )
 
 func TestBans_BlockStrikes(t *testing.T) {
-	e, now, lines := testEngineBans(t, testBans+"rules: [{name: abuse, match: 'path startsWith \"/nz_\"', action: block, strike: 5}]")
+	e, now, lines := testEngineBans(t, testBans+"rules: [{name: abuse, match: 'path startsWith \"/sp_\"', action: block, strike: 5}]")
 
 	// Up to the threshold: no ban; over it: one line
-	decided(e, request("GET", "/nz_x", "192.0.2.1:1"))
-	decided(e, request("GET", "/nz_x", "192.0.2.1:1"))
+	decided(e, request("GET", "/sp_x", "192.0.2.1:1"))
+	decided(e, request("GET", "/sp_x", "192.0.2.1:1"))
 	require.Empty(t, *lines)
-	decided(e, request("GET", "/nz_x", "192.0.2.1:1"))
+	decided(e, request("GET", "/sp_x", "192.0.2.1:1"))
 	require.Equal(t, []string{"2026-11-09T12:00:00Z 192.0.2.1 192.0.2.1/32 abuse"}, *lines)
 
 	// Once per window per client, however many more strikes come
 	for range 10 {
-		decided(e, request("GET", "/nz_x", "192.0.2.1:1"))
+		decided(e, request("GET", "/sp_x", "192.0.2.1:1"))
 	}
 	require.Len(t, *lines, 1)
 
 	// Requests that pass add nothing; other clients have their own count
 	decided(e, request("GET", "/mytopic", "192.0.2.2:1"))
-	decided(e, request("GET", "/nz_x", "192.0.2.2:1"))
+	decided(e, request("GET", "/sp_x", "192.0.2.2:1"))
 	require.Len(t, *lines, 1)
 
 	// A window later, a client that keeps going is reported again
 	*now = now.Add(10 * time.Minute)
 	for range 3 {
-		decided(e, request("GET", "/nz_x", "192.0.2.1:1"))
+		decided(e, request("GET", "/sp_x", "192.0.2.1:1"))
 	}
 	require.Equal(t, "2026-11-09T12:10:00Z 192.0.2.1 192.0.2.1/32 abuse", (*lines)[1])
 }

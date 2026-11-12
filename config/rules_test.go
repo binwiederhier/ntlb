@@ -18,11 +18,11 @@ func TestParse_Rules(t *testing.T) {
 	c, err := Parse([]byte(rulesTestBase + rulesTestBans + `
 rules:
   - name: abuse
-    match: method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24") || path matches "^/nz_")
+    match: method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24") || path matches "^/sp_")
     action: block
     strike: 20
   - name: exempt
-    match: ipIn(ip, "116.203.112.46", "176.126.240.0/24")
+    match: ipIn(ip, "203.0.113.10", "198.51.100.0/24")
     action: allow
   - name: limit
     action: limit
@@ -51,7 +51,7 @@ rules:
 	require.Equal(t, OnRequest, r.On)
 	require.Equal(t, 403, r.Status)
 	require.Equal(t, 20.0, r.Strike)
-	require.True(t, r.Program.Match(match.NewEnv(httptest.NewRequest("GET", "/nz_x", nil))))
+	require.True(t, r.Program.Match(match.NewEnv(httptest.NewRequest("GET", "/sp_x", nil))))
 	require.Zero(t, c.Rules[1].Status)
 
 	// Limit: 429 by default, rate parsed; no match means every request
@@ -159,8 +159,8 @@ func TestLoad_PackagingExampleRules(t *testing.T) {
 	require.False(t, byName["ntfy/abuse-topic-count"].Program.Match(topics(149)))
 	require.Equal(t, ActionAllow, byName["ntfy/limit-exempt"].Action)
 	require.Equal(t, 503, byName["ntfy/limit"].Status)
-	require.True(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/a,my-bets/json", nil))))
-	require.False(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/my-bets2/json", nil))))
+	require.True(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/a,bad-bets/json", nil))))
+	require.False(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/bad-bets2/json", nil))))
 	require.Greater(t, byName["ntfy/abuse-topics"].Strike, c.Bans.Threshold) // Bans on the first request
 	require.Equal(t, OnResponse, byName["bad-requests"].On)
 

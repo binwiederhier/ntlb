@@ -101,7 +101,7 @@ sites:
       # Abusive topics: blocked, and banned if they keep coming. A strike above the bans threshold
       # bans on the first request.
       - name: abuse-topics
-        match: path matches "(^/|,)(spam-[^,/]*|my-bets)(,|/|$)"
+        match: path matches "(^/|,)(spam-[^,/]*|bad-bets)(,|/|$)"
         action: block
         strike: 101
       - name: abuse-topic-count # Subscribing to 150+ topics at once

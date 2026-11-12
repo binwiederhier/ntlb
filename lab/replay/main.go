@@ -302,7 +302,7 @@ func main() {
 	})
 	// Abuse rules
 	add("abuse topic", func(t target) result {
-		return raw(t.http, false, h1("/nz_abc/json?poll=1"), 5*time.Second)
+		return raw(t.http, false, h1("/sp_abc/json?poll=1"), 5*time.Second)
 	})
 	add("abuse user agent", func(t target) result {
 		return raw(t.http, false, h1("/rtopic/json?poll=1", "User-Agent: ntfy-spy/2\r\n"), 5*time.Second)

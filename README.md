@@ -339,7 +339,7 @@ sites:
         action: block
         strike: 101                   # over the threshold: banned on the first request
       - name: limit-exempt
-        match: ipIn(ip, "116.203.112.46", "176.126.240.0/24")
+        match: ipIn(ip, "203.0.113.10", "198.51.100.0/24")
         action: allow                 # stops checking: these skip the limit below
       - name: limit                   # no match: every request
         action: limit                 # per client IP (IPv6 /64), like limit_req nodelay

@@ -158,7 +158,7 @@ func TestEngine_Match(t *testing.T) {
 	e, _ := testEngine(t, `
 rules:
   - name: topic
-    match: path matches "^/nz_"
+    match: path matches "^/sp_"
     action: block
   - name: spy
     action: block
@@ -166,7 +166,7 @@ rules:
 `)
 	ua := []string{"User-Agent", "ntfy/1.0"}
 	require.Equal(t, "", decided(e, request("GET", "/mytopic/json", "192.0.2.1:1234", ua...)))
-	require.Equal(t, "topic", decided(e, request("GET", "/nz_abc/json", "192.0.2.1:1234", ua...)))
+	require.Equal(t, "topic", decided(e, request("GET", "/sp_abc/json", "192.0.2.1:1234", ua...)))
 	require.Equal(t, "spy", decided(e, request("POST", "/x", "192.0.2.1:1234", "User-Agent", "NTFY-Spy/2")))
 	require.Equal(t, "spy", decided(e, request("GET", "/x", "203.0.113.9:1234", ua...)))
 	require.Equal(t, "", decided(e, request("PUT", "/x", "203.0.113.9:1234", ua...)))
@@ -316,7 +316,7 @@ const (
 rules:
   - name: abuse-topics
     action: block
-    match: path matches "^/(alex-kaggle-|nz_|nezha|my-bets($|/)|tuna_zamplia_alerts($|/)|gunbot-contabo-|medusa-one-page-deploy-|carmen-hub-7164-firetv($|/)|whitedeck-2fa-|abrotp_z1b6lgs4qfj($|/)|BADat($|/)|BACam($|/)|spam-)"
+    match: path matches "^/(spam-one-|sp_|spammy|bad-bets($|/)|flood_alerts($|/)|bot-flood-|deploy-spam-|junk-hub-1234($|/)|scam-2fa-|zz_q1w2e3r4($|/)|BADaa($|/)|BADbb($|/)|spam-)"
   - name: abuse-user-agents
     action: block
     match: header("User-Agent") matches "(?i)ntfy-spy"
@@ -324,7 +324,7 @@ rules:
     action: block
     match: path matches "^/[^/]*(,[^/,]*){150,}"
   - name: limit-exempt
-    match: ipIn(ip, "116.203.112.46/32", "132.226.42.65/32", "136.243.88.169/32", "176.126.240.0/24", "188.40.204.226/32", "45.43.14.223/32")
+    match: ipIn(ip, "203.0.113.10/32", "203.0.113.20/32", "203.0.113.30/32", "198.51.100.0/24", "192.0.2.40/32", "192.0.2.50/32")
     action: allow
   - name: limit
     action: limit

@@ -1052,9 +1052,9 @@ func TestServer_NtfyPackagedConfig(t *testing.T) {
 	t.Run("abusive topics are blocked and banned", func(t *testing.T) {
 		resp, _ := newNtfyClient(t, s, "127.0.0.21").do(http.MethodGet, "https", "/spam-offers/json", "")
 		require.Equal(t, http.StatusForbidden, resp.StatusCode)
-		resp, _ = newNtfyClient(t, s, "127.0.0.22").do(http.MethodPost, "https", "/news,my-bets", "x") // Inside a topic list
+		resp, _ = newNtfyClient(t, s, "127.0.0.22").do(http.MethodPost, "https", "/news,bad-bets", "x") // Inside a topic list
 		require.Equal(t, http.StatusForbidden, resp.StatusCode)
-		resp, _ = newNtfyClient(t, s, "127.0.0.22").do(http.MethodGet, "https", "/my-betsy/json?poll=1", "") // A near miss
+		resp, _ = newNtfyClient(t, s, "127.0.0.22").do(http.MethodGet, "https", "/bad-betsy/json?poll=1", "") // A near miss
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		waitFor(t, func() bool {
 			bans := readLog("ban.log")

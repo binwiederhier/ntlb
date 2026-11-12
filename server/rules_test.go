@@ -40,7 +40,7 @@ func TestServer_RuleBlocks(t *testing.T) {
 	s, _ := newTestServer(t, "access-logs: [{file: "+accessLogFile+"}]"+`
 rules:
   - name: abuse
-    match: path startsWith "/nz_"
+    match: path startsWith "/sp_"
     action: block
   - name: spy
     match: header("User-Agent") matches "(?i)ntfy-spy"
@@ -49,7 +49,7 @@ rules:
 `, app1)
 
 	// Blocked before any upstream sees it, also subscriptions
-	status, body := get(t, noRedirects, "http://"+s.HTTPAddr()+"/nz_x/json") // Unblocked, an endless subscription
+	status, body := get(t, noRedirects, "http://"+s.HTTPAddr()+"/sp_x/json") // Unblocked, an endless subscription
 	require.Equal(t, http.StatusForbidden, status)
 	require.Equal(t, "Forbidden\n", body)
 	req, _ := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+"/name", nil)
@@ -71,7 +71,7 @@ rules:
 	})
 	b, err := os.ReadFile(accessLogFile)
 	require.NoError(t, err)
-	require.Contains(t, string(b), `"GET /nz_x/json HTTP/1.1" 403 `)
+	require.Contains(t, string(b), `"GET /sp_x/json HTTP/1.1" 403 `)
 	require.Contains(t, string(b), " upstream=- upstream_status=- rule=abuse\n")
 	require.Contains(t, string(b), "rule=spy\n")
 	require.Contains(t, string(b), "upstream=app1 upstream_status=200\n") // No rule field when none decided
@@ -215,7 +215,7 @@ func TestServer_Bans(t *testing.T) {
 	s, _ := newTestServer(t, "bans: {file: "+banLog+", threshold: 10}"+`
 rules:
   - name: abuse
-    match: path startsWith "/nz_"
+    match: path startsWith "/sp_"
     action: block
     strike: 4
   - name: not-found
@@ -225,7 +225,7 @@ rules:
 `, app1)
 	a, b := clientFrom("127.0.0.1"), clientFrom("127.0.0.2")
 	for range 3 {
-		get(t, a, "http://"+s.HTTPAddr()+"/nz_x")
+		get(t, a, "http://"+s.HTTPAddr()+"/sp_x")
 	}
 	for range 11 {
 		get(t, b, "http://"+s.HTTPAddr()+"/missing")
@@ -251,12 +251,12 @@ func TestServer_SiteBans(t *testing.T) {
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
 bans: {file: %s, threshold: 100}
-rules: [{name: abuse, match: 'path startsWith "/nz_"', action: block, strike: 101}]
+rules: [{name: abuse, match: 'path startsWith "/sp_"', action: block, strike: 101}]
 sites:
   - {name: s, listen-http: '127.0.0.1:0', bans: {file: %s, threshold: 1}, `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}
 `, globalLog, siteLog, app1.addr())), 0600))
 	s := startTestServer(t, filename)
-	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/nz_x")
+	get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/sp_x")
 	waitFor(t, func() bool {
 		data, _ := os.ReadFile(siteLog)
 		return strings.Contains(string(data), " 127.0.0.1 127.0.0.1/32 abuse\n")

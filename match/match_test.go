@@ -25,13 +25,13 @@ func matches(t *testing.T, expression string, r *http.Request) bool {
 }
 
 func TestNewEnv(t *testing.T) {
-	r := testRequest("POST", "http://ntfy.sh/%6Ez_x/json?since=10m&poll=1", "[::ffff:203.0.113.9]:1234", "User-Agent", "ntfy/1.0")
+	r := testRequest("POST", "http://ntfy.sh/%73p_x/json?since=10m&poll=1", "[::ffff:203.0.113.9]:1234", "User-Agent", "ntfy/1.0")
 	env := NewEnv(r)
 	require.Equal(t, "POST", env.Method)
-	require.Equal(t, "/nz_x/json", env.Path) // Decoded
+	require.Equal(t, "/sp_x/json", env.Path) // Decoded
 	require.Equal(t, "since=10m&poll=1", env.Query)
 	require.Equal(t, "ntfy.sh", env.Host)
-	require.Equal(t, "/%6Ez_x/json?since=10m&poll=1", env.URI) // As sent
+	require.Equal(t, "/%73p_x/json?since=10m&poll=1", env.URI) // As sent
 	require.Equal(t, "http", env.Scheme)
 	require.Equal(t, "203.0.113.9", env.IP) // Unmapped
 	require.Equal(t, "ntfy/1.0", env.req.Header.Get("user-agent"))
@@ -53,9 +53,9 @@ func TestMatch(t *testing.T) {
 	}{
 		{"method in", `method in ["GET", "POST"]`, testRequest("POST", "/", "192.0.2.1:1"), true},
 		{"method not in", `method in ["GET", "POST"]`, testRequest("PUT", "/", "192.0.2.1:1"), false},
-		{"path regex", `path matches "^/(nz_|nezha)"`, testRequest("GET", "/nezha/json", "192.0.2.1:1"), true},
-		{"path regex near miss", `path matches "^/my-bets($|/)"`, testRequest("GET", "/my-betsy", "192.0.2.1:1"), false},
-		{"path prefix", `path startsWith "/nz_"`, testRequest("GET", "/nz_x", "192.0.2.1:1"), true},
+		{"path regex", `path matches "^/(sp_|spammy)"`, testRequest("GET", "/spammy/json", "192.0.2.1:1"), true},
+		{"path regex near miss", `path matches "^/bad-bets($|/)"`, testRequest("GET", "/bad-betsy", "192.0.2.1:1"), false},
+		{"path prefix", `path startsWith "/sp_"`, testRequest("GET", "/sp_x", "192.0.2.1:1"), true},
 		{"query", `query contains "evil=1"`, testRequest("GET", "/x?evil=1", "192.0.2.1:1"), true},
 		{"host", `host == "ntfy.sh"`, testRequest("GET", "http://ntfy.sh/x", "192.0.2.1:1"), true},
 		{"ip equal", `ip == "192.0.2.1"`, testRequest("GET", "/", "192.0.2.1:1"), true},
@@ -70,14 +70,14 @@ func TestMatch(t *testing.T) {
 		{"not", `!ipIn(ip, "10.0.0.0/8")`, testRequest("GET", "/", "192.0.2.1:1"), true},
 		{
 			"and/or",
-			`method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7") || path matches "^/nz_")`,
-			testRequest("GET", "/nz_x", "192.0.2.1:1", ua...),
+			`method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7") || path matches "^/sp_")`,
+			testRequest("GET", "/sp_x", "192.0.2.1:1", ua...),
 			true,
 		},
 		{
 			"and/or, method fails",
-			`method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7") || path matches "^/nz_")`,
-			testRequest("PUT", "/nz_x", "203.0.113.1:1", ua...),
+			`method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7") || path matches "^/sp_")`,
+			testRequest("PUT", "/sp_x", "203.0.113.1:1", ua...),
 			false,
 		},
 		{"topic count", `path matches "^/[^/]*(,[^/,]*){3,}"`, testRequest("GET", "/a,b,c,d/json", "192.0.2.1:1"), true},
@@ -133,7 +133,7 @@ func TestMatch_ProgramsAreIndependent(t *testing.T) {
 }
 
 func BenchmarkMatch(b *testing.B) {
-	p, err := Compile(`method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7", "2001:db8::/48") || path matches "^/(nz_|nezha|my-bets($|/))")`, Request)
+	p, err := Compile(`method in ["GET", "POST"] && (ipIn(ip, "203.0.113.0/24", "198.51.100.7", "2001:db8::/48") || path matches "^/(sp_|spammy|bad-bets($|/))")`, Request)
 	require.NoError(b, err)
 	env := NewEnv(testRequest("GET", "/mytopic/json", "192.0.2.1:1", "User-Agent", "ntfy/1.0"))
 	b.ReportAllocs()
