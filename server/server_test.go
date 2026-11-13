@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -27,6 +28,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/match"
 )
 
 // testUpstream is a fake ntfy node. Paths:
@@ -1229,4 +1233,730 @@ func TestServer_InformationalResponseIsNotTheStatus(t *testing.T) {
 	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
 	require.Contains(t, metrics, `ntlb_requests_total{code="404",kind="request",site="s",upstream="app1"} 1`)
 	require.NotContains(t, metrics, `code="103"`)
+}
+
+// Reloads: rules, limits, sites and upstreams added, changed and removed while the server runs.
+// Each test writes whole configs (reloadConfig) and checks requests between reloads.
+
+// reloadServers is a site's upstream block in YAML flow style, set up like ntfy's
+func reloadServers(upstreams ...*testUpstream) string {
+	servers := make([]string, 0, len(upstreams))
+	for _, u := range upstreams {
+		servers = append(servers, fmt.Sprintf("{name: %s, addresses: [%q]}", u.name, u.addr()))
+	}
+	return "{" + testNtfyUpstream + ", servers: [" + strings.Join(servers, ", ") + "]}"
+}
+
+// reloadSite is one site in YAML flow style: a name, its hosts (none: the listener's default
+// site), its default upstream, and more settings (rules, named upstreams via upstreams, ...)
+func reloadSite(name, hosts string, upstream *testUpstream, more ...string) string {
+	settings := []string{"name: " + name, "listen-http: '127.0.0.1:0'", testNtfySite}
+	if hosts != "" {
+		settings = append(settings, "hosts: ["+hosts+"]")
+	}
+	upstreams := "default: " + reloadServers(upstream)
+	for _, m := range more {
+		if named, ok := strings.CutPrefix(m, "upstreams+"); ok {
+			upstreams += ", " + named
+		} else {
+			settings = append(settings, m)
+		}
+	}
+	settings = append(settings, "upstreams: {"+upstreams+"}")
+	return "  - {" + strings.Join(settings, ", ") + "}\n"
+}
+
+// reloadConfig writes a config with global settings (YAML lines) and sites (see reloadSite)
+func reloadConfig(t *testing.T, filename, global string, sites ...string) {
+	conf := "listen-admin: '127.0.0.1:0'\ndrain-duration: 1s\n" + global + "\nsites:\n" + strings.Join(sites, "")
+	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
+}
+
+// startReloadServer writes the first config and starts a server on it
+func startReloadServer(t *testing.T, global string, sites ...string) (*Server, string) {
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	reloadConfig(t, filename, global, sites...)
+	return startTestServer(t, filename), filename
+}
+
+// hostGet sends a GET for path with a Host header from a client IP (one connection per request,
+// so every request sees the current config), without following redirects
+func hostGet(t *testing.T, s *Server, ip, host, path string) (int, string, http.Header) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+path, nil)
+	require.NoError(t, err)
+	req.Host = host
+	client := clientFrom(ip)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, string(body), resp.Header
+}
+
+// openHostStream opens a subscription with a Host header, see openStream
+func openHostStream(t *testing.T, s *Server, host, path string) (*testStream, func()) {
+	req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+path, nil)
+	require.NoError(t, err)
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	r := bufio.NewReader(resp.Body)
+	line, err := r.ReadString('\n')
+	require.NoError(t, err)
+	require.Equal(t, "start\n", line)
+	stream := &testStream{closed: make(chan struct{})}
+	go func() {
+		defer close(stream.closed)
+		io.Copy(io.Discard, r)
+	}()
+	return stream, func() {
+		resp.Body.Close()
+	}
+}
+
+// statusOf is a request's status, see hostGet
+func statusOf(t *testing.T, s *Server, ip, host, path string) int {
+	t.Helper()
+	status, _, _ := hostGet(t, s, ip, host, path)
+	return status
+}
+
+func TestServer_ReloadAddsAndRemovesEachRuleKind(t *testing.T) {
+	// Each kind of rule takes effect with the reload that adds it, and is gone with the one that
+	// removes it
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "page.txt"), []byte("from disk"), 0644))
+	for _, tc := range []struct {
+		name   string
+		rule   string
+		status int
+		body   string
+		more   []string
+	}{
+		{name: "block", rule: `{name: r, match: 'query == "x"', action: block}`, status: http.StatusForbidden},
+		{name: "block with status", rule: `{name: r, match: 'query == "x"', action: block, status: 451}`, status: 451},
+		{name: "redirect", rule: `{name: r, match: 'query == "x"', action: redirect, location: '"https://example.com" + path'}`, status: http.StatusFound},
+		{name: "static", rule: `{name: r, match: 'path == "/page.txt"', action: static, root: ` + root + `}`, status: http.StatusOK, body: "from disk"},
+		{name: "limit", rule: `{name: r, action: limit, rate: 1/h, burst: 0}`, status: http.StatusTooManyRequests},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app1 := newTestUpstream(t, "app1")
+			path := "/name?x"
+			if tc.name == "static" {
+				path = "/page.txt"
+			}
+			s, filename := startReloadServer(t, "", reloadSite("s", "", app1))
+			before := statusOf(t, s, "127.0.0.1", "a.com", path) // 404 for the static file: the upstream has none
+
+			reloadConfig(t, filename, "", reloadSite("s", "", app1, "rules: ["+tc.rule+"]"))
+			requireReload(t, s)
+			if tc.name == "limit" {
+				require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.2", "a.com", path)) // The first one is within the rate
+			}
+			status, body, header := hostGet(t, s, "127.0.0.2", "a.com", path)
+			require.Equal(t, tc.status, status)
+			if tc.body != "" {
+				require.Equal(t, tc.body, body)
+			}
+			if tc.name == "redirect" {
+				require.Equal(t, "https://example.com/name", header.Get("Location"))
+			}
+
+			reloadConfig(t, filename, "", reloadSite("s", "", app1))
+			requireReload(t, s)
+			status, body, _ = hostGet(t, s, "127.0.0.2", "a.com", path)
+			require.Equal(t, before, status) // The upstream's answer again
+			require.NotEqual(t, "from disk", body)
+		})
+	}
+}
+
+func TestServer_ReloadChangesRuleSettings(t *testing.T) {
+	// A rule's match, status and location change with a reload, under the same name
+	app1 := newTestUpstream(t, "app1")
+	block := func(path string, status int) string {
+		return fmt.Sprintf(`rules: [{name: r, match: 'query == "%s"', action: block, status: %d}]`, path, status)
+	}
+	s, filename := startReloadServer(t, "", reloadSite("s", "", app1, block("a", 403)))
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.1", "x", "/name?a"))
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.1", "x", "/name?b"))
+
+	// Another path
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, block("b", 403)))
+	requireReload(t, s)
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.1", "x", "/name?a"))
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.1", "x", "/name?b"))
+
+	// Another status
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, block("b", 451)))
+	requireReload(t, s)
+	require.Equal(t, 451, statusOf(t, s, "127.0.0.1", "x", "/name?b"))
+
+	// A block becomes a redirect, and its location and status change
+	redirect := func(location string, status int) string {
+		return fmt.Sprintf(`rules: [{name: r, match: 'query == "b"', action: redirect, location: '"%s"', status: %d}]`, location, status)
+	}
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, redirect("https://one.example/", 302)))
+	requireReload(t, s)
+	status, _, header := hostGet(t, s, "127.0.0.1", "x", "/name?b")
+	require.Equal(t, http.StatusFound, status)
+	require.Equal(t, "https://one.example/", header.Get("Location"))
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, redirect("https://two.example/", 301)))
+	requireReload(t, s)
+	status, _, header = hostGet(t, s, "127.0.0.1", "x", "/name?b")
+	require.Equal(t, http.StatusMovedPermanently, status)
+	require.Equal(t, "https://two.example/", header.Get("Location"))
+}
+
+func TestServer_ReloadReordersRules(t *testing.T) {
+	// The first rule that decides wins, in the order of the reloaded config
+	app1 := newTestUpstream(t, "app1")
+	allow := `{name: allow-me, match: 'ip == "127.0.0.5"', action: allow}`
+	block := `{name: block-all, match: 'query == "x"', action: block}`
+	s, filename := startReloadServer(t, "", reloadSite("s", "", app1, "rules: ["+allow+", "+block+"]"))
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.5", "x", "/name?x"))
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.6", "x", "/name?x"))
+
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, "rules: ["+block+", "+allow+"]"))
+	requireReload(t, s)
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.5", "x", "/name?x"))
+
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, "rules: ["+allow+", "+block+"]"))
+	requireReload(t, s)
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.5", "x", "/name?x"))
+}
+
+func TestServer_ReloadMovesRulesBetweenGlobalAndSite(t *testing.T) {
+	// A global rule applies to every site, a site's rule to that site only; global rules come
+	// first, so a global allow skips a site's block
+	a1, b1 := newTestUpstream(t, "a1"), newTestUpstream(t, "b1")
+	block := `rules: [{name: r, match: 'query == "x"', action: block}]`
+	siteA := func(more ...string) string { return reloadSite("a", "a.com", a1, more...) }
+	siteB := func(more ...string) string { return reloadSite("b", "b.com", b1, more...) }
+	s, filename := startReloadServer(t, block, siteA(), siteB())
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.1", "a.com", "/name?x"))
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.1", "b.com", "/name?x"))
+
+	// Into site a only
+	reloadConfig(t, filename, "", siteA(block), siteB())
+	requireReload(t, s)
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.1", "a.com", "/name?x"))
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.1", "b.com", "/name?x"))
+
+	// Into site b only
+	reloadConfig(t, filename, "", siteA(), siteB(block))
+	requireReload(t, s)
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.1", "a.com", "/name?x"))
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.1", "b.com", "/name?x"))
+
+	// A global allow for one client goes before site b's block
+	reloadConfig(t, filename, `rules: [{name: vip, match: 'ip == "127.0.0.7"', action: allow}]`, siteA(), siteB(block))
+	requireReload(t, s)
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.7", "b.com", "/name?x"))
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.8", "b.com", "/name?x"))
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_rule_matches_total{rule="b/r"} 2`) // Once per step above
+}
+
+func TestServer_ReloadLimitBuckets(t *testing.T) {
+	// A limit keeps its buckets over a reload while its name, rate and burst and the client key
+	// stay, also with a new match or new rules around it; anything else starts it over
+	app1 := newTestUpstream(t, "app1")
+	limit := func(name, match string, burst int) string {
+		return fmt.Sprintf(`{name: %s, match: '%s', action: limit, rate: 1/h, burst: %d}`, name, match, burst)
+	}
+	site := func(rules ...string) string {
+		return reloadSite("s", "", app1, "rules: ["+strings.Join(rules, ", ")+"]")
+	}
+	s, filename := startReloadServer(t, "", site(limit("l", `path != ""`, 0)))
+	use := func(ip string) int {
+		return statusOf(t, s, ip, "x", "/name")
+	}
+	require.Equal(t, http.StatusOK, use("127.0.0.11"))
+	require.Equal(t, http.StatusTooManyRequests, use("127.0.0.11"))
+	reload := func(global string, rules ...string) {
+		t.Helper()
+		reloadConfig(t, filename, global, site(rules...))
+		requireReload(t, s)
+	}
+
+	// Another match, and a rule in front: the same limit
+	reload("", `{name: other, match: 'path == "/nope"', action: block}`, limit("l", `method == "GET"`, 0))
+	require.Equal(t, http.StatusTooManyRequests, use("127.0.0.11"))
+
+	// Another burst: a new limit
+	reload("", limit("l", `method == "GET"`, 1))
+	require.Equal(t, http.StatusOK, use("127.0.0.11"))
+	require.Equal(t, http.StatusOK, use("127.0.0.11"))
+	require.Equal(t, http.StatusTooManyRequests, use("127.0.0.11"))
+
+	// Removed and added back: a new limit
+	reload("")
+	require.Equal(t, http.StatusOK, use("127.0.0.11"))
+	reload("", limit("l", `method == "GET"`, 1))
+	require.Equal(t, http.StatusOK, use("127.0.0.11"))
+	require.Equal(t, http.StatusOK, use("127.0.0.11"))
+	require.Equal(t, http.StatusTooManyRequests, use("127.0.0.11"))
+
+	// Another client key: a new limit, and clients of one /24 now share a bucket
+	reload("client-key: {ipv4-prefix-bits: 24}", limit("l", `method == "GET"`, 1))
+	require.Equal(t, http.StatusOK, use("127.0.0.11"))
+	require.Equal(t, http.StatusOK, use("127.0.0.12"))
+	require.Equal(t, http.StatusTooManyRequests, use("127.0.0.13"))
+
+	// The same rule moved to the global rules is another rule ("l", not "s/l"): a new limit
+	reloadConfig(t, filename, "client-key: {ipv4-prefix-bits: 24}\nrules: ["+limit("l", `method == "GET"`, 1)+"]", reloadSite("s", "", app1))
+	requireReload(t, s)
+	require.Equal(t, http.StatusOK, use("127.0.0.13"))
+}
+
+func TestServer_ReloadLimitOfOneSiteLeavesOthers(t *testing.T) {
+	// Changing one site's limit starts that limit over, not the other site's of the same name
+	a1, b1 := newTestUpstream(t, "a1"), newTestUpstream(t, "b1")
+	limit := func(burst int) string {
+		return fmt.Sprintf("rules: [{name: l, action: limit, rate: 1/h, burst: %d}]", burst)
+	}
+	s, filename := startReloadServer(t, "", reloadSite("a", "a.com", a1, limit(0)), reloadSite("b", "b.com", b1, limit(0)))
+	for _, host := range []string{"a.com", "b.com"} {
+		require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.21", host, "/name"))
+		require.Equal(t, http.StatusTooManyRequests, statusOf(t, s, "127.0.0.21", host, "/name"))
+	}
+	reloadConfig(t, filename, "", reloadSite("a", "a.com", a1, limit(5)), reloadSite("b", "b.com", b1, limit(0)))
+	requireReload(t, s)
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.21", "a.com", "/name"))
+	require.Equal(t, http.StatusTooManyRequests, statusOf(t, s, "127.0.0.21", "b.com", "/name"))
+}
+
+func TestServer_ReloadRejectedKeepsRunningConfig(t *testing.T) {
+	// A config that does not validate is rejected as a whole: the rules, sites and upstreams of
+	// the running config stay in force
+	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
+	good := []string{
+		reloadSite("a", "a.com", app1, `rules: [{name: r, match: 'query == "x"', action: block}]`),
+		reloadSite("b", "b.com", app2),
+	}
+	s, filename := startReloadServer(t, "", good...)
+	for name, bad := range map[string][]string{
+		"bad expression":      {reloadSite("a", "a.com", app1, `rules: [{name: r, match: 'path ==', action: block}]`)},
+		"unknown action":      {reloadSite("a", "a.com", app1, `rules: [{name: r, action: drop}]`)},
+		"unknown key":         {reloadSite("a", "a.com", app1, `rules: [{name: r, action: block, colour: red}]`)},
+		"limit with status":   {reloadSite("a", "a.com", app1, `rules: [{name: r, action: limit, rate: 1/s, status: 503}]`)},
+		"strike without bans": {reloadSite("a", "a.com", app1, `rules: [{name: r, action: block, strike: 1}]`)},
+		"duplicate rule":      {reloadSite("a", "a.com", app1, `rules: [{name: r, action: block}, {name: r, action: block}]`)},
+		"proxy to nothing":    {reloadSite("a", "a.com", app1, `rules: [{name: r, action: proxy, upstream: nope}]`)},
+		"duplicate site":      {reloadSite("a", "a.com", app1), reloadSite("a", "c.com", app2)},
+		"duplicate host":      {reloadSite("a", "a.com", app1), reloadSite("b", "a.com", app2)},
+		"no default upstream": {"  - {name: a, listen-http: '127.0.0.1:0', upstreams: {x: " + reloadServers(app1) + "}}\n"},
+		"no sites":            {},
+	} {
+		reloadConfig(t, filename, "", bad...)
+		_, err := s.Reload()
+		require.Error(t, err, name)
+		require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.1", "a.com", "/name?x"), name)
+		_, body, _ := hostGet(t, s, "127.0.0.1", "b.com", "/name")
+		require.Equal(t, "app2", body, name)
+	}
+
+	// A good config after all of them applies
+	reloadConfig(t, filename, "", reloadSite("a", "a.com", app1), reloadSite("b", "b.com", app2))
+	requireReload(t, s)
+	require.Equal(t, http.StatusOK, statusOf(t, s, "127.0.0.1", "a.com", "/name?x"))
+}
+
+func TestServer_ReloadAddsAndRemovesSites(t *testing.T) {
+	// Sites come and go with reloads: a new site's hosts reach its upstreams right away, a
+	// removed site's hosts fall back to the listener's default site, and without one, to a 404
+	a1, b1, d1 := newTestUpstream(t, "a1"), newTestUpstream(t, "b1"), newTestUpstream(t, "d1")
+	siteA, siteB, siteD := reloadSite("a", "a.com", a1), reloadSite("b", "b.com", b1), reloadSite("d", "", d1)
+	s, filename := startReloadServer(t, "errors: {format: json}", siteA, siteD)
+	name := func(host string) string {
+		_, body, _ := hostGet(t, s, "127.0.0.1", host, "/name")
+		return body
+	}
+	require.Equal(t, "a1", name("a.com"))
+	require.Equal(t, "d1", name("b.com"))
+
+	// Site b added
+	reloadConfig(t, filename, "errors: {format: json}", siteA, siteB, siteD)
+	requireReload(t, s)
+	require.Equal(t, "b1", name("b.com"))
+	require.Equal(t, "a1", name("a.com"))
+	require.Len(t, s.balancer.Status().Upstreams, 3)
+
+	// Site b removed again
+	reloadConfig(t, filename, "errors: {format: json}", siteA, siteD)
+	requireReload(t, s)
+	require.Equal(t, "d1", name("b.com"))
+
+	// The default site removed: unknown hosts get ntlb's 404
+	reloadConfig(t, filename, "errors: {format: json}", siteA, siteB)
+	requireReload(t, s)
+	status, body, _ := hostGet(t, s, "127.0.0.1", "unknown.com", "/name")
+	require.Equal(t, http.StatusNotFound, status)
+	require.Contains(t, body, `"code":40499`)
+	require.Equal(t, "b1", name("b.com"))
+
+	// And added back
+	reloadConfig(t, filename, "errors: {format: json}", siteA, siteB, siteD)
+	requireReload(t, s)
+	require.Equal(t, "d1", name("unknown.com"))
+}
+
+func TestServer_ReloadChangesSiteHosts(t *testing.T) {
+	// A site's hosts change with a reload: exact names, then a wildcard, which an exact name of
+	// another site beats
+	a1, b1, d1 := newTestUpstream(t, "a1"), newTestUpstream(t, "b1"), newTestUpstream(t, "d1")
+	siteD := reloadSite("d", "", d1)
+	s, filename := startReloadServer(t, "", reloadSite("a", "a.com", a1), siteD)
+	name := func(host string) string {
+		_, body, _ := hostGet(t, s, "127.0.0.1", host, "/name")
+		return body
+	}
+	require.Equal(t, "a1", name("a.com"))
+	require.Equal(t, "d1", name("a.org"))
+
+	reloadConfig(t, filename, "", reloadSite("a", "a.org", a1), siteD)
+	requireReload(t, s)
+	require.Equal(t, "d1", name("a.com"))
+	require.Equal(t, "a1", name("a.org"))
+
+	reloadConfig(t, filename, "", reloadSite("a", "'*.example.com'", a1), reloadSite("b", "b.example.com", b1), siteD)
+	requireReload(t, s)
+	require.Equal(t, "a1", name("x.example.com"))
+	require.Equal(t, "a1", name("y.x.example.com"))
+	require.Equal(t, "b1", name("b.example.com"))
+	require.Equal(t, "d1", name("example.com"))
+}
+
+func TestServer_ReloadRemovedSiteDrainsItsStreams(t *testing.T) {
+	// A removed site's streams are closed at the pace of drain-duration (1s here), its other
+	// site's streams stay open, and a renamed site is a new one
+	a1, b1 := newTestUpstream(t, "a1"), newTestUpstream(t, "b1")
+	s, filename := startReloadServer(t, "", reloadSite("a", "a.com", a1), reloadSite("b", "b.com", b1))
+	streamA, closeA := openHostStream(t, s, "a.com", "/mytopic/json")
+	defer closeA()
+	streamB, closeB := openHostStream(t, s, "b.com", "/mytopic/json")
+	defer closeB()
+
+	reloadConfig(t, filename, "", reloadSite("a", "a.com", a1))
+	requireReload(t, s)
+	waitFor(t, func() bool {
+		return streamClosed(streamB)
+	})
+	require.False(t, streamClosed(streamA))
+	waitFor(t, func() bool {
+		return len(s.balancer.Status().Upstreams) == 1 // b/b1 forgotten once drained
+	})
+
+	// Renamed: site c, with the same upstream as a, is new, and a's streams drain
+	reloadConfig(t, filename, "", reloadSite("c", "a.com", a1))
+	requireReload(t, s)
+	waitFor(t, func() bool {
+		return streamClosed(streamA)
+	})
+	_, body, _ := hostGet(t, s, "127.0.0.1", "a.com", "/name")
+	require.Equal(t, "a1", body)
+	waitFor(t, func() bool {
+		status := s.balancer.Status()
+		return len(status.Upstreams) == 1 && status.Upstreams[0].Site == "c"
+	})
+}
+
+func TestServer_ReloadMovesSiteToAnotherListener(t *testing.T) {
+	// A site moved to a new listen address answers there after the reload, and no longer on
+	// the old one, where the remaining site takes its hosts
+	a1, b1 := newTestUpstream(t, "a1"), newTestUpstream(t, "b1")
+	siteA := reloadSite("a", "", a1)
+	siteB := func(listen string) string {
+		return strings.Replace(reloadSite("b", "b.com", b1), "'127.0.0.1:0'", "'"+listen+"'", 1)
+	}
+	s, filename := startReloadServer(t, "", siteA, siteB("127.0.0.1:0"))
+	_, body, _ := hostGet(t, s, "127.0.0.1", "b.com", "/name")
+	require.Equal(t, "b1", body)
+
+	reloadConfig(t, filename, "", siteA, siteB("127.0.0.2:0"))
+	requireReload(t, s)
+	_, body, _ = hostGet(t, s, "127.0.0.1", "b.com", "/name")
+	require.Equal(t, "a1", body) // The old listener's default site
+	req, err := http.NewRequest(http.MethodGet, "http://"+s.ListenerAddr("127.0.0.2:0")+"/name", nil)
+	require.NoError(t, err)
+	req.Host = "b.com"
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, "b1", string(b))
+}
+
+func TestServer_ReloadNamedUpstreamsAndProxyRules(t *testing.T) {
+	// A named upstream and the proxy rule that routes to it arrive and leave with one reload; a
+	// rule that names a missing upstream is rejected
+	app1, api1 := newTestUpstream(t, "app1"), newTestUpstream(t, "api1")
+	route := `rules: [{name: to-api, match: 'path startsWith "/api/"', action: proxy, upstream: api}]`
+	api := "upstreams+api: " + reloadServers(api1)
+	s, filename := startReloadServer(t, "", reloadSite("s", "", app1))
+	api1.on("/api/name", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "api1")
+	})
+	app1.on("/api/name", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "app1")
+	})
+	name := func() string {
+		_, body, _ := hostGet(t, s, "127.0.0.1", "x", "/api/name")
+		return body
+	}
+	require.Equal(t, "app1", name())
+
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, api, route))
+	requireReload(t, s)
+	require.Equal(t, "api1", name())
+
+	// The upstream without the rule: unused
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, api))
+	requireReload(t, s)
+	require.Equal(t, "app1", name())
+
+	// The rule without the upstream: rejected, the last config stays
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, route))
+	_, err := s.Reload()
+	require.ErrorContains(t, err, `unknown upstream "api"`)
+	require.Equal(t, "app1", name())
+
+	// Both again, then the rule without an upstream: the default
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, api, route))
+	requireReload(t, s)
+	require.Equal(t, "api1", name())
+	reloadConfig(t, filename, "", reloadSite("s", "", app1, api, `rules: [{name: to-api, match: 'path startsWith "/api/"', action: proxy}]`))
+	requireReload(t, s)
+	require.Equal(t, "app1", name())
+}
+
+func TestServer_ReloadMovesServerBetweenUpstreams(t *testing.T) {
+	// A server moved from the default upstream to a named one keeps its open streams, and new
+	// requests reach it only through the proxy rule
+	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
+	s, filename := startReloadServer(t, "", "  - {name: s, listen-http: '127.0.0.1:0', "+testNtfySite+", upstreams: {default: "+reloadServers(app2)+"}}\n")
+	stream, closeStream := openHostStream(t, s, "x", "/mytopic/json")
+	defer closeStream()
+	require.Equal(t, int64(1), app2.hits.Load())
+
+	reloadConfig(t, filename, "", "  - {name: s, listen-http: '127.0.0.1:0', "+testNtfySite+
+		", rules: [{name: to-two, match: 'path == \"/two\"', action: proxy, upstream: two}]"+
+		", upstreams: {default: "+reloadServers(app1)+", two: "+reloadServers(app2)+"}}\n")
+	requireReload(t, s)
+	require.False(t, streamClosed(stream))
+	_, body, _ := hostGet(t, s, "127.0.0.1", "x", "/name")
+	require.Equal(t, "app1", body)
+	app2.on("/two", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "app2")
+	})
+	_, body, _ = hostGet(t, s, "127.0.0.1", "x", "/two")
+	require.Equal(t, "app2", body)
+	for _, u := range s.balancer.Status().Upstreams {
+		if u.Name == "app2" {
+			require.Equal(t, "two", u.Pool)
+			require.Equal(t, 1, u.Streams)
+		}
+	}
+}
+
+func TestServer_ReloadChangesErrorPages(t *testing.T) {
+	// Error pages switch format with a reload, globally and per site
+	app1 := newTestUpstream(t, "app1")
+	template := filepath.Join(t.TempDir(), "error.txt")
+	require.NoError(t, os.WriteFile(template, []byte("custom {{.Code}}"), 0600))
+	block := `rules: [{name: r, match: 'query == "x"', action: block}]`
+	s, filename := startReloadServer(t, "", reloadSite("s", "", app1, block))
+	_, body, header := hostGet(t, s, "127.0.0.1", "x", "/name?x")
+	require.Equal(t, "text/html; charset=utf-8", header.Get("Content-Type"))
+	require.Contains(t, body, "Error 40399")
+	for global, want := range map[string]string{
+		"errors: {format: json}":               `{"code":40399,"http":403,"error":"blocked","origin":"ntlb"}` + "\n",
+		"errors: {format: text}":               "Error 40399: blocked\n",
+		"errors: {template: " + template + "}": "custom 40399",
+	} {
+		reloadConfig(t, filename, global, reloadSite("s", "", app1, block))
+		requireReload(t, s)
+		_, body, _ = hostGet(t, s, "127.0.0.1", "x", "/name?x")
+		require.Equal(t, want, body, global)
+	}
+
+	// The site's own replaces the global one
+	reloadConfig(t, filename, "errors: {format: text}", reloadSite("s", "", app1, block, "errors: {format: json}"))
+	requireReload(t, s)
+	_, body, _ = hostGet(t, s, "127.0.0.1", "x", "/name?x")
+	require.Contains(t, body, `"code":40399`)
+
+	// A template that cannot be read rejects the reload
+	reloadConfig(t, filename, "errors: {template: /nonexistent/error.html}", reloadSite("s", "", app1, block))
+	_, err := s.Reload()
+	require.ErrorContains(t, err, "errors.template")
+	_, body, _ = hostGet(t, s, "127.0.0.1", "x", "/name?x")
+	require.Contains(t, body, `"code":40399`)
+}
+
+func TestServer_ReloadStormKeepsServing(t *testing.T) {
+	// Many reloads that add and remove rules, limits and sites while clients keep sending: no
+	// request fails for anything but a rule, and an open stream of a site that stays survives
+	a1, b1, d1 := newTestUpstream(t, "a1"), newTestUpstream(t, "b1"), newTestUpstream(t, "d1")
+	configs := [][]string{
+		{reloadSite("a", "a.com", a1), reloadSite("d", "", d1)},
+		{reloadSite("a", "a.com", a1, `rules: [{name: r, match: 'query == "x"', action: block}]`), reloadSite("b", "b.com", b1), reloadSite("d", "", d1)},
+		{reloadSite("a", "a.com", a1, `rules: [{name: l, match: 'query == "x"', action: limit, rate: 1/h, burst: 0}]`), reloadSite("b", "b.com", b1, `rules: [{name: r, match: 'query == "x"', action: block}]`), reloadSite("d", "", d1)},
+	}
+	globals := []string{"", `rules: [{name: g, match: 'query == "g"', action: block}]`}
+	s, filename := startReloadServer(t, "", configs[0]...)
+	stream, closeStream := openHostStream(t, s, "a.com", "/mytopic/json")
+	defer closeStream()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	var failures atomic.Int64
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hosts := []string{"a.com", "b.com", "other.com"}
+			for n := 0; ctx.Err() == nil; n++ {
+				host := hosts[(i+n)%len(hosts)]
+				req, _ := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+[]string{"/name", "/name?x", "/name?g"}[n%3], nil)
+				req.Host = host
+				resp, err := clientFrom(fmt.Sprintf("127.0.1.%d", i+1)).Do(req)
+				if err != nil {
+					failures.Add(1)
+					t.Logf("%s %s: %v", host, req.URL.Path, err)
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				switch resp.StatusCode {
+				case http.StatusOK, http.StatusForbidden, http.StatusTooManyRequests:
+				default:
+					failures.Add(1)
+					t.Logf("%s %s: %d %s", host, req.URL, resp.StatusCode, regexp.MustCompile(`Error [0-9]+: [^<]*`).FindString(string(body)))
+				}
+			}
+		}()
+	}
+	for i := range 40 {
+		reloadConfig(t, filename, globals[i%len(globals)], configs[i%len(configs)]...)
+		requireReload(t, s)
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	wg.Wait()
+	require.Zero(t, failures.Load())
+	require.False(t, streamClosed(stream))
+
+	// The last config is the one in force
+	reloadConfig(t, filename, "", configs[1]...)
+	requireReload(t, s)
+	require.Equal(t, http.StatusForbidden, statusOf(t, s, "127.0.0.1", "a.com", "/name?x"))
+	_, body, _ := hostGet(t, s, "127.0.0.1", "b.com", "/name")
+	require.Equal(t, "b1", body)
+}
+
+func TestServer_ReloadServesRequestsRoutedBefore(t *testing.T) {
+	// A request routed by the config before a reload that removed its site, or the upstream block
+	// a proxy rule sent it to, is still served by the removed servers while they drain, instead
+	// of a 503 for every request in flight during the reload
+	a1, b1, api1 := newTestUpstream(t, "a1"), newTestUpstream(t, "b1"), newTestUpstream(t, "api1")
+	api := "upstreams+api: " + reloadServers(api1)
+	s, filename := startReloadServer(t, "", reloadSite("a", "a.com", a1), reloadSite("b", "b.com", b1, api))
+	serveRoutedBy := func(conf *config.Config, site, pool string) (int, string) {
+		r := httptest.NewRequest(http.MethodGet, "http://"+site+".com/name", nil)
+		r.RemoteAddr = "127.0.0.1:1234"
+		env := match.NewEnv(r)
+		env.Site = site
+		pr := &proxyRequest{
+			env:        env,
+			site:       site,
+			pool:       pool,
+			siteConf:   conf.Site(site),
+			errorPages: conf.ErrorPagesFor(nil),
+		}
+		w := httptest.NewRecorder()
+		s.proxy.ServeHTTP(w, r.WithContext(withProxyRequest(r.Context(), pr)))
+		pr.finish()
+		return w.Code, w.Body.String()
+	}
+	before := s.config.Load()
+
+	// The named upstream removed
+	reloadConfig(t, filename, "", reloadSite("a", "a.com", a1), reloadSite("b", "b.com", b1))
+	requireReload(t, s)
+	status, body := serveRoutedBy(before, "b", "api")
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, "api1", body)
+
+	// The whole site removed
+	reloadConfig(t, filename, "", reloadSite("a", "a.com", a1))
+	requireReload(t, s)
+	status, body = serveRoutedBy(before, "b", "")
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, "b1", body)
+}
+
+func TestServer_ReloadChangesHealthCheck(t *testing.T) {
+	// A new health check path applies from the next round: a path the server fails takes it out
+	// (with the only server out, requests fail open to it), and the old path brings it back
+	app1 := newTestUpstream(t, "app1")
+	site := func(path string) string {
+		return "  - {name: s, listen-http: '127.0.0.1:0', " + testNtfySite + ", upstreams: {default: {healthcheck: {path: " + path +
+			", interval: 50ms, timeout: 40ms, fails: 1, passes: 1}, servers: [{name: app1, addresses: [" + strconv.Quote(app1.addr()) + "]}]}}}\n"
+	}
+	s, filename := startReloadServer(t, "", site(testHealthPath))
+	require.True(t, s.balancer.Healthy())
+
+	reloadConfig(t, filename, "", site("/nope"))
+	requireReload(t, s)
+	waitFor(t, func() bool {
+		return !s.balancer.Healthy()
+	})
+	_, body, _ := hostGet(t, s, "127.0.0.1", "x", "/name")
+	require.Equal(t, "app1", body) // Fail open
+
+	reloadConfig(t, filename, "", site(testHealthPath))
+	requireReload(t, s)
+	waitFor(t, func() bool {
+		return s.balancer.Healthy()
+	})
+}
+
+func TestServer_ReloadAddsServerThatIsDown(t *testing.T) {
+	// A server added by a reload is probed before it takes traffic: one that is not ready never
+	// gets a request, and joins once it is
+	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
+	app2.notReady.Store(true)
+	site := func(upstreams ...*testUpstream) string {
+		return "  - {name: s, listen-http: '127.0.0.1:0', " + testNtfySite + ", upstreams: {default: " +
+			strings.Replace(reloadServers(upstreams...), "interval: 1h, timeout: 1s", "interval: 50ms, timeout: 40ms", 1) + "}}\n"
+	}
+	s, filename := startReloadServer(t, "", site(app1))
+	reloadConfig(t, filename, "", site(app1, app2))
+	requireReload(t, s)
+	for i := range 50 {
+		statusOf(t, s, fmt.Sprintf("127.0.2.%d", i+1), "x", "/name")
+	}
+	require.Zero(t, app2.hits.Load())
+
+	app2.notReady.Store(false)
+	waitFor(t, func() bool {
+		for _, u := range s.balancer.Status().Upstreams {
+			if u.Name == "app2" && u.State == balancer.StateHealthy {
+				return true
+			}
+		}
+		return false
+	})
+	for i := range 50 {
+		statusOf(t, s, fmt.Sprintf("127.0.2.%d", i+1), "x", "/name")
+	}
+	require.NotZero(t, app2.hits.Load())
 }

@@ -95,7 +95,7 @@ type proxyRequest struct {
 	key            []byte
 	kind           string // kindRequest, kindStream or kindWebSocket
 	session        *balancer.Session
-	conns          *upstreamConns // The pool's, nil if a reload removed it meanwhile
+	conns          *upstreamConns // The pool's, or the request's own if a reload removed the pool meanwhile
 	cancel         context.CancelCauseFunc
 	env            *match.Env   // The request as expressions see it, if Server.observe made one
 	site           string       // The site serving the request, "" if none does
@@ -183,6 +183,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pr.pool = pool.Name
 	pr.readTimeout = pool.Timeouts.Read
 	pr.conns = (*p.conns.Load())[balancer.PoolKey(site.Name, pool.Name)]
+	if pr.conns == nil {
+		// A reload removed the pool after the request was routed: its servers still drain (see
+		// Balancer.Pick), through connections of the request's own
+		pr.conns = newUpstreamConns(pool)
+		pr.onFinish(pr.conns.transport.CloseIdleConnections)
+	}
 	pr.session = p.balancer.NewSession(cancel)
 	if subscription {
 		gauge := p.metrics.streams.WithLabelValues(streamProtocol(pr.kind, r.ProtoMajor))
@@ -300,7 +306,7 @@ func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 func tryUpstreams[T any](p *proxy, ctx context.Context, pr *proxyRequest, method string, send func(transport *http.Transport, addr string) (T, int, func() bool, error), drop func(T)) (T, error) {
 	var zero T
 	candidates := p.balancer.Pick(pr.site, pr.pool, pr.key)
-	if len(candidates) == 0 || pr.conns == nil {
+	if len(candidates) == 0 {
 		return zero, errNoUpstream
 	}
 	for i, u := range candidates {

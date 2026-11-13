@@ -20,8 +20,11 @@ the code itself is in [code.md](code.md). User-facing docs are in the [README](.
 `Balancer.Pick(site, pool, key)` collects the servers of one of the site's upstream blocks (a pool:
 `default`, or the one a `proxy` rule named) that are in the config and not draining, in config
 order, keeps the healthy ones (all of them if none is: fail open, like lbagent), and orders them by
-the block's `balance`; the first is the choice, the rest are the retries. Only if
-every upstream is draining does it return nothing (-> 503).
+the block's `balance`; the first is the choice, the rest are the retries. A pool that a reload
+removed (its site, or the block itself), or left without any of its servers, returns the removed
+servers while they drain: a request routed by the config before the reload has nowhere else to go
+and would get a 503 otherwise. Only if every upstream is draining by command, or the pool is gone
+and drained, does it return nothing (-> 503).
 
 - `round-robin`: rotated by a per-site turn (`Balancer.turns`, a `sync.Map` of `atomic.Uint64`),
   over the healthy upstreams only, so an unhealthy one does not hand its turn to its neighbor. With

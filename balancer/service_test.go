@@ -926,8 +926,8 @@ sites:
 	require.False(t, status.Upstreams[0].Removed)
 	require.True(t, status.Upstreams[1].Removed)
 	require.True(t, status.Upstreams[2].Removed)
-	require.Empty(t, b.Pick("b", "", key))
-	require.NoError(t, b.DrainUpstream("app1", time.Hour)) // Only a's is left
+	require.ElementsMatch(t, []string{b1.addr(), b2.addr()}, addressesOf(b.Pick("b", "", key))) // For requests routed before the reload
+	require.NoError(t, b.DrainUpstream("app1", time.Hour))                                      // Only a's is left
 }
 
 func addressesOf(upstreams []*Upstream) []string {
@@ -992,4 +992,39 @@ sites:
 		pools[u.Name] = u.Pool
 	}
 	require.Equal(t, map[string]string{"web": "default", "a1": "app1", "a2": "app1", "b1": "app2"}, pools)
+}
+
+func TestBalancer_PickRemovedPoolForRequestsRoutedBefore(t *testing.T) {
+	// A request routed by the config before a reload that removed its site (or upstream block)
+	// still reaches the removed servers while they drain: it has nowhere else to go, and a 503
+	// for the requests in flight during a reload is what nginx's old workers avoid too
+	a1, b1, b2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
+	sites := func(withB bool, pools string) *config.Config {
+		conf := fmt.Sprintf("sites:\n  - {name: a, listen-http: ':0', hosts: [a.com], upstreams: {default: {healthcheck: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}}}\n", a1.addr())
+		if withB {
+			conf += fmt.Sprintf("  - {name: b, listen-http: ':0', upstreams: {default: {healthcheck: {interval: 1h, timeout: 1s}, servers: [{name: app1, addresses: [%q]}]}%s}}\n", b1.addr(), pools)
+		}
+		return mustParse(t, "drain-duration: 1m\n"+conf)
+	}
+	named := fmt.Sprintf(", api: {healthcheck: {interval: 1h, timeout: 1s}, servers: [{name: app2, addresses: [%q]}]}", b2.addr())
+	b := New(sites(true, named))
+	b.checkHealth(context.Background())
+	key := []byte{192, 0, 2, 1}
+	require.Equal(t, []string{b1.addr()}, addressesOf(b.Pick("b", "", key)))
+	require.Equal(t, []string{b2.addr()}, addressesOf(b.Pick("b", "api", key)))
+
+	// Site b's named upstream removed: requests routed to it before still get its server
+	b.Update(sites(true, ""))
+	require.Equal(t, []string{b2.addr()}, addressesOf(b.Pick("b", "api", key)))
+	require.Equal(t, []string{b1.addr()}, addressesOf(b.Pick("b", "", key)))
+
+	// Site b removed: the same for its default upstream
+	b.Update(sites(false, ""))
+	require.Equal(t, []string{b1.addr()}, addressesOf(b.Pick("b", "", key)))
+	require.Equal(t, []string{a1.addr()}, addressesOf(b.Pick("a", "", key)))
+
+	// Not once they are forgotten
+	b.drainTick(time.Now().Add(2 * time.Minute))
+	require.Empty(t, b.Pick("b", "", key))
+	require.Empty(t, b.Pick("b", "api", key))
 }

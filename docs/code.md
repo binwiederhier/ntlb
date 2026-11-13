@@ -449,7 +449,11 @@ sequenceDiagram
 
 Requests in flight keep the old `*Config` and the old `upstreamConns` they loaded. A request
 routed by the new rules may meet a site of the old config that lacks its pool; `proxy.ServeHTTP`
-answers that with 502 (`upstream not configured`) instead of guessing.
+answers that with 502 (`upstream not configured`) instead of guessing. The other way round, a
+request routed by the old config whose site or pool the reload removed is still served: `Pick`
+returns the removed servers while they drain, and `proxy.ServeHTTP` gives it connections of its
+own, since the pool's are gone from `proxy.conns`. `TestServer_ReloadStormKeepsServing` checks
+that no request fails during reloads that add and remove sites and rules.
 
 ## The balancer
 
@@ -460,7 +464,9 @@ the rule buckets.
 those of the site's pool that are not removed or draining, split them into healthy, healthy
 backups, unhealthy, unhealthy backups, and return the first non-empty set sorted by the pool's
 balance (`sortFor` in `strategy.go`), backups last. No healthy server at all: the unhealthy ones
-(fail open). Nothing only if all are draining or the pool is gone.
+(fail open). A pool a reload removed (or left without its servers) returns the removed servers
+while they drain, for the requests routed by the config before. Nothing only if all are draining
+by command, or the pool is gone and drained.
 
 | `balance` | Order (`strategy.go`, `hash.go`) |
 |---|---|

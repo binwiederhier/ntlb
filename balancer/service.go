@@ -4,6 +4,7 @@
 package balancer
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
 	"maps"
@@ -107,23 +108,31 @@ func (b *Balancer) Start(ctx context.Context) {
 // the healthy backups as the last retries; the healthy backups alone if no other upstream is
 // healthy. If none is healthy, it fails open and returns every upstream that is not draining
 // (backups last), since a problem shared by all nodes (e.g. their database) is no reason to turn
-// every client away. Returns nothing only if every upstream of the pool is draining, or the pool
-// is gone. The order is the pool's balance (strategy.go); the client key matters for balance hash only.
+// every client away. A pool that a reload removed, or left without any of its servers, still
+// returns the removed servers while they drain, in config order: a request routed by the config
+// before the reload has nowhere else to go. Returns nothing only if every upstream of the pool
+// is draining (by command), or the pool is gone and drained. The order is the pool's balance
+// (strategy.go); the client key matters for balance hash only.
 func (b *Balancer) Pick(site, pool string, key []byte) []*Upstream {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	siteConf := b.config.Site(site)
-	if siteConf == nil {
-		return nil
+	var poolConf *config.Upstream
+	if siteConf := b.config.Site(site); siteConf != nil {
+		poolConf = siteConf.UpstreamNamed(pool)
 	}
-	poolConf := siteConf.UpstreamNamed(pool)
-	if poolConf == nil {
-		return nil
-	}
-	var healthy, healthyBackups, unhealthy, unhealthyBackups []*Upstream
+	poolName := cmp.Or(pool, config.UpstreamDefault)
+	var healthy, healthyBackups, unhealthy, unhealthyBackups, removed []*Upstream
+	live := false
 	for _, id := range b.order {
 		u := b.upstreams[id]
-		if u.site != site || u.pool != poolConf.Name || u.removed || u.drain != nil {
+		if u.site != site || u.pool != poolName {
+			continue
+		} else if u.removed {
+			removed = append(removed, u)
+			continue
+		}
+		live = true
+		if u.drain != nil {
 			continue
 		}
 		switch ok := u.isHealthy(); {
@@ -136,6 +145,9 @@ func (b *Balancer) Pick(site, pool string, key []byte) []*Upstream {
 		default:
 			unhealthyBackups = append(unhealthyBackups, u)
 		}
+	}
+	if poolConf == nil || !live {
+		return removed // Removed by a reload after the request was routed
 	}
 	var turn uint64
 	if balance := poolConf.Balance; balance == config.BalanceRoundRobin || balance == config.BalanceLeastConn {
