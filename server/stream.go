@@ -35,6 +35,9 @@ import (
 //     which cancels the request context.
 //
 // Draining and the upstream read timeout close the upstream connection, which ends the copy.
+//
+// WebSockets (HTTP/1.1 upgrades) take the same path, with the handshake sent as HTTP/1.1 and its
+// upgrade headers kept; after a 101, both connections are copied both ways (see copyUpgraded).
 
 // hopHeaders are the hop-by-hop headers, never forwarded (RFC 9110, section 7.6.1)
 var (
@@ -47,7 +50,7 @@ var (
 		"TE",
 		"Trailer",
 		"Transfer-Encoding",
-		"Upgrade",
+		headerUpgrade,
 	}
 )
 
@@ -91,11 +94,15 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, pr *proxyReq
 	})
 	pr.status = us.resp.StatusCode
 	if r.ProtoMajor == 1 {
-		head := responseHead(us.resp)
-		client, _, err := http.NewResponseController(w).Hijack()
+		head := responseHead(us.resp, us.upgraded)
+		client, brw, err := http.NewResponseController(w).Hijack()
 		if err == nil {
 			pr.detached = true
 			us.resp = nil // Its headers are in head; a stream holds them for hours otherwise
+			var pending []byte
+			if us.upgraded {
+				pending = takeBuffered(brw.Reader) // A client's first frame may come with the handshake
+			}
 			stopClient := context.AfterFunc(r.Context(), func() {
 				safely("stream cancel", func() {
 					client.Close() // A drain must not wait for a blocked write to the client
@@ -103,10 +110,17 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, pr *proxyReq
 			})
 			go safely("stream copy", func() {
 				defer stopClient()
-				copyStreamHTTP1(client, us, head, pr)
+				if us.upgraded {
+					copyUpgraded(client, pending, us, head, pr)
+				} else {
+					copyStreamHTTP1(client, us, head, pr)
+				}
 			})
 			return
 		}
+	}
+	if us.upgraded {
+		panic(http.ErrAbortHandler) // Not reached: an HTTP/1.1 connection can always be hijacked
 	}
 	cc := &clientConn{
 		ctrl: http.NewResponseController(w),
@@ -128,6 +142,7 @@ type upstreamStream struct {
 	resp     *http.Response // Dropped by a detached stream once its head is written
 	body     io.Reader      // The framed body (chunked, Content-Length), if not raw
 	raw      bool           // Close-delimited body: copy conn's bytes as they are (buffered first)
+	upgraded bool           // A 101 to an upgrade (WebSocket): raw, and copied both ways
 	buffered []byte         // Body bytes read along with the headers, if raw
 }
 
@@ -153,8 +168,9 @@ func noBodySent() bool {
 	return true
 }
 
-// roundTripStream dials addr, writes the request as HTTP/1.0 and reads the response headers,
-// skipping informational (1xx) responses and reading at most maxUpstreamHeaderBytes of headers
+// roundTripStream dials addr, writes the request as HTTP/1.0 (an upgrade as HTTP/1.1, with its
+// upgrade headers) and reads the response headers, skipping informational (1xx) responses other
+// than a 101 and reading at most maxUpstreamHeaderBytes of headers
 func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, error) {
 	pr := proxyRequestFromContext(r.Context())
 	conn, err := pr.conns.dialer.DialContext(r.Context(), "tcp", addr)
@@ -166,14 +182,21 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, 
 	})
 	defer stop()
 	conn.SetDeadline(time.Now().Add(pr.readTimeout)) // Like the transport's ResponseHeaderTimeout
+	upgrade := upgradeType(r.Header)
 	header := r.Header.Clone()
 	removeHopHeaders(header)
 	for _, name := range forwardedHeaders {
 		header.Del(name)
 	}
 	header.Set(headerXForwardedFor, forwardedFor(r))
+	proto := "HTTP/1.0"
+	if upgrade != "" {
+		proto = "HTTP/1.1" // A WebSocket handshake is HTTP/1.1 only (RFC 6455)
+		header.Set(headerConnection, headerUpgrade)
+		header.Set(headerUpgrade, upgrade)
+	}
 	bw := bufio.NewWriterSize(conn, streamHeaderBufferSize)
-	fmt.Fprintf(bw, "GET %s HTTP/1.0\r\nHost: %s\r\n", r.URL.RequestURI(), r.Host)
+	fmt.Fprintf(bw, "GET %s %s\r\nHost: %s\r\n", r.URL.RequestURI(), proto, r.Host)
 	header.Write(bw)
 	bw.WriteString("\r\n")
 	if err := bw.Flush(); err != nil {
@@ -196,10 +219,12 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, 
 	limited.n = math.MaxInt64 // Headers done; the body is not limited
 	conn.SetDeadline(time.Time{})
 	resp.Request = nil // The client's request, which a stream must not keep
+	upgraded := upgrade != "" && resp.StatusCode == http.StatusSwitchingProtocols
 	us := &upstreamStream{
-		conn: conn,
-		resp: resp,
-		raw:  resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 && resp.Body != http.NoBody,
+		conn:     conn,
+		resp:     resp,
+		upgraded: upgraded,
+		raw:      upgraded || resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 && resp.Body != http.NoBody,
 	}
 	if us.raw {
 		buffered, _ := br.Peek(br.Buffered())
@@ -212,17 +237,22 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, 
 }
 
 // responseHead renders the response line and headers for a hijacked HTTP/1.1 client. The body
-// ends when the connection closes.
-func responseHead(resp *http.Response) []byte {
+// ends when the connection closes; an upgraded connection keeps the upgrade headers instead.
+func responseHead(resp *http.Response, upgraded bool) []byte {
+	upgrade := resp.Header.Get(headerUpgrade)
 	header := resp.Header.Clone()
 	removeHopHeaders(header)
-	if resp.ContentLength >= 0 && len(resp.TransferEncoding) == 0 {
+	if !upgraded && resp.ContentLength >= 0 && len(resp.TransferEncoding) == 0 {
 		header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	}
 	head := &bytes.Buffer{}
 	fmt.Fprintf(head, "HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
 	header.Write(head)
-	head.WriteString("Connection: close\r\n\r\n")
+	if upgraded {
+		fmt.Fprintf(head, "Connection: Upgrade\r\nUpgrade: %s\r\n\r\n", upgrade)
+	} else {
+		head.WriteString("Connection: close\r\n\r\n")
+	}
 	return head.Bytes()
 }
 
@@ -299,29 +329,35 @@ func copyBody(us *upstreamStream, timeout time.Duration, write func([]byte) erro
 		}
 		us.buffered = nil
 	}
-	return copyStream(us.conn, timeout, write)
+	return copyStream(us.conn, newActivity(timeout), write)
 }
 
-// copyStream copies upstream to write until either fails. It waits for upstream data without a
-// buffer and takes one from the pool only to read and write. timeout bounds each wait, like
-// nginx's proxy_read_timeout. It returns nil if the upstream closed the stream cleanly (EOF).
-func copyStream(upstream net.Conn, timeout time.Duration, write func([]byte) error) error {
-	sc, ok := upstream.(syscall.Conn)
+// copyStream copies src to write until either fails. It waits for data without a buffer and
+// takes one from the pool only to read and write. A wait ends once nothing moved for act's
+// timeout (in either direction, if act is shared), like nginx's proxy_read_timeout. It returns
+// nil if src closed cleanly (EOF). A src without a file descriptor to wait on (a TLS client,
+// whose records crypto/tls buffers) is copied with a small buffer of its own instead.
+func copyStream(src net.Conn, act *activity, write func([]byte) error) error {
+	sc, ok := src.(syscall.Conn)
 	if !ok {
-		return errors.New("upstream connection has no file descriptor")
+		return copyBuffered(src, act, write)
 	}
 	raw, err := sc.SyscallConn()
 	if err != nil {
 		return err
 	}
 	for {
-		upstream.SetReadDeadline(time.Now().Add(timeout))
+		src.SetReadDeadline(act.deadline())
 		if err := waitReadable(raw); err != nil {
+			if act.movedSince(err) {
+				continue
+			}
 			return err
 		}
 		buf := streamBufferPool.Get()
-		n, err := upstream.Read(buf)
+		n, err := src.Read(buf)
 		if n > 0 {
+			act.touch()
 			if werr := write(buf[:n]); werr != nil {
 				streamBufferPool.Put(buf)
 				return werr
@@ -330,6 +366,28 @@ func copyStream(upstream net.Conn, timeout time.Duration, write func([]byte) err
 		streamBufferPool.Put(buf)
 		if errors.Is(err, io.EOF) {
 			return nil
+		} else if err != nil {
+			return err
+		}
+	}
+}
+
+// copyBuffered is copyStream for a src it cannot wait on, with a small buffer held while waiting
+func copyBuffered(src net.Conn, act *activity, write func([]byte) error) error {
+	buf := make([]byte, upgradedUpBufferSize)
+	for {
+		src.SetReadDeadline(act.deadline())
+		n, err := src.Read(buf)
+		if n > 0 {
+			act.touch()
+			if werr := write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		} else if act.movedSince(err) {
+			continue
 		} else if err != nil {
 			return err
 		}

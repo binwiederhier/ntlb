@@ -39,6 +39,7 @@ const (
 // Headers the proxy sets or reads
 const (
 	headerConnection      = "Connection"
+	headerUpgrade         = "Upgrade"
 	headerXForwardedFor   = "X-Forwarded-For"
 	headerAcceptEncoding  = "Accept-Encoding"
 	headerAcceptRanges    = "Accept-Ranges"
@@ -149,10 +150,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pr.site = site.Name
 	subscription := isSubscription(env, site.Streams)
 	pr.env = nil // Its header() holds the whole request, which a detached stream must not keep
-	upgrade := r.Header.Get("Upgrade") != ""
-	// Only bodyless GETs take the stream path, which writes a GET; WebSockets, other methods and
-	// requests with a body stay on the reverse proxy
-	stream := subscription && r.Method == http.MethodGet && !upgrade && r.ContentLength == 0
+	upgrade := r.Header.Get(headerUpgrade) != ""
+	// Only bodyless GETs take the stream path, which writes a GET: subscriptions, and HTTP/1.1
+	// upgrades (WebSockets, subscriptions or not). Other methods and requests with a body stay on
+	// the reverse proxy.
+	bodyless := r.Method == http.MethodGet && r.ContentLength == 0
+	stream := bodyless && (subscription && !upgrade || r.ProtoMajor == 1 && upgradeType(r.Header) != "")
 	switch {
 	case subscription && upgrade:
 		pr.kind = kindWebSocket

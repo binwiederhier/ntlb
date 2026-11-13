@@ -77,8 +77,9 @@ flowchart TB
 counted by), and `client` imports `server` only for the admin API's response types.
 
 External libraries: `expr-lang/expr` (expressions), `prometheus/client_golang` (metrics),
-`urfave/cli/v3` (CLI), `gopkg.in/yaml.v3` (config). TLS, HTTP/1.1, HTTP/2, the reverse proxy and
-WebSockets are the standard library's.
+`urfave/cli/v3` (CLI), `gopkg.in/yaml.v3` (config). TLS, HTTP/1.1, HTTP/2 and the reverse proxy
+are the standard library's; WebSockets are proxied as bytes after the handshake (see the stream
+path), never parsed.
 
 ## The main types
 
@@ -335,9 +336,10 @@ of the real connection.
 
 ## The stream path
 
-Subscriptions (`streams.match`, bodyless `GET`, no `Upgrade`) skip `ReverseProxy`: there are
-tens of thousands of them, idle almost all the time, and the reverse proxy would hold buffers
-and goroutines for each. `proxy.serveStream` in `server/stream.go`:
+Subscriptions (`streams.match`, bodyless `GET`, no `Upgrade`) and HTTP/1.1 upgrades (WebSockets,
+bodyless `GET`) skip `ReverseProxy`: there are tens of thousands of them, idle almost all the
+time, and the reverse proxy would hold buffers and goroutines for each. `proxy.serveStream` in
+`server/stream.go`:
 
 ```mermaid
 sequenceDiagram
@@ -372,8 +374,20 @@ sequenceDiagram
 
 A drain cancels the request context; `context.AfterFunc` callbacks then close the upstream
 connection and the client side (`client.Close`, or `clientConn.interrupt` for HTTP/2), so a
-blocked read or write returns at once. WebSockets (`Upgrade`) stay on `ReverseProxy`, with
-`upgradedBody` bounding idleness both ways.
+blocked read or write returns at once.
+
+A WebSocket takes the same path (`server/websocket.go`): `roundTripStream` sends the handshake
+as HTTP/1.1 with its `Connection: Upgrade` and `Upgrade` headers, and after a 101,
+`copyUpgraded` writes the head (upgrade headers kept, no `Connection: close`) and copies both
+ways, one goroutine per direction, each waiting without a buffer (`copyStream`). Bytes either
+side sent along with the handshake go first. The two directions share an `activity`: the read
+timeout counts from the last bytes either way, like nginx's `proxy_read_timeout` on an upgraded
+connection. The first direction to end (EOF, error, timeout) closes both connections. A TLS
+client cannot be waited on without reading (crypto/tls buffers its records), so its direction
+reads with a small buffer of its own (`copyBuffered`). Any other answer than a 101 (ntfy's 401,
+403, 429) is relayed like a stream's response, and the connection closes. Upgrades with a body
+or another method than `GET` stay on `ReverseProxy`, with `upgradedBody` bounding idleness both
+ways.
 
 ## The per-request state and its finishers
 
@@ -538,11 +552,12 @@ type-checks the result (bool, or string for `location`). The functions:
 | `drainLoop` | `Balancer.Start` | every second `drainTick`: picks this tick's sessions (oldest first, spread evenly to the deadline) under the lock, cancels them outside it, forgets drained removed servers |
 | `accessLog.flushLoop` | per log file | flushes the buffered writer every second |
 | `serve` | `Server.Serve`, `swapPublic` | one `http.Server` per listen address, plus admin, metrics, profiler |
-| stream copy | `serveStream` | one per detached HTTP/1.1 stream |
+| stream copy | `serveStream` | one per detached HTTP/1.1 stream, and the downstream copy of a WebSocket |
+| websocket copy | `copyUpgraded` | the upstream copy (client to upstream) of a WebSocket |
 | `handleSignals` | `execServe` | reload, shutdown |
 
-Go's `http.Server` adds a goroutine per connection (and per HTTP/2 stream), the reverse proxy
-two per WebSocket.
+Go's `http.Server` adds a goroutine per connection (and per HTTP/2 stream), until a stream or a
+WebSocket hijacks it.
 
 ## Locks and what they protect
 
@@ -592,10 +607,11 @@ Colocated (`foo.go` and `foo_test.go`), `make` runs fmt-check, vet, the tests an
   packaged rules about fifteen (mostly expr, which boxes every field an expression reads), a whole
   publish through the packaged config 260 (client and test upstream included). Raise a budget
   only on purpose, and say why in the commit.
-- **Memory budget**: `TestStream_MemoryPerStream` holds 1000 open HTTP/1.1 streams and pins the
+- **Memory budgets**: `TestStream_MemoryPerStream` holds 1000 open HTTP/1.1 streams and pins the
   live heap (5 KiB, test side included; about 3.5 KiB measured) and goroutines (the copy and the
   test upstream's) each one adds, since tens of thousands are open at once. A detached stream
   keeps only its two connections, its contexts and the access log entry: not the request, not
-  the upstream's response.
+  the upstream's response. `TestWebSocket_MemoryPerWebSocket` does the same for WebSockets
+  (8 KiB, about 5 KiB measured; the reverse proxy took 23 KiB and four goroutines).
 - **lab/replay**: compares ntlb with nginx on the lab VMs; see design.md for the lab setup and
   results.
