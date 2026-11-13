@@ -592,5 +592,10 @@ Colocated (`foo.go` and `foo_test.go`), `make` runs fmt-check, vet, the tests an
   packaged rules about fifteen (mostly expr, which boxes every field an expression reads), a whole
   publish through the packaged config 260 (client and test upstream included). Raise a budget
   only on purpose, and say why in the commit.
+- **Memory budget**: `TestStream_MemoryPerStream` holds 1000 open HTTP/1.1 streams and pins the
+  live heap (5 KiB, test side included; about 3.5 KiB measured) and goroutines (the copy and the
+  test upstream's) each one adds, since tens of thousands are open at once. A detached stream
+  keeps only its two connections, its contexts and the access log entry: not the request, not
+  the upstream's response.
 - **lab/replay**: compares ntlb with nginx on the lab VMs; see design.md for the lab setup and
   results.

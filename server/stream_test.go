@@ -780,3 +780,73 @@ func BenchmarkStream_Subscribe(b *testing.B) {
 		resp.Body.Close()
 	}
 }
+
+func TestStream_MemoryPerStream(t *testing.T) {
+	// The live heap and goroutines a detached HTTP/1.1 stream holds, test side included (two
+	// connections and the upstream's goroutine, all small). Tens of thousands are open at once.
+	skipUnderRace(t)
+	app1 := newRawUpstream(t, "app1", func(conn net.Conn) {
+		head := readHeadBytewise(conn)
+		if answerReady(conn, head) {
+			return
+		}
+		io.WriteString(conn, "HTTP/1.0 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\nstart\n")
+		conn.Read(make([]byte, 1)) // Until the load balancer closes the stream
+	})
+	s, _ := newTestServer(t, "", app1)
+	heap, goroutines := memoryPerConn(t, 1000, func() net.Conn {
+		conn, err := net.Dial("tcp", s.HTTPAddr())
+		require.NoError(t, err)
+		io.WriteString(conn, "GET /mytopic/json HTTP/1.1\r\nHost: example.com\r\nUser-Agent: ntfy/1.0\r\n\r\n")
+		for !strings.HasSuffix(readHeadBytewise(conn), "start\n") {
+		}
+		return conn
+	})
+	t.Logf("per stream: %.0f bytes of heap, %.2f goroutines", heap, goroutines)
+	require.LessOrEqual(t, heap, float64(maxHeapPerStream))
+	require.LessOrEqual(t, goroutines, 2.05) // The stream's copy, and the upstream's
+}
+
+// maxHeapPerStream is TestStream_MemoryPerStream's budget, test side included
+const maxHeapPerStream = 5 * 1024
+
+// memoryPerConn opens n connections with open and returns the live heap and the goroutines each
+// one adds, after a GC
+func memoryPerConn(t *testing.T, n int, open func() net.Conn) (float64, float64) {
+	measure := func() (uint64, int) {
+		runtime.GC()
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		return ms.HeapAlloc, runtime.NumGoroutine()
+	}
+	open().Close() // Warm up: pools, the first connection's one-time state
+	time.Sleep(100 * time.Millisecond)
+	heap0, goroutines0 := measure()
+	conns := make([]net.Conn, n)
+	for i := range conns {
+		conns[i] = open()
+	}
+	time.Sleep(100 * time.Millisecond) // Let the handlers return and the hijacked state go
+	heap1, goroutines1 := measure()
+	for _, conn := range conns {
+		conn.Close()
+	}
+	return float64(int64(heap1)-int64(heap0)) / float64(n), float64(goroutines1-goroutines0) / float64(n)
+}
+
+// readHeadBytewise reads up to a blank line, or a line ending a body's first line, one byte at a
+// time, so the test side holds no buffer
+func readHeadBytewise(conn net.Conn) string {
+	var head []byte
+	b := make([]byte, 1)
+	for {
+		if _, err := conn.Read(b); err != nil {
+			return string(head)
+		}
+		head = append(head, b[0])
+		if b[0] == '\n' && (strings.HasSuffix(string(head), "\r\n\r\n") || strings.HasSuffix(string(head), "start\n")) {
+			return string(head)
+		}
+	}
+}

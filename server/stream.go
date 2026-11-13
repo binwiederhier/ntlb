@@ -95,6 +95,7 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, pr *proxyReq
 		client, _, err := http.NewResponseController(w).Hijack()
 		if err == nil {
 			pr.detached = true
+			us.resp = nil // Its headers are in head; a stream holds them for hours otherwise
 			stopClient := context.AfterFunc(r.Context(), func() {
 				safely("stream cancel", func() {
 					client.Close() // A drain must not wait for a blocked write to the client
@@ -124,9 +125,10 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, pr *proxyReq
 // upstreamStream is an upstream connection on the stream path, after the response headers
 type upstreamStream struct {
 	conn     net.Conn
-	resp     *http.Response
-	raw      bool   // Close-delimited body: copy conn's bytes as they are (buffered first)
-	buffered []byte // Body bytes read along with the headers, if raw
+	resp     *http.Response // Dropped by a detached stream once its head is written
+	body     io.Reader      // The framed body (chunked, Content-Length), if not raw
+	raw      bool           // Close-delimited body: copy conn's bytes as they are (buffered first)
+	buffered []byte         // Body bytes read along with the headers, if raw
 }
 
 // connectStream sends the request to the best upstream for the client, with the same retries as
@@ -193,6 +195,7 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, 
 	}
 	limited.n = math.MaxInt64 // Headers done; the body is not limited
 	conn.SetDeadline(time.Time{})
+	resp.Request = nil // The client's request, which a stream must not keep
 	us := &upstreamStream{
 		conn: conn,
 		resp: resp,
@@ -201,6 +204,9 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, 
 	if us.raw {
 		buffered, _ := br.Peek(br.Buffered())
 		us.buffered = append([]byte(nil), buffered...)
+		resp.Body = http.NoBody // It reads through br, which the raw copy does not need
+	} else {
+		us.body = resp.Body
 	}
 	return us, nil
 }
@@ -273,7 +279,7 @@ func copyBody(us *upstreamStream, timeout time.Duration, write func([]byte) erro
 		defer streamBufferPool.Put(buf)
 		us.conn.SetReadDeadline(time.Now().Add(timeout))
 		for {
-			n, err := us.resp.Body.Read(buf)
+			n, err := us.body.Read(buf)
 			if n > 0 {
 				if werr := write(buf[:n]); werr != nil {
 					return werr
