@@ -213,7 +213,7 @@ classDiagram
 Two things share the name "upstream": a `config.Upstream` is a block in `upstreams:` (a pool,
 with its balance, timeouts and health check), a `balancer.Upstream` is one server of it (one
 node with its addresses). The balancer keys servers by `site/name`; per-pool state (round-robin
-turns, the proxy's connection pools) by `balancer.PoolKey(site, pool)`, also `site/name`.
+turns, the proxy's connection pools) by `config.Upstream.ID`, also `site/name`.
 
 ## Process lifecycle
 
@@ -277,7 +277,7 @@ sequenceDiagram
         O->>O: pr.pool = rule.Upstream (proxy rule), newGzipWriter
         O->>P: ServeHTTP(w, r with pr in its context)
         P->>P: no site: 404. isSubscription. draining: 503
-        P->>P: site.UpstreamNamed(pr.pool), pr.conns = conns[PoolKey]
+        P->>P: site.UpstreamNamed(pr.pool), pr.conns = conns[pool.ID]
         P->>B: NewSession(cancel)
         P->>P: track(pr), finisher: balancer.Close + cancel
         alt bodyless subscription
@@ -470,7 +470,7 @@ by command, or the pool is gone and drained.
 
 | `balance` | Order (`strategy.go`, `hash.go`) |
 |---|---|
-| `round-robin` | `rotate` by the pool's turn (`nextTurn(PoolKey)`, an atomic counter), weighted |
+| `round-robin` | `rotate` by the pool's turn (`nextTurn(pool.ID)`, an atomic counter), weighted |
 | `least-conn` | rotated, then stable-sorted by `load()` (attached + reserved) per weight |
 | `random-two-least-conn` | `sortRandomTwo`: the less loaded of two weighted random draws first |
 | `hash` | `rankWeighted`: rendezvous hash of the client key and each server name (FNV-1a plus a bit mixer), the same on every load balancer |
@@ -577,8 +577,20 @@ Colocated (`foo.go` and `foo_test.go`), `make` runs fmt-check, vet, the tests an
 - **Fuzz targets**: `FuzzParse` (config), `FuzzCompile` (expressions), `FuzzAccessLog_Escape`,
   `FuzzAccessLog_RedactAuth`, `FuzzRankWeighted`. Run one with
   `go test ./config -run '^$' -fuzz FuzzParse -fuzztime 5m`.
-- **Benchmarks**: `BenchmarkMatch`, `BenchmarkMatch_HeaderAndFlag` (expressions),
-  `BenchmarkEngine_Check`, `BenchmarkEngine_CheckParallel` (rules), `BenchmarkProxy_NtfyPublish`
-  (a publish end to end).
+- **Benchmarks** (`make bench`, compare runs with `benchstat`): each step of the request path has
+  one, next to its code: `BenchmarkConfig_SiteFor`, `BenchmarkNewEnv`, `BenchmarkMatch*`,
+  `BenchmarkEngine_Check*` (the packaged ntfy rules included), `BenchmarkBalancer_Pick` (every
+  balance, 3 and 10 servers), `BenchmarkBalancer_SessionLifecycle*` (also with 100k open streams
+  and in parallel), `BenchmarkBalancer_DrainTick*` (100k streams), `BenchmarkBalancer_Status`,
+  `BenchmarkAccessLog_Write`, `BenchmarkWriteError`, `BenchmarkValidRequest`, and end to end
+  `BenchmarkProxy_NtfyPublish`, `BenchmarkProxy_NtfyPublishParallel`, `BenchmarkProxy_NtfyPoll`,
+  `BenchmarkStream_Subscribe`.
+- **Allocation budgets**: tests named `*Allocations` pin what each step may allocate per request
+  (`testing.AllocsPerRun`), so a change that adds allocations to the hot path fails `make`:
+  `SiteFor` and `validRequest` none, `Pick` one (the slice it returns), a session's lifecycle two,
+  an access log line four, an error page none (rendered once per format, code and status), the
+  packaged rules about fifteen (mostly expr, which boxes every field an expression reads), a whole
+  publish through the packaged config 260 (client and test upstream included). Raise a budget
+  only on purpose, and say why in the commit.
 - **lab/replay**: compares ntlb with nginx on the lab VMs; see design.md for the lab setup and
   results.

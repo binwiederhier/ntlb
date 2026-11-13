@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -637,4 +638,9 @@ func TestBalancer_WaitIdle(t *testing.T) {
 	require.True(t, errors.Is(b.WaitIdle(ctx), context.DeadlineExceeded))
 	b.Close(s.Session)
 	require.NoError(t, b.WaitIdle(context.Background()))
+}
+
+// pick is a drain tick of one drain over these sessions: its quota, the oldest first
+func (d *drainState) pick(now time.Time, sessions []*Session) []*Session {
+	return oldestSessions(slices.Values(sessions), d.quota(now, len(sessions)))
 }

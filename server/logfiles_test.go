@@ -51,7 +51,7 @@ func TestOpenLogFiles_ClosesOnFailure(t *testing.T) {
 }
 
 // openFDs counts the open file descriptors of this process
-func openFDs(t *testing.T) int {
+func openFDs(t testing.TB) int {
 	entries, err := os.ReadDir("/proc/self/fd")
 	require.NoError(t, err)
 	return len(entries)

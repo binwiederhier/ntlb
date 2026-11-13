@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,7 +38,7 @@ func (s *testSession) canceled() bool {
 	return s.cause != nil
 }
 
-func newTestUpstream(t *testing.T, name string) *testUpstream {
+func newTestUpstream(t testing.TB, name string) *testUpstream {
 	u := &testUpstream{name: name}
 	u.ready.Store(true)
 	u.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +74,7 @@ func newTestConfigBalance(balance string, upstreams ...*testUpstream) *config.Co
 
 // newTestBalancer runs the first health round like Start, but not the loops: a real drain tick
 // in between the fake-time drainTick calls of a test would move the drain's last tick around
-func newTestBalancer(t *testing.T, upstreams ...*testUpstream) *Balancer {
+func newTestBalancer(t testing.TB, upstreams ...*testUpstream) *Balancer {
 	b := New(newTestConfig(upstreams...))
 	b.checkHealth(context.Background())
 	return b
@@ -255,7 +256,7 @@ func TestBalancer_NextAddressLeastLoaded(t *testing.T) {
 	require.Equal(t, 1, b.Status().Upstreams[0].Streams)
 }
 
-func mustParse(t *testing.T, s string) *config.Config {
+func mustParse(t testing.TB, s string) *config.Config {
 	conf, err := config.Parse([]byte(s))
 	require.NoError(t, err)
 	return conf
@@ -1027,4 +1028,208 @@ func TestBalancer_PickRemovedPoolForRequestsRoutedBefore(t *testing.T) {
 	b.drainTick(time.Now().Add(2 * time.Minute))
 	require.Empty(t, b.Pick("b", "", key))
 	require.Empty(t, b.Pick("b", "api", key))
+}
+
+// The request path's share of the balancer: Pick and the session calls run for every proxied
+// request (sessions under the balancer's lock), so they are benchmarked, and their allocations
+// are pinned by tests that fail when a change adds one. Raise a limit only on purpose.
+
+// newBenchBalancer is a probed balancer with n healthy servers in one site, by balance
+func newBenchBalancer(tb testing.TB, balance string, n int) *Balancer {
+	upstreams := make([]*testUpstream, n)
+	for i := range upstreams {
+		upstreams[i] = newTestUpstream(tb, fmt.Sprintf("app%d", i+1))
+	}
+	b := New(newTestConfigBalance(balance, upstreams...))
+	b.checkHealth(context.Background())
+	return b
+}
+
+func BenchmarkBalancer_Pick(b *testing.B) {
+	for _, balance := range []string{config.BalanceHash, config.BalanceRoundRobin, config.BalanceLeastConn, config.BalanceRandomTwo} {
+		for _, n := range []int{3, 10} {
+			b.Run(fmt.Sprintf("%s/%d", balance, n), func(b *testing.B) {
+				lb := newBenchBalancer(b, balance, n)
+				key := []byte{203, 0, 113, 7}
+				b.ReportAllocs()
+				for b.Loop() {
+					if len(lb.Pick("s", "", key)) != n {
+						b.Fatal("wrong candidates")
+					}
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkBalancer_PickParallel(b *testing.B) {
+	lb := newBenchBalancer(b, config.BalanceHash, 3)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		key := []byte{203, 0, 113, 7}
+		for pb.Next() {
+			lb.Pick("s", "", key)
+		}
+	})
+}
+
+// sessionLifecycle is what a proxied request does with the balancer: a session, a pick, one
+// attempt reserved and attached, and the close
+func sessionLifecycle(lb *Balancer, key []byte) {
+	s := lb.NewSession(func(error) {})
+	u := lb.Pick("s", "", key)[0]
+	addr := lb.Reserve(s, u)
+	lb.Attach(s, u, addr)
+	lb.Close(s)
+}
+
+func BenchmarkBalancer_SessionLifecycle(b *testing.B) {
+	lb := newBenchBalancer(b, config.BalanceHash, 3)
+	key := []byte{203, 0, 113, 7}
+	b.ReportAllocs()
+	for b.Loop() {
+		sessionLifecycle(lb, key)
+	}
+}
+
+func BenchmarkBalancer_SessionLifecycleParallel(b *testing.B) {
+	// All requests serialize on the balancer's lock for the session calls: this shows the cost
+	// of that contention
+	lb := newBenchBalancer(b, config.BalanceHash, 3)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		key := []byte{203, 0, 113, 7}
+		for pb.Next() {
+			sessionLifecycle(lb, key)
+		}
+	})
+}
+
+func BenchmarkBalancer_SessionLifecycleWithStreams(b *testing.B) {
+	// The same with 100k open streams, as on ntfy.sh: session calls must not scan them
+	lb := newBenchBalancer(b, config.BalanceHash, 3)
+	key := []byte{203, 0, 113, 7}
+	for i := range 100_000 {
+		s := lb.NewSession(func(error) {})
+		u := lb.Pick("s", "", keyFor(i))[0]
+		lb.Attach(s, u, lb.Reserve(s, u))
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		sessionLifecycle(lb, key)
+	}
+}
+
+func BenchmarkBalancer_DrainTick(b *testing.B) {
+	// A drain tick scans every session under the lock; with 100k streams that is the longest
+	// the lock is held, so new requests wait that long once a second while something drains
+	lb := newBenchBalancer(b, config.BalanceHash, 3)
+	for i := range 100_000 {
+		s := lb.NewSession(func(error) {})
+		u := lb.Pick("s", "", keyFor(i))[0]
+		lb.Attach(s, u, lb.Reserve(s, u))
+	}
+	require.NoError(b, lb.DrainUpstream("app1", 24*time.Hour))
+	now := time.Now()
+	b.ReportAllocs()
+	for b.Loop() {
+		lb.drainTickVictims(now) // The deadline is far: few or no victims, the scan is the cost
+	}
+}
+
+func BenchmarkBalancer_Status(b *testing.B) {
+	// What the metrics scrape and ntlb status read, with 100k streams
+	lb := newBenchBalancer(b, config.BalanceHash, 3)
+	for i := range 100_000 {
+		s := lb.NewSession(func(error) {})
+		u := lb.Pick("s", "", keyFor(i))[0]
+		lb.Attach(s, u, lb.Reserve(s, u))
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		lb.Status()
+	}
+}
+
+func TestBalancer_PickAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// The candidates slice it returns, nothing else, for every balance and up to 16 servers
+	for _, balance := range []string{config.BalanceHash, config.BalanceRoundRobin, config.BalanceLeastConn, config.BalanceRandomTwo} {
+		for _, n := range []int{1, 3, 16} {
+			lb := newBenchBalancer(t, balance, n)
+			key := []byte{203, 0, 113, 7}
+			allocs := testing.AllocsPerRun(100, func() {
+				lb.Pick("s", "", key)
+			})
+			require.LessOrEqual(t, allocs, 1.0, "%s/%d", balance, n)
+		}
+	}
+}
+
+func TestBalancer_SessionLifecycleAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// The session and the candidates; the rest reuses the upstream's maps
+	lb := newBenchBalancer(t, config.BalanceHash, 3)
+	key := []byte{203, 0, 113, 7}
+	allocs := testing.AllocsPerRun(100, func() {
+		sessionLifecycle(lb, key)
+	})
+	require.LessOrEqual(t, allocs, 2.0)
+}
+
+func TestBalancer_DrainTickAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// A tick of an upstream drain with 10k streams allocates for its victims, not per stream
+	lb := newBenchBalancer(t, config.BalanceHash, 3)
+	for i := range 10_000 {
+		s := lb.NewSession(func(error) {})
+		u := lb.Pick("s", "", keyFor(i))[0]
+		lb.Attach(s, u, lb.Reserve(s, u))
+	}
+	require.NoError(t, lb.DrainUpstream("app1", 24*time.Hour))
+	now := time.Now()
+	allocs := testing.AllocsPerRun(10, func() {
+		lb.drainTickVictims(now)
+	})
+	require.LessOrEqual(t, allocs, 10.0)
+}
+
+func TestBalancer_ClientKeyAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// ClientKey runs for every request (sticky routing, limits, bans)
+	v4, v6 := netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("2001:db8::1")
+	require.LessOrEqual(t, testing.AllocsPerRun(100, func() {
+		ClientKey(v4, 32, 64)
+	}), 1.0)
+	require.LessOrEqual(t, testing.AllocsPerRun(100, func() {
+		ClientKey(v6, 32, 64)
+	}), 1.0)
+}
+
+func BenchmarkBalancer_DrainTickWithVictims(b *testing.B) {
+	// The same while the drain closes streams: 100k over 10 minutes, ~170 per one-second tick
+	lb := newBenchBalancer(b, config.BalanceHash, 3)
+	for i := range 100_000 {
+		s := lb.NewSession(func(error) {})
+		u := lb.Pick("s", "", keyFor(i))[0]
+		lb.Attach(s, u, lb.Reserve(s, u))
+	}
+	require.NoError(b, lb.DrainUpstream("app1", 10*time.Minute))
+	now := time.Now()
+	b.ReportAllocs()
+	for b.Loop() {
+		now = now.Add(time.Second)
+		lb.drainTickVictims(now)
+	}
+}
+
+// skipUnderRace skips an allocation budget under the race detector, which allocates on its own
+func skipUnderRace(t *testing.T) {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "-race" && s.Value == "true" {
+				t.Skip("allocation counts differ under -race")
+			}
+		}
+	}
 }

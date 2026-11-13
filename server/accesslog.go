@@ -15,6 +15,7 @@ import (
 
 const (
 	accessLogFlushInterval = time.Second
+	accessLogLineSize      = 320                          // Room for a typical line, built in one allocation
 	accessLogTimeFormat    = "02/Jan/2006:15:04:05 -0700" // nginx's $time_local
 	maxLogField            = 4096                         // Bytes per escaped field, so one request cannot write a huge line
 )
@@ -67,19 +68,39 @@ func newAccessLogEntry(r *http.Request, start time.Time) *accessLogEntry {
 }
 
 func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest, status int) {
-	bytes := pr.bytes
-	site, upstream, upstreamStatus := "-", "-", "-"
-	if pr.site != "" {
-		site = pr.site
-	}
+	// Appended field by field, like fmt's "%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s
+	// site=%s request_time=%.3f upstream=%s upstream_status=%s", without boxing every argument
+	line := make([]byte, 0, accessLogLineSize)
+	line = append(line, e.remoteAddr...)
+	line = append(line, " - - ["...)
+	line = e.start.AppendFormat(line, accessLogTimeFormat)
+	line = append(line, "] \""...)
+	line = append(line, e.request...)
+	line = append(line, "\" "...)
+	line = strconv.AppendInt(line, int64(status), 10)
+	line = append(line, ' ')
+	line = strconv.AppendInt(line, pr.bytes, 10)
+	line = append(line, " \""...)
+	line = append(line, orDash(e.referer)...)
+	line = append(line, "\" \""...)
+	line = append(line, orDash(e.userAgent)...)
+	line = append(line, "\" http_host="...)
+	line = append(line, orDash(e.host)...)
+	line = append(line, " site="...)
+	line = append(line, orDash(pr.site)...)
+	line = append(line, " request_time="...)
+	line = strconv.AppendFloat(line, time.Since(e.start).Seconds(), 'f', 3, 64)
+	line = append(line, " upstream="...)
 	if pr.upstream != "" {
-		upstream, upstreamStatus = pr.upstream, strconv.Itoa(pr.upstreamStatus)
+		line = append(line, pr.upstream...)
+		line = append(line, " upstream_status="...)
+		line = strconv.AppendInt(line, int64(pr.upstreamStatus), 10)
+	} else {
+		line = append(line, "- upstream_status=-"...)
 	}
-	line := fmt.Appendf(nil, "%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s site=%s request_time=%.3f upstream=%s upstream_status=%s",
-		e.remoteAddr, e.start.Format(accessLogTimeFormat), e.request, status, bytes,
-		orDash(e.referer), orDash(e.userAgent), orDash(e.host), site, time.Since(e.start).Seconds(), upstream, upstreamStatus)
 	if pr.rule != "" {
-		line = append(append(line, " rule="...), pr.rule...)
+		line = append(line, " rule="...)
+		line = append(line, pr.rule...)
 	}
 	l.writeLine(append(line, '\n'))
 }
@@ -145,10 +166,13 @@ func escapeUnquoted(s string) string {
 }
 
 func escapeField(s string, spaces bool) string {
+	if len(s) < maxLogField && !needsEscape(s, spaces) {
+		return s // The usual case: nothing to escape or cut
+	}
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c < 0x20 || c > 0x7e || c == '"' || c == '\\' || (spaces && c == ' ') {
+		if escaped(c, spaces) {
 			fmt.Fprintf(&b, "\\x%02X", c)
 		} else {
 			b.WriteByte(c)
@@ -160,10 +184,25 @@ func escapeField(s string, spaces bool) string {
 	return b.String()
 }
 
-// redactAuth hides the values of auth query parameters (the web app's credentials)
+func needsEscape(s string, spaces bool) bool {
+	for i := 0; i < len(s); i++ {
+		if escaped(s[i], spaces) {
+			return true
+		}
+	}
+	return false
+}
+
+// escaped reports whether a byte is written as \xHH (see escape)
+func escaped(c byte, spaces bool) bool {
+	return c < 0x20 || c > 0x7e || c == '"' || c == '\\' || (spaces && c == ' ')
+}
+
+// redactAuth hides the values of auth query parameters (the web app's credentials). A URI without
+// one is returned as it is.
 func redactAuth(uri string) string {
 	path, query, ok := strings.Cut(uri, "?")
-	if !ok {
+	if !ok || !hasAuthParam(query) {
 		return uri
 	}
 	params := strings.Split(query, "&")
@@ -173,6 +212,18 @@ func redactAuth(uri string) string {
 		}
 	}
 	return path + "?" + strings.Join(params, "&")
+}
+
+// hasAuthParam reports whether a query has an auth=... parameter, any case
+func hasAuthParam(query string) bool {
+	for query != "" {
+		var p string
+		p, query, _ = strings.Cut(query, "&")
+		if key, _, ok := strings.Cut(p, "="); ok && strings.EqualFold(key, "auth") {
+			return true
+		}
+	}
+	return false
 }
 
 func orDash(s string) string {

@@ -393,10 +393,13 @@ func overlaps(a, b string) bool {
 	return errA == nil && errB == nil && ipA.Unmap() == ipB.Unmap()
 }
 
-// normalizeHost lowercases a Host header and strips its port and trailing dot
+// normalizeHost lowercases a Host header and strips its port and trailing dot. Only a host with
+// a port goes through net.SplitHostPort, whose error for the usual host without one allocates.
 func normalizeHost(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	if strings.LastIndexByte(host, ':') > strings.LastIndexByte(host, ']') {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
 	}
 	return strings.TrimSuffix(strings.ToLower(host), ".")
 }

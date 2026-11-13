@@ -367,7 +367,7 @@ func TestServer_RuleStaticOnlyCleanPaths(t *testing.T) {
 }
 
 // banLines returns the ban file's lines without their timestamps: "<ip> <prefix> <rule>"
-func banLines(t *testing.T, banLog string) []string {
+func banLines(t testing.TB, banLog string) []string {
 	data, _ := os.ReadFile(banLog)
 	var lines []string
 	for line := range strings.Lines(string(data)) {

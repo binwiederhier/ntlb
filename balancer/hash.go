@@ -32,26 +32,24 @@ func ClientKey(addr netip.Addr, ipv4PrefixBits, ipv6PrefixBits int) []byte {
 	return prefix.Addr().AsSlice()[:(bits+7)/8]
 }
 
-// rankWeighted orders upstream names by preference for a key, using rendezvous (highest random
-// weight) hashing. The order depends only on the key and the names, not on the config order or
-// the process, so every load balancer with the same upstream names routes a client the same way,
-// and removing or adding an upstream only moves the clients that ranked it first. With a weight
-// per name (nil: all 1), each name scores weight / -ln(hash as a number in (0,1)), so a name gets
-// its weight's share of keys, and adding, removing or reweighting one only moves keys from or to
-// it. Equal weights rank like no weights, since the score grows with the hash.
-func rankWeighted(key []byte, names []string, weights []int) []string {
+// sortByHash orders upstreams by preference for a key, using rendezvous (highest random weight)
+// hashing on their names. The order depends only on the key and the names, not on the config
+// order or the process, so every load balancer with the same upstream names routes a client the
+// same way, and removing or adding an upstream only moves the clients that ranked it first. With
+// weights, each name scores weight / -ln(hash as a number in (0,1)), so a name gets its weight's
+// share of keys, and adding, removing or reweighting one only moves keys from or to it. Equal
+// weights rank like no weights, since the score grows with the hash. Sorts in place, without
+// allocating for up to scratchSize upstreams.
+func sortByHash(key []byte, upstreams []*Upstream) {
 	type scored struct {
-		name  string
+		u     *Upstream
 		score float64
 	}
-	scores := make([]scored, len(names))
-	for i, name := range names {
-		weight := 1
-		if weights != nil {
-			weight = weights[i]
-		}
-		u := (float64(score(key, name)>>11) + 0.5) / (1 << 53) // In (0,1), never 0 or 1
-		scores[i] = scored{name: name, score: float64(weight) / -math.Log(u)}
+	var scratch [scratchSize]scored
+	scores := scratch[:0]
+	for _, u := range upstreams {
+		h := (float64(score(key, u.name)>>11) + 0.5) / (1 << 53) // In (0,1), never 0 or 1
+		scores = append(scores, scored{u: u, score: float64(u.weight) / -math.Log(h)})
 	}
 	slices.SortFunc(scores, func(a, b scored) int {
 		if a.score != b.score {
@@ -60,13 +58,11 @@ func rankWeighted(key []byte, names []string, weights []int) []string {
 			}
 			return 1
 		}
-		return strings.Compare(a.name, b.name)
+		return strings.Compare(a.u.name, b.u.name)
 	})
-	ranked := make([]string, len(scores))
 	for i, s := range scores {
-		ranked[i] = s.name
+		upstreams[i] = s.u
 	}
-	return ranked
 }
 
 // score hashes key and name with FNV-1a, followed by the splitmix64 finalizer, since FNV alone

@@ -448,10 +448,12 @@ func validRequest(r *http.Request) bool {
 		}
 	}
 	host, port := r.Host, ""
-	if h, p, err := net.SplitHostPort(r.Host); err == nil {
-		host, port = h, p
-	} else if strings.Contains(strings.TrimSuffix(strings.TrimPrefix(r.Host, "["), "]"), ":") && !strings.HasPrefix(r.Host, "[") {
-		return false // A colon, but no valid port
+	if strings.Contains(r.Host, ":") { // Only then: SplitHostPort's error for a host without a port allocates
+		if h, p, err := net.SplitHostPort(r.Host); err == nil {
+			host, port = h, p
+		} else if strings.Contains(strings.TrimSuffix(strings.TrimPrefix(r.Host, "["), "]"), ":") && !strings.HasPrefix(r.Host, "[") {
+			return false // A colon, but no valid port
+		}
 	}
 	for i := 0; i < len(port); i++ {
 		if port[i] < '0' || port[i] > '9' {

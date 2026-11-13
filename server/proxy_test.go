@@ -627,7 +627,7 @@ func TestProxy_ReloadUnderLoad(t *testing.T) {
 }
 
 // clientForRank returns a client from a loopback IP whose rendezvous order starts with names
-func clientForRank(t *testing.T, s *Server, names ...string) *http.Client {
+func clientForRank(t testing.TB, s *Server, names ...string) *http.Client {
 	for i := 1; i < 250; i++ {
 		ip := fmt.Sprintf("127.0.2.%d", i)
 		candidates := s.balancer.Pick("s", "", clientKey(ip+":1", s.config.Load().ClientKey))
@@ -944,7 +944,7 @@ type echoed struct {
 	transferEncoding   []string
 }
 
-func newEchoUpstream(t *testing.T, respond func(w http.ResponseWriter, r *http.Request)) *echoUpstream {
+func newEchoUpstream(t testing.TB, respond func(w http.ResponseWriter, r *http.Request)) *echoUpstream {
 	e := &echoUpstream{}
 	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == testHealthPath {
@@ -976,7 +976,7 @@ func (e *echoUpstream) lastRequest() *echoed {
 	return e.last
 }
 
-func echoServer(t *testing.T, e *echoUpstream) *Server {
+func echoServer(t testing.TB, e *echoUpstream) *Server {
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
@@ -986,7 +986,7 @@ sites: [{name: s, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: {defa
 }
 
 // rawRoundTrip sends a raw HTTP/1.x request and reads one response
-func rawRoundTrip(t *testing.T, addr, request string) *http.Response {
+func rawRoundTrip(t testing.TB, addr, request string) *http.Response {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
@@ -1255,7 +1255,7 @@ func upgradeThen(then func(net.Conn)) http.HandlerFunc {
 }
 
 // openUpgrade opens an upgraded connection through the load balancer
-func openUpgrade(t *testing.T, addr, path string) (net.Conn, *bufio.Reader) {
+func openUpgrade(t testing.TB, addr, path string) (net.Conn, *bufio.Reader) {
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -1362,44 +1362,94 @@ func TestProxy_UpdateKeepsUnchangedConns(t *testing.T) {
 	require.Same(t, before["b/default"], changed["b/default"])
 }
 
-func BenchmarkProxy_NtfyPublish(b *testing.B) {
-	// A publish through the shipped ntfy config (all its rules, access logs, gzip), with keep-alive
-	t := &testing.T{}
-	app1 := newTestUpstream(t, "app1")
+// ntfyBench is the shipped ntfy config in front of one app node that answers publishes and polls,
+// and a keep-alive client from an IP exempt from the limit
+func ntfyBench(tb testing.TB) (*Server, *http.Client) {
+	app1 := newTestUpstream(tb, "app1")
 	app1.on("/mytopic", func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		io.WriteString(w, `{"id":"abc","event":"message"}`)
 	})
-	s, _ := newNtfyPackagedServer(t, app1)
+	s, _ := newNtfyPackagedServer(tb, app1)
 	dialer := &net.Dialer{
 		LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.41")}, // Exempt from the limit
 	}
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext:         dialer.DialContext,
-			MaxIdleConnsPerHost: 1,
+			MaxIdleConnsPerHost: 64,
 		},
 	}
+	tb.Cleanup(client.CloseIdleConnections)
+	return s, client
+}
+
+// ntfyDo sends one request and reads the answer, which must be 200
+func ntfyDo(tb testing.TB, client *http.Client, method, url, body string) {
+	req, _ := http.NewRequest(method, url, strings.NewReader(body))
+	req.Host = "ntfy.sh"
+	resp, err := client.Do(req)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		tb.Fatal(resp.Status)
+	}
+}
+
+func BenchmarkProxy_NtfyPublish(b *testing.B) {
+	// A publish through the shipped ntfy config (all its rules, access logs, gzip), with keep-alive
+	s, client := ntfyBench(b)
 	url := "http://" + s.HTTPAddr() + "/mytopic"
 	b.ReportAllocs()
 	for b.Loop() {
-		req, _ := http.NewRequest(http.MethodPut, url, strings.NewReader("hello"))
-		req.Host = "ntfy.sh"
-		resp, err := client.Do(req)
-		if err != nil {
-			b.Fatal(err)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			b.Fatal(resp.Status)
-		}
+		ntfyDo(b, client, http.MethodPut, url, "hello")
 	}
+}
+
+func BenchmarkProxy_NtfyPublishParallel(b *testing.B) {
+	// The same from many clients at once: shows contention on shared state (the balancer's lock,
+	// the access log's, the metrics)
+	s, client := ntfyBench(b)
+	url := "http://" + s.HTTPAddr() + "/mytopic"
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			ntfyDo(b, client, http.MethodPut, url, "hello")
+		}
+	})
+}
+
+func BenchmarkProxy_NtfyPoll(b *testing.B) {
+	// A poll: a GET that the streams match looks at closely (flag) and that is not a stream
+	s, client := ntfyBench(b)
+	url := "http://" + s.HTTPAddr() + "/mytopic/json?poll=1&since=1730000000"
+	b.ReportAllocs()
+	for b.Loop() {
+		ntfyDo(b, client, http.MethodGet, url, "")
+	}
+}
+
+func TestProxy_NtfyPublishAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// A whole publish, the client and the test upstream included (about two thirds of it), so the
+	// limit is loose: it catches a change that adds allocations per request in bulk, like the
+	// access log's 30 or the HTML error page's 50 before they were cut
+	s, client := ntfyBench(t)
+	url := "http://" + s.HTTPAddr() + "/mytopic"
+	ntfyDo(t, client, http.MethodPut, url, "hello") // Warm up the connection
+	allocs := testing.AllocsPerRun(50, func() {
+		ntfyDo(t, client, http.MethodPut, url, "hello")
+	})
+	t.Logf("%.0f allocations per publish", allocs)
+	require.LessOrEqual(t, allocs, 260.0)
 }
 
 // routedConfig is a site whose default upstream takes what no rule routes, and whose upstreams app1
 // and app2 take /app1/ and /app2/
-func routedConfig(t *testing.T, filename string, web *testUpstream, app1, app2 []*testUpstream) {
+func routedConfig(t testing.TB, filename string, web *testUpstream, app1, app2 []*testUpstream) {
 	servers := func(indent string, upstreams []*testUpstream) string {
 		var b strings.Builder
 		for _, u := range upstreams {

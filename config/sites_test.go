@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"testing"
 	"time"
 
@@ -351,5 +352,80 @@ sites:
 		require.ErrorContains(t, err, "gzip", name)
 		_, err = Parse([]byte("sites: [{name: a, listen-http: ':80', gzip: " + gzip + ", " + testUp + "}]"))
 		require.ErrorContains(t, err, "site a: gzip", name)
+	}
+}
+
+// SiteFor runs for every request
+
+func benchSites(tb testing.TB) *Config {
+	c, err := Parse([]byte(`
+sites:
+  - {name: a, listen-http: ':80', hosts: [a.com, www.a.com], ` + testUp + `}
+  - {name: b, listen-http: ':80', hosts: ['*.b.com'], ` + testUp + `}
+  - {name: c, listen-http: ':80', hosts: [c.com], ` + testUp + `}
+  - {name: d, listen-http: ':80', ` + testUp + `}
+`))
+	require.NoError(tb, err)
+	return c
+}
+
+func BenchmarkConfig_SiteFor(b *testing.B) {
+	c := benchSites(b)
+	for name, host := range map[string]string{
+		"exact":    "a.com",
+		"wildcard": "x.b.com",
+		"fallback": "other.org",
+		"port":     "a.com:80",
+		"upper":    "A.COM",
+	} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if c.SiteFor(":80", host) == nil {
+					b.Fatal("no site")
+				}
+			}
+		})
+	}
+}
+
+func TestConfig_SiteForAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// No allocation for the hosts clients send (lowercase, with or without a port); an uppercase
+	// host is lowercased
+	c := benchSites(t)
+	for host, limit := range map[string]float64{"a.com": 0, "x.b.com": 0, "other.org": 0, "a.com:443": 0, "A.COM": 2} {
+		allocs := testing.AllocsPerRun(100, func() {
+			c.SiteFor(":80", host)
+		})
+		require.LessOrEqual(t, allocs, limit, host)
+	}
+}
+
+func TestNormalizeHost(t *testing.T) {
+	for host, want := range map[string]string{
+		"a.com":         "a.com",
+		"A.Com.":        "a.com",
+		"a.com:8080":    "a.com",
+		"a.com.:443":    "a.com",
+		"[::1]":         "[::1]",
+		"[::1]:80":      "::1",
+		"::1":           "::1",
+		"[2001:DB8::1]": "[2001:db8::1]",
+		"":              "",
+		"a.com:":        "a.com",
+	} {
+		require.Equal(t, want, normalizeHost(host), host)
+	}
+}
+
+// skipUnderRace skips an allocation budget under the race detector, which allocates on its own
+func skipUnderRace(t *testing.T) {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "-race" && s.Value == "true" {
+				t.Skip("allocation counts differ under -race")
+			}
+		}
 	}
 }

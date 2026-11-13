@@ -3,6 +3,7 @@ package rules
 import (
 	"net/http"
 	"net/http/httptest"
+	"runtime/debug"
 	"strconv"
 	"testing"
 	"time"
@@ -464,4 +465,64 @@ func TestBans_TrackedClientsCapped(t *testing.T) {
 	*now = now.Add(fullSweepInterval)
 	decided(e, request("GET", "/", "192.0.2.4:1"))
 	require.NotEqual(t, swept, b.lastSweep)
+}
+
+// The packaged ntfy rules against the requests ntfy.sh sees most: their cost is paid on every
+// request, so they are benchmarked, and their allocations pinned
+
+func packagedEngine(tb testing.TB) *Engine {
+	conf, err := config.Load("../packaging/config.yml")
+	require.NoError(tb, err)
+	return New(conf, nil)
+}
+
+var packagedRequests = map[string][]string{
+	"subscribe": {"GET", "/mytopic/json", "User-Agent", "ntfy/1.27.0 (Android; 14)"},
+	"poll":      {"GET", "/mytopic/json?poll=1&since=1730000000", "User-Agent", "ntfy/1.27.0 (Android; 14)"},
+	"publish":   {"POST", "/mytopic", "User-Agent", "curl/8.5.0"},
+	"web app":   {"GET", "/", "User-Agent", "Mozilla/5.0"},
+}
+
+func BenchmarkEngine_CheckPackaged(b *testing.B) {
+	e := packagedEngine(b)
+	for name, req := range packagedRequests {
+		b.Run(name, func(b *testing.B) {
+			r := request(req[0], req[1], "203.0.113.7:4321", req[2], req[3])
+			r.Host = "ntfy.sh"
+			b.ReportAllocs()
+			for b.Loop() {
+				env := match.NewEnv(r)
+				env.Site = "ntfy"
+				e.Check(r, env)
+			}
+		})
+	}
+}
+
+func TestEngine_CheckPackagedAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// Including the Env; a client's bucket is created once, so it does not count
+	e := packagedEngine(t)
+	for name, req := range packagedRequests {
+		r := request(req[0], req[1], "203.0.113.7:4321", req[2], req[3])
+		r.Host = "ntfy.sh"
+		allocs := testing.AllocsPerRun(100, func() {
+			env := match.NewEnv(r)
+			env.Site = "ntfy"
+			e.Check(r, env)
+		})
+		t.Logf("%s: %.0f", name, allocs)
+		require.LessOrEqual(t, allocs, 20.0, name)
+	}
+}
+
+// skipUnderRace skips an allocation budget under the race detector, which allocates on its own
+func skipUnderRace(t *testing.T) {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "-race" && s.Value == "true" {
+				t.Skip("allocation counts differ under -race")
+			}
+		}
+	}
 }

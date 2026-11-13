@@ -3,8 +3,11 @@ package match
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"runtime/debug"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -262,6 +265,89 @@ func BenchmarkMatch_HeaderAndFlag(b *testing.B) {
 	for b.Loop() {
 		if !p.Match(NewEnv(r)) { // A new env per request, like the server
 			b.Fatal("expected a match")
+		}
+	}
+}
+
+// NewEnv runs for every request, the programs for every rule and the streams match
+
+func BenchmarkNewEnv(b *testing.B) {
+	r := testRequest("GET", "http://ntfy.sh/mytopic/json?since=10m", "203.0.113.9:1234", "User-Agent", "ntfy/1.0")
+	b.ReportAllocs()
+	for b.Loop() {
+		NewEnv(r)
+	}
+}
+
+func TestNewEnvAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// The Env itself, and the request URI
+	r := testRequest("GET", "http://ntfy.sh/mytopic/json?since=10m", "203.0.113.9:1234")
+	require.LessOrEqual(t, testing.AllocsPerRun(100, func() {
+		NewEnv(r)
+	}), 2.0)
+}
+
+func TestMatchAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// expr boxes every field it reads (one allocation per string field: method, path, ip...), a
+	// function call allocates its arguments, header() its result; flag() reads the raw query
+	// without parsing it. The packaged rules read a handful of fields per request.
+	r := testRequest("GET", "http://ntfy.sh/mytopic/json?poll=1", "203.0.113.9:1234", "User-Agent", "ntfy/1.0")
+	for expression, limit := range map[string]float64{
+		`method == "GET" && path startsWith "/mytopic"`:                                  2,
+		`path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$"`: 1,
+		`ipIn(ip, "203.0.113.0/24", "198.51.100.7")`:                                     3,
+		`header("User-Agent") matches "(?i)ntfy-spy"`:                                    3,
+		`!flag("x-poll", "poll", "po")`:                                                  2,
+	} {
+		p, err := Compile(expression, Request)
+		require.NoError(t, err)
+		env := NewEnv(r)
+		allocs := testing.AllocsPerRun(100, func() {
+			p.Match(env)
+		})
+		assert.LessOrEqual(t, allocs, limit, expression)
+	}
+}
+
+func TestQueryParam(t *testing.T) {
+	// The same answer as url.Values.Get on the parsed query
+	for _, raw := range []string{"", "poll=1", "a=1&poll=1", "poll=&poll=1", "poll", "p%6Fll=1", "poll=%31", "poll=a+b", "x;y=1&poll=1", "poll=%zz&poll=1", "%zz=1&poll=yes"} {
+		want := url.Values{}
+		if parsed, err := url.ParseQuery(raw); err == nil || parsed != nil {
+			want = parsed
+		}
+		require.Equal(t, want.Get("poll"), queryParam(raw, "poll"), raw)
+	}
+}
+
+func FuzzQueryParam(f *testing.F) {
+	for _, raw := range []string{"poll=1", "a=1&poll=1", "p%6Fll=%31", "x;y=1&poll=1", "poll=%zz&poll=1"} {
+		f.Add(raw, "poll")
+	}
+	f.Fuzz(func(t *testing.T, raw, name string) {
+		parsed, _ := url.ParseQuery(raw)
+		require.Equal(t, parsed.Get(name), queryParam(raw, name))
+	})
+}
+
+func TestFlagAndHeaderWithComputedNames(t *testing.T) {
+	// Names that are not literals are not canonicalized at compile time; they still work
+	r := testRequest("GET", "/t/json?poll=1", "192.0.2.1:1", "x-poll", "yes", "User-Agent", "ntfy/1")
+	require.True(t, matches(t, `flag(lower("X-POLL"))`, r))
+	require.True(t, matches(t, `flag(lower("NOPE"), lower("POLL"))`, testRequest("GET", "/t/json?poll=1", "192.0.2.1:1")))
+	require.True(t, matches(t, `header(lower("USER-AGENT")) == "ntfy/1"`, r))
+	require.True(t, matches(t, `header("user-agent") == "ntfy/1"`, r))
+}
+
+// skipUnderRace skips an allocation budget under the race detector, which allocates on its own
+func skipUnderRace(t *testing.T) {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "-race" && s.Value == "true" {
+				t.Skip("allocation counts differ under -race")
+			}
 		}
 	}
 }

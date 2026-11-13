@@ -58,7 +58,7 @@ func TestCerts_ListenerWithoutCertificates(t *testing.T) {
 	require.ErrorIs(t, err, errNoCertificate)
 }
 
-func servedBy(t *testing.T, addr, serverName string) string {
+func servedBy(t testing.TB, addr, serverName string) string {
 	conn, err := tls.Dial("tcp", addr, &tls.Config{
 		ServerName:         serverName,
 		InsecureSkipVerify: true,

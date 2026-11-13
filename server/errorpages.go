@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"heckel.io/ntlb/config"
 )
@@ -33,7 +34,14 @@ var (
 )
 
 const (
-	errorOrigin = "ntlb"
+	errorOrigin         = "ntlb"
+	maxCachedErrorPages = 1000 // Formats times codes times the statuses rules choose: far fewer
+)
+
+var (
+	errorPages   = make(map[errorPageKey]*errorPage) // Rendered pages of the built-in formats
+	errorPagesMu sync.RWMutex                        // Protects errorPages
+	nosniff      = []string{"nosniff"}               // X-Content-Type-Options, shared
 )
 
 var (
@@ -41,6 +49,19 @@ var (
 	errorPageHTML     string
 	errorPageTemplate = template.Must(template.New("errorpage").Parse(errorPageHTML))
 )
+
+// errorPageKey identifies a page of a built-in format: rules choose the status of a block
+type errorPageKey struct {
+	format string
+	code   int
+	status int
+}
+
+// errorPage is a rendered error page
+type errorPage struct {
+	contentType []string // The Content-Type header's value
+	body        []byte
+}
 
 // httpError is one of ntlb's own answers; also what error page templates get
 type httpError struct {
@@ -61,8 +82,49 @@ func (e *httpError) withStatus(status int) *httpError {
 }
 
 // writeError answers with one of ntlb's errors, in the format of the site's error pages. A
-// template that fails falls back to text.
+// template that fails falls back to text. The built-in formats are rendered once per error and
+// status, so a flood of blocked or limited requests does not render a page for each.
 func writeError(w http.ResponseWriter, pages *config.ErrorPages, e *httpError) {
+	page := cachedErrorPage(pages, e)
+	if page == nil {
+		page = newErrorPage(pages, e)
+	}
+	h := w.Header()
+	h.Del("Content-Length")
+	h["Content-Type"] = page.contentType // Shared, never changed: Header.Set would allocate every time
+	h["X-Content-Type-Options"] = nosniff
+	w.WriteHeader(e.HTTP)
+	w.Write(page.body)
+}
+
+// cachedErrorPage returns the rendered page of a built-in format, rendering it the first time;
+// nil for a template of the config's own
+func cachedErrorPage(pages *config.ErrorPages, e *httpError) *errorPage {
+	if pages.Executor != nil {
+		return nil
+	}
+	key := errorPageKey{
+		format: pages.Format,
+		code:   e.Code,
+		status: e.HTTP,
+	}
+	errorPagesMu.RLock()
+	page, ok := errorPages[key]
+	errorPagesMu.RUnlock()
+	if ok {
+		return page
+	}
+	page = newErrorPage(pages, e)
+	errorPagesMu.Lock()
+	if len(errorPages) < maxCachedErrorPages {
+		errorPages[key] = page
+	}
+	errorPagesMu.Unlock()
+	return page
+}
+
+// newErrorPage renders an error page
+func newErrorPage(pages *config.ErrorPages, e *httpError) *errorPage {
 	data := &httpError{
 		Code:   e.Code,
 		HTTP:   e.HTTP,
@@ -77,12 +139,10 @@ func writeError(w http.ResponseWriter, pages *config.ErrorPages, e *httpError) {
 		b.Reset()
 		contentType = renderTextError(&b, data)
 	}
-	h := w.Header()
-	h.Del("Content-Length")
-	h.Set("Content-Type", contentType)
-	h.Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(data.HTTP)
-	w.Write(b.Bytes())
+	return &errorPage{
+		contentType: []string{contentType},
+		body:        b.Bytes(),
+	}
 }
 
 // renderError writes the error page and returns its content type

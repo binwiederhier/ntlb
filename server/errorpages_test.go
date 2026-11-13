@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"heckel.io/ntlb/config"
 )
 
 const testErrorRules = `
@@ -19,7 +21,7 @@ rules:
 `
 
 // getResponse is get with the response's content type
-func getResponse(t *testing.T, url string) (int, string, string) {
+func getResponse(t testing.TB, url string) (int, string, string) {
 	resp, err := http.Get(url)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -95,5 +97,52 @@ func TestErrorPages_UpstreamFailed(t *testing.T) {
 		status, _, body := getResponse(t, "http://"+s.HTTPAddr()+path)
 		require.Equal(t, http.StatusBadGateway, status, path)
 		require.Equal(t, `{"code":50299,"http":502,"error":"upstream failed","origin":"ntlb"}`+"\n", body, path)
+	}
+}
+
+// discardWriter is a ResponseWriter that keeps nothing, so benchmarks measure writeError alone
+type discardWriter struct {
+	header http.Header
+}
+
+func (w *discardWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *discardWriter) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (w *discardWriter) WriteHeader(int) {
+}
+
+func BenchmarkWriteError(b *testing.B) {
+	// Blocks and limits answer with an error page; a flood of them is the case to be cheap for
+	for _, format := range []string{config.ErrorFormatHTML, config.ErrorFormatJSON, config.ErrorFormatText} {
+		b.Run(format, func(b *testing.B) {
+			pages := &config.ErrorPages{Format: format}
+			w := &discardWriter{header: make(http.Header)}
+			b.ReportAllocs()
+			for b.Loop() {
+				writeError(w, pages, httpErrRateLimited)
+			}
+		})
+	}
+}
+
+func TestWriteErrorAllocations(t *testing.T) {
+	skipUnderRace(t)
+	for format, limit := range map[string]float64{
+		config.ErrorFormatHTML: 3,
+		config.ErrorFormatJSON: 3,
+		config.ErrorFormatText: 3,
+	} {
+		pages := &config.ErrorPages{Format: format}
+		w := &discardWriter{header: make(http.Header)}
+		allocs := testing.AllocsPerRun(100, func() {
+			writeError(w, pages, httpErrRateLimited)
+		})
+		t.Logf("%s: %.0f", format, allocs)
+		assert.LessOrEqual(t, allocs, limit, format)
 	}
 }

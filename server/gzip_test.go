@@ -32,7 +32,7 @@ var (
 
 // gzipGet sends a request with the given Accept-Encoding (none if "") and returns the response
 // and its body, decompressed if the response is gzip-encoded
-func gzipGet(t *testing.T, method, url, acceptEncoding string, header ...string) (*http.Response, string) {
+func gzipGet(t testing.TB, method, url, acceptEncoding string, header ...string) (*http.Response, string) {
 	t.Helper()
 	req, err := http.NewRequest(method, url, nil)
 	require.NoError(t, err)

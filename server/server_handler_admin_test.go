@@ -16,7 +16,7 @@ import (
 	"heckel.io/ntlb/balancer"
 )
 
-func adminDo(t *testing.T, s *Server, method, path, body string) (int, string) {
+func adminDo(t testing.TB, s *Server, method, path, body string) (int, string) {
 	req, err := http.NewRequest(method, "http://"+s.AdminAddr()+path, strings.NewReader(body))
 	require.NoError(t, err)
 	resp, err := http.DefaultClient.Do(req)
@@ -26,7 +26,7 @@ func adminDo(t *testing.T, s *Server, method, path, body string) (int, string) {
 	return resp.StatusCode, string(b)
 }
 
-func adminStatus(t *testing.T, s *Server) *balancer.Status {
+func adminStatus(t testing.TB, s *Server) *balancer.Status {
 	code, body := adminDo(t, s, http.MethodGet, "/v1/status", "")
 	require.Equal(t, http.StatusOK, code)
 	status := &balancer.Status{}

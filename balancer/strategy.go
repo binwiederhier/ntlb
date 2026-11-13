@@ -13,15 +13,7 @@ import (
 func sortFor(pool *config.Upstream, key []byte, turn uint64, upstreams []*Upstream) {
 	switch pool.Balance {
 	case config.BalanceHash:
-		byName := make(map[string]*Upstream, len(upstreams))
-		names := make([]string, len(upstreams))
-		weights := make([]int, len(upstreams))
-		for i, u := range upstreams {
-			byName[u.name], names[i], weights[i] = u, u.name, u.weight
-		}
-		for i, name := range rankWeighted(key, names, weights) {
-			upstreams[i] = byName[name]
-		}
+		sortByHash(key, upstreams)
 	case config.BalanceRoundRobin:
 		rotate(upstreams, turn)
 	case config.BalanceLeastConn:
@@ -32,7 +24,7 @@ func sortFor(pool *config.Upstream, key []byte, turn uint64, upstreams []*Upstre
 	}
 }
 
-// nextTurn returns a pool's next round-robin turn (key: see PoolKey)
+// nextTurn returns a pool's next round-robin turn (key: its config.Upstream.ID)
 func (b *Balancer) nextTurn(key string) uint64 {
 	turn, ok := b.turns.Load(key)
 	if !ok {
@@ -63,24 +55,25 @@ func rotate(upstreams []*Upstream, turn uint64) {
 }
 
 // sortRandomTwo puts the less busy (per weight) of two upstreams drawn by weight first, the other
-// second, and the rest by load: nginx's "random two least_conn"
+// second, and the rest by load: nginx's "random two least_conn". The rest keep their order among
+// equals.
 func sortRandomTwo(upstreams []*Upstream) {
 	if len(upstreams) < 2 {
 		return
 	}
-	rest := slices.Clone(upstreams)
-	i := drawByWeight(rest)
-	first := rest[i]
-	rest = slices.Delete(rest, i, i+1)
-	j := drawByWeight(rest)
-	second := rest[j]
-	rest = slices.Delete(rest, j, j+1)
-	if lessBusy(second.load(), second.weight, first.load(), first.weight) {
-		first, second = second, first
+	moveTo(upstreams, drawByWeight(upstreams), 0)
+	moveTo(upstreams, 1+drawByWeight(upstreams[1:]), 1)
+	if lessBusy(upstreams[1].load(), upstreams[1].weight, upstreams[0].load(), upstreams[0].weight) {
+		upstreams[0], upstreams[1] = upstreams[1], upstreams[0]
 	}
-	sortByLoad(rest)
-	upstreams[0], upstreams[1] = first, second
-	copy(upstreams[2:], rest)
+	sortByLoad(upstreams[2:])
+}
+
+// moveTo moves upstreams[from] to index to (to <= from), shifting the ones in between up
+func moveTo(upstreams []*Upstream, from, to int) {
+	u := upstreams[from]
+	copy(upstreams[to+1:from+1], upstreams[to:from])
+	upstreams[to] = u
 }
 
 // drawByWeight returns the index of a random upstream, each drawn with its weight's share
@@ -99,21 +92,30 @@ func drawByWeight(upstreams []*Upstream) int {
 	return len(upstreams) - 1 // Not reached
 }
 
-// sortByLoad orders upstreams by their open requests per weight, keeping the order of equals
+// sortByLoad orders upstreams by their open requests per weight, keeping the order of equals.
+// Each load is read once; without allocating for up to scratchSize upstreams.
 func sortByLoad(upstreams []*Upstream) {
-	loads := make(map[*Upstream]int, len(upstreams))
-	for _, u := range upstreams {
-		loads[u] = u.load()
+	type loaded struct {
+		u    *Upstream
+		load int
 	}
-	slices.SortStableFunc(upstreams, func(a, b *Upstream) int {
+	var scratch [scratchSize]loaded
+	loads := scratch[:0]
+	for _, u := range upstreams {
+		loads = append(loads, loaded{u: u, load: u.load()})
+	}
+	slices.SortStableFunc(loads, func(a, b loaded) int {
 		switch {
-		case lessBusy(loads[a], a.weight, loads[b], b.weight):
+		case lessBusy(a.load, a.u.weight, b.load, b.u.weight):
 			return -1
-		case lessBusy(loads[b], b.weight, loads[a], a.weight):
+		case lessBusy(b.load, b.u.weight, a.load, a.u.weight):
 			return 1
 		}
 		return 0
 	})
+	for i, l := range loads {
+		upstreams[i] = l.u
+	}
 }
 
 // lessBusy reports whether load a per weight a is below load b per weight b, like nginx's

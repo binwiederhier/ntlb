@@ -17,7 +17,7 @@ import (
 )
 
 // readLine reads one line from a stream, failing after 3s
-func readLine(t *testing.T, r *bufio.Reader) string {
+func readLine(t testing.TB, r *bufio.Reader) string {
 	t.Helper()
 	result := make(chan string, 1)
 	go func() {
@@ -37,7 +37,7 @@ func readLine(t *testing.T, r *bufio.Reader) string {
 	}
 }
 
-func openSubscription(t *testing.T, client *http.Client, url string) (*http.Response, *bufio.Reader) {
+func openSubscription(t testing.TB, client *http.Client, url string) (*http.Response, *bufio.Reader) {
 	resp, err := client.Get(url)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -502,7 +502,7 @@ func goroutineCounts() (copying, serving, transport int) {
 }
 
 // newTLSTestServer is newTestServer with an HTTPS listener too
-func newTLSTestServer(t *testing.T, extra string, upstreams ...*testUpstream) *Server {
+func newTLSTestServer(t testing.TB, extra string, upstreams ...*testUpstream) *Server {
 	dir := t.TempDir()
 	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 	writeTestCert(t, certFile, keyFile, "test")
@@ -759,4 +759,24 @@ func TestStream_HTTP2DrainInterruptsBlockedWrite(t *testing.T) {
 	waitFor(t, func() bool {
 		return s.balancer.Status().Streams == 0
 	})
+}
+
+func BenchmarkStream_Subscribe(b *testing.B) {
+	// Opening and closing a subscription on the stream path: picking, the raw upstream
+	// connection, the hijack and the copy goroutine
+	app1 := newTestUpstream(b, "app1")
+	s, _ := newTestServer(b, "", app1)
+	url := "http://" + s.HTTPAddr() + "/mytopic/json"
+	b.ReportAllocs()
+	for b.Loop() {
+		resp, err := http.Get(url)
+		if err != nil {
+			b.Fatal(err)
+		}
+		line, err := bufio.NewReader(resp.Body).ReadString('\n')
+		if err != nil || line != "start\n" {
+			b.Fatal(line, err)
+		}
+		resp.Body.Close()
+	}
 }

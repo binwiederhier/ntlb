@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/textproto"
 	"net/url"
 	"reflect"
 	"strings"
@@ -64,8 +65,7 @@ type Env struct {
 	Site   string `expr:"site"`   // The site serving the host, "" if none does
 
 	// header(name) is the first value of a header, "" if missing; flag(name...) see flag
-	req   *http.Request
-	query url.Values // The parsed query, once a flag needed it (an env serves one request at a time)
+	req *http.Request
 }
 
 // ResponseEnv is what a response expression sees when a request ended: the request without its
@@ -189,7 +189,9 @@ func (p *Program) run(env any) any {
 }
 
 // requestCalls rewrites header(...) and flag(...) to their functions, with the env as the first
-// argument (see headerFunc)
+// argument (see headerFunc). Header names that are literals are canonicalized here, once, so that
+// a header lookup does not canonicalize (and allocate) on every request; flag gets each name
+// twice, as a header name and as the query parameter's.
 type requestCalls struct{}
 
 func (requestCalls) Visit(node *ast.Node) {
@@ -201,15 +203,31 @@ func (requestCalls) Visit(node *ast.Node) {
 	if !ok {
 		return
 	}
+	args := []ast.Node{&ast.IdentifierNode{Value: envName}}
 	switch callee.Value {
 	case headerName:
 		callee.Value = headerFunc
+		for _, arg := range call.Arguments {
+			args = append(args, canonicalHeader(arg))
+		}
 	case flagName:
 		callee.Value = flagFunc
+		for _, arg := range call.Arguments {
+			args = append(args, canonicalHeader(arg), arg)
+		}
 	default:
 		return
 	}
-	call.Arguments = append([]ast.Node{&ast.IdentifierNode{Value: envName}}, call.Arguments...)
+	call.Arguments = args
+}
+
+// canonicalHeader returns a string literal as a canonical header name, any other node as it is
+// (Header.Get canonicalizes that at runtime)
+func canonicalHeader(arg ast.Node) ast.Node {
+	if s, ok := arg.(*ast.StringNode); ok {
+		return &ast.StringNode{Value: textproto.CanonicalMIMEHeaderKey(s.Value)}
+	}
+	return arg
 }
 
 // headerOf is header(name) at runtime: the env and the name, as the type checker guarantees
@@ -217,13 +235,10 @@ func headerOf(params ...any) (any, error) {
 	return params[0].(*Env).req.Header.Get(params[1].(string)), nil
 }
 
-// flagOf is flag(name...) at runtime
+// flagOf is flag(name...) at runtime: the env, and each name as a header name and as a query
+// parameter name (see requestCalls), as the type checker guarantees
 func flagOf(params ...any) (any, error) {
-	names := make([]string, len(params)-1)
-	for i, p := range params[1:] {
-		names[i] = p.(string)
-	}
-	return params[0].(*Env).flag(names), nil
+	return params[0].(*Env).flag(params[1:]), nil
 }
 
 // Visit checks and parses the networks of every ipIn call; the first error fails the compile
@@ -297,22 +312,51 @@ func parsePrefix(s string) (netip.Prefix, error) {
 }
 
 // flag is flag(name...), like ntfy's readParam for a boolean: the first of the names that is set
-// as a header, else the first set as a query parameter, decides; it is true if 1, yes or true
-func (e *Env) flag(names []string) bool {
-	for _, name := range names {
-		if v := strings.TrimSpace(e.req.Header.Get(name)); v != "" {
+// as a header, else the first set as a query parameter, decides; it is true if 1, yes or true.
+// names are pairs of strings: the header name, canonical if it was a literal, and the query
+// parameter's.
+func (e *Env) flag(names []any) bool {
+	for i := 0; i+1 < len(names); i += 2 {
+		if v := strings.TrimSpace(e.req.Header.Get(names[i].(string))); v != "" {
 			return isTrue(v)
 		}
 	}
-	if e.query == nil {
-		e.query = e.req.URL.Query()
-	}
-	for _, name := range names {
-		if v := strings.TrimSpace(e.query.Get(name)); v != "" {
+	for i := 0; i+1 < len(names); i += 2 {
+		if v := strings.TrimSpace(queryParam(e.req.URL.RawQuery, names[i+1].(string))); v != "" {
 			return isTrue(v)
 		}
 	}
 	return false
+}
+
+// queryParam returns the first value of a query parameter, like url.Values.Get on the parsed
+// query, without parsing (and allocating for) the rest: pairs that do not parse are skipped,
+// names and values are unescaped
+func queryParam(rawQuery, name string) string {
+	for rawQuery != "" {
+		var pair string
+		pair, rawQuery, _ = strings.Cut(rawQuery, "&")
+		if pair == "" || strings.Contains(pair, ";") {
+			continue // Like url.ParseQuery
+		}
+		key, value, _ := strings.Cut(pair, "=")
+		if strings.ContainsAny(key, "%+") {
+			if k, err := url.QueryUnescape(key); err != nil || k != name {
+				continue
+			}
+		} else if key != name {
+			continue
+		}
+		if strings.ContainsAny(value, "%+") {
+			v, err := url.QueryUnescape(value)
+			if err != nil {
+				continue
+			}
+			return v
+		}
+		return value
+	}
+	return ""
 }
 
 func isTrue(s string) bool {

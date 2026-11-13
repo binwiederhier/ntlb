@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,7 +109,7 @@ const (
 	testStreamEnd = "!end"
 )
 
-func newTestUpstream(t *testing.T, name string) *testUpstream {
+func newTestUpstream(t testing.TB, name string) *testUpstream {
 	u := &testUpstream{
 		name:   name,
 		bodyCh: make(chan string, 10),
@@ -294,7 +295,7 @@ func siteYAML(settings []string, upstreams ...*testUpstream) string {
 
 // writeConfig writes a config with the global settings in extra and one site "s" with the
 // upstreams; the siteKeys lines of extra go into the site
-func writeConfig(t *testing.T, filename, extra string, upstreams ...*testUpstream) {
+func writeConfig(t testing.TB, filename, extra string, upstreams ...*testUpstream) {
 	var global, site []string
 	for _, line := range strings.Split(extra, "\n") {
 		if isSiteSetting(line) {
@@ -307,14 +308,14 @@ func writeConfig(t *testing.T, filename, extra string, upstreams ...*testUpstrea
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 }
 
-func newTestServer(t *testing.T, extra string, upstreams ...*testUpstream) (*Server, string) {
+func newTestServer(t testing.TB, extra string, upstreams ...*testUpstream) (*Server, string) {
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	writeConfig(t, filename, extra, upstreams...)
 	return startTestServer(t, filename), filename
 }
 
 // startTestServer runs a server from a config file until the test ends
-func startTestServer(t *testing.T, filename string) *Server {
+func startTestServer(t testing.TB, filename string) *Server {
 	s, err := New(filename)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -351,7 +352,7 @@ func clientFrom(ip string) *http.Client {
 	}
 }
 
-func get(t *testing.T, client *http.Client, url string) (int, string) {
+func get(t testing.TB, client *http.Client, url string) (int, string) {
 	resp, err := client.Get(url)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -360,7 +361,7 @@ func get(t *testing.T, client *http.Client, url string) (int, string) {
 	return resp.StatusCode, string(body)
 }
 
-func waitFor(t *testing.T, f func() bool) {
+func waitFor(t testing.TB, f func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -379,7 +380,7 @@ type testStream struct {
 
 // openStream starts a stream request and returns once its first line arrived, plus a func to
 // close it from the client side
-func openStream(t *testing.T, client *http.Client, url string) (*testStream, func()) {
+func openStream(t testing.TB, client *http.Client, url string) (*testStream, func()) {
 	resp, err := client.Get(url)
 	require.NoError(t, err)
 	r := bufio.NewReader(resp.Body)
@@ -521,7 +522,7 @@ func TestServer_HTTPSAndCertReload(t *testing.T) {
 }
 
 // clientForUpstream returns a client whose IP the server routes to the given upstream first
-func clientForUpstream(t *testing.T, s *Server, name string) *http.Client {
+func clientForUpstream(t testing.TB, s *Server, name string) *http.Client {
 	for i := 1; i < 255; i++ {
 		client := clientFrom(fmt.Sprintf("127.0.1.%d", i))
 		if _, body := get(t, client, "http://"+s.HTTPAddr()+"/name"); body == name {
@@ -532,7 +533,7 @@ func clientForUpstream(t *testing.T, s *Server, name string) *http.Client {
 	return nil
 }
 
-func writeTestCert(t *testing.T, certFile, keyFile, commonName string) {
+func writeTestCert(t testing.TB, certFile, keyFile, commonName string) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	template := &x509.Certificate{
@@ -557,7 +558,7 @@ func readFileString(filename string) (string, error) {
 	return string(b), err
 }
 
-func requireReload(t *testing.T, s *Server) {
+func requireReload(t testing.TB, s *Server) {
 	t.Helper()
 	restart, err := s.Reload()
 	require.NoError(t, err)
@@ -672,7 +673,7 @@ func TestServer_ReloadAppliesStreamsAndHash(t *testing.T) {
 
 // newRawUpstream is an upstream that hands every connection to handle, for malformed or
 // misbehaving responses. Health checks get garbage too, so it is used fail-open.
-func newRawUpstream(t *testing.T, name string, handle func(conn net.Conn)) *testUpstream {
+func newRawUpstream(t testing.TB, name string, handle func(conn net.Conn)) *testUpstream {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	go func() {
@@ -857,12 +858,12 @@ func TestServer_InvalidHostOrTargetRejected(t *testing.T) {
 // ntfyClient sends requests for ntfy.sh to a server from one loopback IP, over HTTP or HTTPS,
 // without following redirects
 type ntfyClient struct {
-	t      *testing.T
+	t      testing.TB
 	s      *Server
 	client *http.Client
 }
 
-func newNtfyClient(t *testing.T, s *Server, ip string) *ntfyClient {
+func newNtfyClient(t testing.TB, s *Server, ip string) *ntfyClient {
 	dialer := &net.Dialer{
 		LocalAddr: &net.TCPAddr{IP: net.ParseIP(ip)},
 	}
@@ -909,7 +910,7 @@ func (c *ntfyClient) do(method, scheme, target, body string, header ...string) (
 // newNtfyPackagedServer runs the shipped config (packaging/config.yml and sites.d/ntfy.yml) as is,
 // but for what a test cannot have: addresses, files and certificates in a temporary directory,
 // the test upstreams, loopback IPs in the limit exemptions, and a small limit burst
-func newNtfyPackagedServer(t *testing.T, upstreams ...*testUpstream) (*Server, string) {
+func newNtfyPackagedServer(t testing.TB, upstreams ...*testUpstream) (*Server, string) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "sites.d"), 0755))
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "html", "_next"), 0755))
@@ -1267,13 +1268,13 @@ func reloadSite(name, hosts string, upstream *testUpstream, more ...string) stri
 }
 
 // reloadConfig writes a config with global settings (YAML lines) and sites (see reloadSite)
-func reloadConfig(t *testing.T, filename, global string, sites ...string) {
+func reloadConfig(t testing.TB, filename, global string, sites ...string) {
 	conf := "listen-admin: '127.0.0.1:0'\ndrain-duration: 1s\n" + global + "\nsites:\n" + strings.Join(sites, "")
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 }
 
 // startReloadServer writes the first config and starts a server on it
-func startReloadServer(t *testing.T, global string, sites ...string) (*Server, string) {
+func startReloadServer(t testing.TB, global string, sites ...string) (*Server, string) {
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	reloadConfig(t, filename, global, sites...)
 	return startTestServer(t, filename), filename
@@ -1281,7 +1282,7 @@ func startReloadServer(t *testing.T, global string, sites ...string) (*Server, s
 
 // hostGet sends a GET for path with a Host header from a client IP (one connection per request,
 // so every request sees the current config), without following redirects
-func hostGet(t *testing.T, s *Server, ip, host, path string) (int, string, http.Header) {
+func hostGet(t testing.TB, s *Server, ip, host, path string) (int, string, http.Header) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+path, nil)
 	require.NoError(t, err)
@@ -1299,7 +1300,7 @@ func hostGet(t *testing.T, s *Server, ip, host, path string) (int, string, http.
 }
 
 // openHostStream opens a subscription with a Host header, see openStream
-func openHostStream(t *testing.T, s *Server, host, path string) (*testStream, func()) {
+func openHostStream(t testing.TB, s *Server, host, path string) (*testStream, func()) {
 	req, err := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+path, nil)
 	require.NoError(t, err)
 	req.Host = host
@@ -1320,7 +1321,7 @@ func openHostStream(t *testing.T, s *Server, host, path string) (*testStream, fu
 }
 
 // statusOf is a request's status, see hostGet
-func statusOf(t *testing.T, s *Server, ip, host, path string) int {
+func statusOf(t testing.TB, s *Server, ip, host, path string) int {
 	t.Helper()
 	status, _, _ := hostGet(t, s, ip, host, path)
 	return status
@@ -1959,4 +1960,37 @@ func TestServer_ReloadAddsServerThatIsDown(t *testing.T) {
 		statusOf(t, s, fmt.Sprintf("127.0.2.%d", i+1), "x", "/name")
 	}
 	require.NotZero(t, app2.hits.Load())
+}
+
+func BenchmarkValidRequest(b *testing.B) {
+	r := httptest.NewRequest(http.MethodGet, "/mytopic/json?poll=1", nil)
+	r.Host = "ntfy.sh:443"
+	b.ReportAllocs()
+	for b.Loop() {
+		if !validRequest(r) {
+			b.Fatal("invalid")
+		}
+	}
+}
+
+func TestValidRequestAllocations(t *testing.T) {
+	skipUnderRace(t)
+	r := httptest.NewRequest(http.MethodGet, "/mytopic/json?poll=1", nil)
+	for _, host := range []string{"ntfy.sh", "ntfy.sh:443", "[::1]:80", "203.0.113.7"} {
+		r.Host = host
+		require.Zero(t, testing.AllocsPerRun(100, func() {
+			validRequest(r)
+		}), host)
+	}
+}
+
+// skipUnderRace skips an allocation budget under the race detector, which allocates on its own
+func skipUnderRace(t *testing.T) {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "-race" && s.Value == "true" {
+				t.Skip("allocation counts differ under -race")
+			}
+		}
+	}
 }

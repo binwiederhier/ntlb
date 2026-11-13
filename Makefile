@@ -2,7 +2,7 @@
 
 BINARY  := ntlb
 
-.PHONY: all build test race vet fmt fmt-check lint clean
+.PHONY: all build test race vet fmt fmt-check lint bench clean
 
 all: fmt-check vet test build
 
@@ -26,6 +26,11 @@ fmt-check:
 
 lint:
 	golangci-lint run ./...
+
+# Benchmarks of the request path, 6 runs each, for benchstat: save one run before a change
+# (make bench > old.txt) and one after, then compare: benchstat old.txt new.txt
+bench:
+	go test -run '^$$' -bench . -benchmem -count 6 ./...
 
 clean:
 	rm -rf build

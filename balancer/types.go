@@ -72,6 +72,21 @@ type Session struct {
 	canceled     bool      // Protected by Balancer.mu
 }
 
+// pickKind is how Pick sees an upstream of the pool
+type pickKind int
+
+// Pick kinds, see Balancer.Pick
+const (
+	pickNone            pickKind = iota // No second kind to return
+	pickHealthy                         // In rotation
+	pickHealthyBackup                   // In rotation as a backup
+	pickUnhealthy                       // Only if nothing is healthy (fail open)
+	pickUnhealthyBackup                 // The same, as a backup
+	pickDraining                        // Never
+	pickRemoved                         // Only for requests routed before a reload removed its pool
+	pickKinds                           // The number of kinds
+)
+
 // poolServer is a server of the config, with its site and the upstream block (pool) it is in
 type poolServer struct {
 	site   string

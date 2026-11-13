@@ -3,6 +3,7 @@ package balancer
 import (
 	"cmp"
 	"context"
+	"iter"
 	"log/slog"
 	"math"
 	"slices"
@@ -97,33 +98,31 @@ func (d *drainState) done(now time.Time) bool {
 	return !now.Before(d.deadline)
 }
 
-// pick returns the sessions to close at this tick, oldest first (see drainState)
-func (d *drainState) pick(now time.Time, sessions []*Session) []*Session {
+// quota returns how many of count open sessions to close at this tick: every one once the
+// deadline passed, else the share that spreads them evenly over the time left (see drainState)
+func (d *drainState) quota(now time.Time, count int) int {
 	defer func() {
 		d.last = now
 	}()
 	if d.done(now) {
 		d.finished = true
 	}
-	if len(sessions) == 0 {
-		return nil
+	if count == 0 {
+		return 0
 	} else if d.finished {
-		return sessions
+		return count
 	}
 	elapsed, remaining := now.Sub(d.last), d.deadline.Sub(d.last)
 	if elapsed <= 0 {
-		return nil
+		return 0
 	}
-	d.credit += (float64(len(sessions)) - d.credit) * float64(elapsed) / float64(remaining) // Of what is not earned yet, so the credit grows linearly
-	n := min(int(math.Floor(d.credit+0.5)), len(sessions))                                  // Rounded: evenly spaced, centered in their slots
+	d.credit += (float64(count) - d.credit) * float64(elapsed) / float64(remaining) // Of what is not earned yet, so the credit grows linearly
+	n := min(int(math.Floor(d.credit+0.5)), count)                                  // Rounded: evenly spaced, centered in their slots
 	if n <= 0 {
-		return nil
+		return 0
 	}
 	d.credit -= float64(n)
-	slices.SortFunc(sessions, func(a, b *Session) int {
-		return cmp.Compare(a.id, b.id)
-	})
-	return sessions[:n]
+	return n
 }
 
 // drainLoop closes the streams of draining upstreams and of a draining load balancer
@@ -152,40 +151,37 @@ func (b *Balancer) drainTick(now time.Time) {
 	}
 }
 
-// drainTickVictims picks this tick's streams to close. It scans the sessions only while a drain
-// runs: at ~100k streams the scan holds the lock for milliseconds, every tick. A drained upstream
-// (finished, with no stream left) does not count: it may stay drained for days. (A session that
-// attaches to a forgotten or drained upstream is closed by Attach.)
+// drainTickVictims picks this tick's streams to close, oldest first. It scans the sessions only
+// while a drain runs, and keeps only this tick's few of them: at ~100k streams the scan still
+// holds the lock for about a millisecond, every tick. A drained upstream (finished, with no
+// stream left) does not count: it may stay drained for days. (A session that attaches to a
+// forgotten or drained upstream is closed by Attach.)
 func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var victims []*Session
-	if b.drain != nil || b.upstreamDrainingNoLock() {
-		var all []*Session // Only for the load balancer's drain
-		byUpstream := make(map[*Upstream][]*Session)
+	switch {
+	case b.drain != nil:
+		live := b.liveSessionsNoLock(nil)
+		victims = oldestSessions(live, b.drain.quota(now, countSessions(live)))
+	case b.upstreamDrainingNoLock():
+		counts := make(map[*Upstream]int)
 		for _, s := range b.sessions {
-			if s.canceled {
+			if !s.canceled && s.upstream != nil && s.upstream.drain != nil {
+				counts[s.upstream]++
+			}
+		}
+		for _, u := range b.upstreams {
+			if u.drain == nil {
 				continue
 			}
-			if b.drain != nil {
-				all = append(all, s)
-			}
-			if s.upstream != nil && s.upstream.drain != nil {
-				byUpstream[s.upstream] = append(byUpstream[s.upstream], s)
+			if n := u.drain.quota(now, counts[u]); n > 0 {
+				victims = append(victims, oldestSessions(b.liveSessionsNoLock(u), n)...)
 			}
 		}
-		if b.drain != nil {
-			victims = b.drain.pick(now, all)
-		} else {
-			for _, u := range b.upstreams {
-				if u.drain != nil {
-					victims = append(victims, u.drain.pick(now, byUpstream[u])...)
-				}
-			}
-		}
-		for _, s := range victims {
-			s.canceled = true
-		}
+	}
+	for _, s := range victims {
+		s.canceled = true
 	}
 	for id, u := range b.upstreams {
 		if u.removed && u.drain != nil && u.drain.done(now) && u.streamCount() == 0 {
@@ -197,6 +193,64 @@ func (b *Balancer) drainTickVictims(now time.Time) []*Session {
 		}
 	}
 	return victims
+}
+
+// liveSessionsNoLock yields the sessions not canceled yet, of an upstream (nil: all of them).
+// The caller must hold Balancer.mu.
+func (b *Balancer) liveSessionsNoLock(u *Upstream) iter.Seq[*Session] {
+	return func(yield func(*Session) bool) {
+		for _, s := range b.sessions {
+			if !s.canceled && (u == nil || s.upstream == u) && !yield(s) {
+				return
+			}
+		}
+	}
+}
+
+// countSessions returns the number of sessions
+func countSessions(sessions iter.Seq[*Session]) int {
+	n := 0
+	for range sessions {
+		n++
+	}
+	return n
+}
+
+// oldestSessions returns the n oldest (lowest ID) of the sessions, oldest first. It keeps no more
+// than n at a time, in a heap with the newest of them on top: a tick closes few of many.
+func oldestSessions(sessions iter.Seq[*Session], n int) []*Session {
+	if n <= 0 {
+		return nil
+	}
+	heap := make([]*Session, 0, n)
+	for s := range sessions {
+		if len(heap) < n {
+			heap = append(heap, s)
+			for i := len(heap) - 1; i > 0 && heap[(i-1)/2].id < heap[i].id; i = (i - 1) / 2 {
+				heap[i], heap[(i-1)/2] = heap[(i-1)/2], heap[i]
+			}
+		} else if s.id < heap[0].id {
+			heap[0] = s
+			for i := 0; ; {
+				left, right, newest := 2*i+1, 2*i+2, i
+				if left < len(heap) && heap[left].id > heap[newest].id {
+					newest = left
+				}
+				if right < len(heap) && heap[right].id > heap[newest].id {
+					newest = right
+				}
+				if newest == i {
+					break
+				}
+				heap[i], heap[newest] = heap[newest], heap[i]
+				i = newest
+			}
+		}
+	}
+	slices.SortFunc(heap, func(a, b *Session) int {
+		return cmp.Compare(a.id, b.id)
+	})
+	return heap
 }
 
 // upstreamDrainingNoLock reports whether any upstream is draining (removed, or by command) and

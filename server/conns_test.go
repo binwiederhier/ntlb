@@ -16,7 +16,7 @@ import (
 )
 
 // sendRaw writes raw bytes to a listener and returns the first line of the answer, "" if none
-func sendRaw(t *testing.T, addr, data string) string {
+func sendRaw(t testing.TB, addr, data string) string {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)

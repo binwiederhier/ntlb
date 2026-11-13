@@ -154,3 +154,20 @@ func FuzzRankWeighted(f *testing.F) {
 func rank(key []byte, names []string) []string {
 	return rankWeighted(key, names, nil)
 }
+
+// rankWeighted is sortByHash on upstreams with the names and weights (nil: all 1)
+func rankWeighted(key []byte, names []string, weights []int) []string {
+	upstreams := make([]*Upstream, len(names))
+	for i, name := range names {
+		upstreams[i] = &Upstream{name: name, weight: 1}
+		if weights != nil {
+			upstreams[i].weight = weights[i]
+		}
+	}
+	sortByHash(key, upstreams)
+	ranked := make([]string, len(upstreams))
+	for i, u := range upstreams {
+		ranked[i] = u.name
+	}
+	return ranked
+}

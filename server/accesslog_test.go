@@ -232,3 +232,118 @@ func FuzzAccessLog_RedactAuth(f *testing.F) {
 		}
 	})
 }
+
+// An access log line is written for every request
+
+func benchAccessLog(tb testing.TB) (*accessLog, *http.Request, *proxyRequest) {
+	f, err := os.Create(filepath.Join(tb.TempDir(), "access.log"))
+	require.NoError(tb, err)
+	l := newAccessLogFile(f)
+	tb.Cleanup(l.close)
+	r := httptest.NewRequest(http.MethodGet, "/mytopic/json?poll=1&since=1730000000", nil)
+	r.RemoteAddr = "203.0.113.7:4321"
+	r.Header.Set("User-Agent", "ntfy/1.27.0 (Android; 14)")
+	pr := &proxyRequest{
+		site:           "ntfy",
+		upstream:       "app3",
+		upstreamStatus: http.StatusOK,
+		bytes:          120,
+	}
+	return l, r, pr
+}
+
+func BenchmarkAccessLog_Write(b *testing.B) {
+	l, r, pr := benchAccessLog(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		l.write(newAccessLogEntry(r, time.Now()), pr, http.StatusOK)
+	}
+}
+
+func TestAccessLog_WriteAllocations(t *testing.T) {
+	skipUnderRace(t)
+	// The entry and its request line when the request starts, the line when it ends
+	l, r, pr := benchAccessLog(t)
+	allocs := testing.AllocsPerRun(100, func() {
+		l.write(newAccessLogEntry(r, time.Now()), pr, http.StatusOK)
+	})
+	require.LessOrEqual(t, allocs, 4.0)
+}
+
+func TestAccessLog_LineFormat(t *testing.T) {
+	// The line, byte for byte, as nginx's combined_ssl plus the key=value fields: the formula
+	// here is the reference the writer must match, whatever it does to be cheap
+	dir := t.TempDir()
+	start := time.Now().Add(-1500 * time.Millisecond)
+	for name, tc := range map[string]struct {
+		target, ua, referer, host string
+		pr                        *proxyRequest
+		status                    int
+	}{
+		"proxied":       {target: "/mytopic/json?poll=1", ua: "ntfy/1.27.0 (Android; 14)", host: "ntfy.sh", pr: &proxyRequest{site: "ntfy", upstream: "app3", upstreamStatus: 200, bytes: 120}, status: 200},
+		"rule":          {target: "/sp_x/json", ua: "curl/8", host: "ntfy.sh", pr: &proxyRequest{site: "ntfy", rule: "ntfy/abuse"}, status: 403},
+		"no site":       {target: "/", host: "other", pr: &proxyRequest{}, status: 404},
+		"escaped":       {target: "/a?auth=secret&x=\"1\"", ua: "bad\"agent\\x", referer: "https://x/?a b", host: "ntfy.sh", pr: &proxyRequest{site: "ntfy", upstream: "app5", upstreamStatus: 502, bytes: 0}, status: 502},
+		"long":          {target: "/" + strings.Repeat("a", 5000), ua: strings.Repeat("u", 4096), host: "ntfy.sh", pr: &proxyRequest{site: "ntfy"}, status: 200},
+		"exactly max":   {target: "/", ua: strings.Repeat("u", maxLogField), host: "ntfy.sh", pr: &proxyRequest{site: "ntfy"}, status: 200},
+		"upstream 101":  {target: "/mytopic/ws", ua: "ntfy", host: "ntfy.sh", pr: &proxyRequest{site: "ntfy", upstream: "app3", upstreamStatus: 101, bytes: 4096}, status: 101},
+		"auth in path?": {target: "/auth?Auth=x&AUTH=y&auth", host: "ntfy.sh", pr: &proxyRequest{site: "ntfy"}, status: 200},
+	} {
+		f, err := os.Create(filepath.Join(dir, strings.ReplaceAll(name, " ", "-")+".log"))
+		require.NoError(t, err)
+		l := newAccessLogFile(f)
+		r := httptest.NewRequest(http.MethodGet, "http://x"+tc.target, nil)
+		r.RequestURI = tc.target
+		r.RemoteAddr = "203.0.113.7:4321"
+		r.Host = tc.host
+		if tc.ua != "" {
+			r.Header.Set("User-Agent", tc.ua)
+		}
+		if tc.referer != "" {
+			r.Header.Set("Referer", tc.referer)
+		}
+		e := newAccessLogEntry(r, start)
+		l.write(e, tc.pr, tc.status)
+		l.close()
+		b, err := os.ReadFile(f.Name())
+		require.NoError(t, err)
+
+		upstream, upstreamStatus := "-", "-"
+		if tc.pr.upstream != "" {
+			upstream, upstreamStatus = tc.pr.upstream, fmt.Sprint(tc.pr.upstreamStatus)
+		}
+		site := "-"
+		if tc.pr.site != "" {
+			site = tc.pr.site
+		}
+		want := fmt.Sprintf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s site=%s request_time=",
+			"203.0.113.7", start.Format(accessLogTimeFormat),
+			escapeUnquoted("GET")+" "+escapeUnquoted(redactAuth(tc.target))+" "+escapeUnquoted("HTTP/1.1"),
+			tc.status, tc.pr.bytes, orDash(escape(tc.referer)), orDash(escape(tc.ua)), orDash(escapeUnquoted(tc.host)), site)
+		line := string(b)
+		require.True(t, strings.HasPrefix(line, want), "%s:\n%s\n%s", name, line, want)
+		rest := strings.TrimPrefix(line, want) // The request time varies: "N.NNN upstream=..."
+		seconds, rest, _ := strings.Cut(rest, " ")
+		require.Regexp(t, `^\d+\.\d{3}$`, seconds, name)
+		tail := fmt.Sprintf("upstream=%s upstream_status=%s", upstream, upstreamStatus)
+		if tc.pr.rule != "" {
+			tail += " rule=" + tc.pr.rule
+		}
+		require.Equal(t, tail+"\n", rest, name)
+	}
+}
+
+func TestAccessLog_EscapeAndRedact(t *testing.T) {
+	// The values the writer relies on, pinned
+	require.Equal(t, `bad\x22agent\x5Cx`, escape(`bad"agent\x`))
+	require.Equal(t, `a\x20b`, escapeUnquoted("a b"))
+	require.Equal(t, "a b", escape("a b"))
+	require.Equal(t, "plain", escape("plain"))
+	require.Equal(t, strings.Repeat("u", maxLogField)+"...", escape(strings.Repeat("u", maxLogField)))
+	require.Equal(t, strings.Repeat("u", maxLogField-1), escape(strings.Repeat("u", maxLogField-1)))
+	require.Equal(t, strings.Repeat("u", maxLogField)+"...", escape(strings.Repeat("u", maxLogField+10)))
+	require.Equal(t, "/a?auth=REDACTED&x=1", redactAuth("/a?auth=secret&x=1"))
+	require.Equal(t, "/a?Auth=REDACTED&AUTH=REDACTED&auth", redactAuth("/a?Auth=x&AUTH=y&auth"))
+	require.Equal(t, "/a?x=1&y=2", redactAuth("/a?x=1&y=2"))
+	require.Equal(t, "/auth", redactAuth("/auth"))
+}

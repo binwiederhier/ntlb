@@ -24,6 +24,7 @@ type HealthCheck struct {
 // and its proxy_*_timeout settings
 type Upstream struct {
 	Name        string       `yaml:"-"`           // Its key in the site's upstreams
+	ID          string       `yaml:"-"`           // "<site>/<name>", which identifies it among all sites' upstreams
 	Balance     string       `yaml:"balance"`     // round-robin (default), least-conn, random-two or hash
 	Timeouts    *Timeouts    `yaml:"timeouts"`    //
 	Keepalive   *Keepalive   `yaml:"keepalive"`   // TCP keepalive towards the servers
@@ -93,7 +94,7 @@ func (s *Site) validateUpstreams() error {
 		} else if u == nil {
 			return fmt.Errorf("upstreams.%s is empty", name)
 		}
-		u.Name = name
+		u.Name, u.ID = name, s.Name+"/"+name
 		if err := u.validate("upstreams." + name); err != nil {
 			return err
 		}

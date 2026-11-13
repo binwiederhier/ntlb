@@ -22,6 +22,7 @@ const (
 	waitIdleInterval  = 50 * time.Millisecond
 	addressBackoffMin = time.Second
 	addressBackoffMax = 30 * time.Second
+	scratchSize       = 16 // Upstreams per pool that the sorts handle on the stack
 )
 
 // Balancer routes requests to the healthy upstreams of one of their site's upstream blocks (a
@@ -35,7 +36,7 @@ type Balancer struct {
 	sessions  map[uint64]*Session
 	nextID    uint64
 	drain     *drainState // Draining the load balancer itself
-	turns     sync.Map    // Pool key (see PoolKey) -> *atomic.Uint64, the next turn of round-robin and least-conn
+	turns     sync.Map    // Pool ID (config.Upstream.ID) -> *atomic.Uint64, the next turn of round-robin and least-conn
 	client    *http.Client
 	mu        sync.RWMutex // Protects config, upstreams, order, sessions, nextID, drain, and each Upstream's removed and drain
 }
@@ -121,52 +122,68 @@ func (b *Balancer) Pick(site, pool string, key []byte) []*Upstream {
 		poolConf = siteConf.UpstreamNamed(pool)
 	}
 	poolName := cmp.Or(pool, config.UpstreamDefault)
-	var healthy, healthyBackups, unhealthy, unhealthyBackups, removed []*Upstream
+
+	// Count the pool's servers by kind, then take the best kind that has any: one allocation
+	var counts [pickKinds]int
+	kinds := make([]pickKind, 0, scratchSize)
 	live := false
 	for _, id := range b.order {
 		u := b.upstreams[id]
 		if u.site != site || u.pool != poolName {
 			continue
-		} else if u.removed {
-			removed = append(removed, u)
+		}
+		kind := u.pickKindNoLock()
+		live = live || kind != pickRemoved
+		counts[kind]++
+		kinds = append(kinds, kind)
+	}
+	var first, second pickKind // The kinds to return, second after first (the backups)
+	switch {
+	case poolConf == nil || !live:
+		first, second = pickRemoved, pickNone // Removed by a reload after the request was routed
+	case counts[pickHealthy] > 0:
+		first, second = pickHealthy, pickHealthyBackup
+	case counts[pickHealthyBackup] > 0:
+		first, second = pickHealthyBackup, pickNone
+	default:
+		first, second = pickUnhealthy, pickUnhealthyBackup // Fail open
+	}
+	candidates := make([]*Upstream, 0, counts[first]+counts[second])
+	i := 0
+	for _, id := range b.order {
+		u := b.upstreams[id]
+		if u.site != site || u.pool != poolName {
 			continue
 		}
-		live = true
-		if u.drain != nil {
-			continue
+		if kinds[i] == first {
+			candidates = append(candidates, u)
 		}
-		switch ok := u.isHealthy(); {
-		case ok && !u.backup:
-			healthy = append(healthy, u)
-		case ok:
-			healthyBackups = append(healthyBackups, u)
-		case !u.backup:
-			unhealthy = append(unhealthy, u)
-		default:
-			unhealthyBackups = append(unhealthyBackups, u)
+		i++
+	}
+	n := len(candidates)
+	if second != pickNone {
+		i = 0
+		for _, id := range b.order {
+			u := b.upstreams[id]
+			if u.site != site || u.pool != poolName {
+				continue
+			}
+			if kinds[i] == second {
+				candidates = append(candidates, u)
+			}
+			i++
 		}
 	}
-	if poolConf == nil || !live {
-		return removed // Removed by a reload after the request was routed
+	if first == pickRemoved {
+		return candidates // In config order: their pool and its balance are gone
 	}
 	var turn uint64
 	if balance := poolConf.Balance; balance == config.BalanceRoundRobin || balance == config.BalanceLeastConn {
-		turn = b.nextTurn(PoolKey(site, poolConf.Name))
+		turn = b.nextTurn(poolConf.ID)
 	}
-	switch {
-	case len(healthy) > 0:
-		return sorted(poolConf, key, turn, healthy, healthyBackups)
-	case len(healthyBackups) > 0:
-		return sorted(poolConf, key, turn, healthyBackups, nil)
-	}
-	return sorted(poolConf, key, turn, unhealthy, unhealthyBackups) // Fail open
-}
-
-// sorted returns the upstreams sorted by the pool's balance, then the backups sorted the same way
-func sorted(pool *config.Upstream, key []byte, turn uint64, upstreams, backups []*Upstream) []*Upstream {
-	sortFor(pool, key, turn, upstreams)
-	sortFor(pool, key, turn, backups)
-	return append(upstreams, backups...)
+	sortFor(poolConf, key, turn, candidates[:n])
+	sortFor(poolConf, key, turn, candidates[n:])
+	return candidates
 }
 
 // RecordAddressFailure counts a request that an upstream failed on an address (connection error,
@@ -261,7 +278,7 @@ func (b *Balancer) tryUpdate(conf *config.Config) bool {
 	pools := make(map[string]bool)
 	for _, site := range conf.Sites {
 		for _, pool := range site.AllUpstreams() {
-			pools[PoolKey(site.Name, pool.Name)] = true
+			pools[pool.ID] = true
 		}
 	}
 	b.turns.Range(func(key, _ any) bool {
@@ -336,11 +353,6 @@ func (u *Upstream) AddressCount() int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return len(u.addresses)
-}
-
-// PoolKey identifies one of a site's upstream blocks (a pool), "<site>/<name>"
-func PoolKey(site, pool string) string {
-	return site + "/" + pool
 }
 
 func newUpstream(site string, pool *config.Upstream, uc *config.Server) *Upstream {
@@ -477,6 +489,24 @@ func (u *Upstream) recordAddressFailureNoLock(addr string, now time.Time) {
 		backoff = min(addressBackoffMin<<shift, addressBackoffMax)
 	}
 	u.addrRetry[addr] = now.Add(backoff)
+}
+
+// pickKindNoLock is what Pick makes of the upstream. The caller must hold Balancer.mu.
+func (u *Upstream) pickKindNoLock() pickKind {
+	switch healthy := u.isHealthy(); {
+	case u.removed:
+		return pickRemoved
+	case u.drain != nil:
+		return pickDraining
+	case healthy && !u.backup:
+		return pickHealthy
+	case healthy:
+		return pickHealthyBackup
+	case !u.backup:
+		return pickUnhealthy
+	default:
+		return pickUnhealthyBackup
+	}
 }
 
 func (u *Upstream) isHealthy() bool {

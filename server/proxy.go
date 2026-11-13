@@ -73,7 +73,7 @@ type proxy struct {
 	balancer *balancer.Balancer
 	metrics  *metrics
 	reverse  *httputil.ReverseProxy
-	conns    atomic.Pointer[map[string]*upstreamConns] // Per pool, by balancer.PoolKey
+	conns    atomic.Pointer[map[string]*upstreamConns] // Per pool, by config.Upstream.ID
 	config   atomic.Pointer[config.Config]
 	active   map[*proxyRequest]struct{}
 	mu       sync.Mutex // Protects active
@@ -182,7 +182,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	pr.pool = pool.Name
 	pr.readTimeout = pool.Timeouts.Read
-	pr.conns = (*p.conns.Load())[balancer.PoolKey(site.Name, pool.Name)]
+	pr.conns = (*p.conns.Load())[pool.ID]
 	if pr.conns == nil {
 		// A reload removed the pool after the request was routed: its servers still drain (see
 		// Balancer.Pick), through connections of the request's own
@@ -394,7 +394,7 @@ func (p *proxy) update(conf *config.Config) {
 	conns := make(map[string]*upstreamConns, len(conf.Sites))
 	for _, site := range conf.Sites {
 		for _, pool := range site.AllUpstreams() {
-			key := balancer.PoolKey(site.Name, pool.Name)
+			key := pool.ID
 			if c, ok := old[key]; ok && c.timeouts == *pool.Timeouts && c.keepalive == *pool.Keepalive {
 				conns[key] = c
 			} else {
