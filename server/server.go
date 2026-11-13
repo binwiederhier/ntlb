@@ -336,7 +336,7 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			// GOAWAY), which lands it on an address that is still there
 			s.metrics.refused.Inc()
 			w.Header().Set(headerConnection, connectionClose)
-			http.Error(w, "listener closed, reconnect", http.StatusServiceUnavailable)
+			writeError(w, conf.ErrorPagesFor(nil), httpErrListenerClosed)
 			return
 		}
 		env := match.NewEnv(r)
@@ -350,9 +350,10 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			entry = newAccessLogEntry(r, start)
 		}
 		pr := &proxyRequest{
-			env:      env,
-			site:     env.Site,
-			siteConf: site,
+			env:        env,
+			site:       env.Site,
+			siteConf:   site,
+			errorPages: conf.ErrorPagesFor(site),
 		}
 		sw := &statusWriter{ResponseWriter: w}
 		valid := validRequest(r)
@@ -386,7 +387,7 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			}
 		}()
 		if !valid {
-			http.Error(sw, "Bad Request", http.StatusBadRequest)
+			writeError(sw, pr.errorPages, httpErrBadRequest)
 			return
 		}
 		var out http.ResponseWriter = sw
@@ -398,7 +399,7 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			defer gw.close() // Runs before the deferred finish above, which reads sw
 		}
 		if rule != nil {
-			s.answer(w, r, env, rule)
+			s.answer(w, r, env, rule, pr.errorPages)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(withProxyRequest(r.Context(), pr)))

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.HTTP}} {{.Status}}</title>
+<style>
+:root { color-scheme: light dark; --fg: #1f2328; --muted: #656d76; --bg: #ffffff; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e6edf3; --muted: #8d96a0; --bg: #0d1117; } }
+body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { padding: 24px 16px; text-align: center; }
+h1 { margin: 0; font-size: 32px; font-weight: 600; }
+p { margin: 8px 0 0; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+<h1>{{.HTTP}} {{.Status}}</h1>
+<p>Error {{.Code}}: {{.Error}}</p>
+</main>
+</body>
+</html>

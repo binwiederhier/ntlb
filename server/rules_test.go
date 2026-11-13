@@ -51,7 +51,7 @@ rules:
 	// Blocked before any upstream sees it, also subscriptions
 	status, body := get(t, noRedirects, "http://"+s.HTTPAddr()+"/sp_x/json") // Unblocked, an endless subscription
 	require.Equal(t, http.StatusForbidden, status)
-	require.Equal(t, "Forbidden\n", body)
+	require.Contains(t, body, "Error 40399: blocked")
 	req, _ := http.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+"/name", nil)
 	req.Header.Set("User-Agent", "ntfy-spy/1.0")
 	resp, err := http.DefaultClient.Do(req)

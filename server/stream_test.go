@@ -696,7 +696,7 @@ func TestStream_HTTP2InvalidPathRejected(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, "HTTP/2.0", resp.Proto)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	require.Equal(t, "Bad Request\n", string(body)) // Our answer, not the upstream's parser ("400 Bad Request")
+	require.Contains(t, string(body), "Error 40099: bad request") // Our answer, not the upstream's parser ("400 Bad Request")
 	require.Equal(t, int64(0), app1.hits.Load())
 }
 

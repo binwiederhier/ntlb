@@ -104,8 +104,9 @@ type proxyRequest struct {
 	site           string       // The site serving the request, "" if none does
 	pool           string       // The site's upstream a proxy rule sent the request to, "" for default
 	siteConf       *config.Site // Set by Server.observe; dropped once the request is under way
-	rule           string       // The rule that decided the request, if any
-	upstream       string       // Set once an upstream answered
+	errorPages     *config.ErrorPages
+	rule           string // The rule that decided the request, if any
+	upstream       string // Set once an upstream answered
 	upstreamStatus int
 	status         int   // Set by the stream path, which may bypass the ResponseWriter
 	bytes          int64 // Body bytes written by the stream path
@@ -145,7 +146,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pr.siteConf = nil // A detached stream must not keep an old config alive
 	if site == nil {
 		pr.env, pr.kind = nil, kindRequest
-		http.Error(w, "no site for this host", http.StatusNotFound)
+		writeError(w, pr.errorPages, httpErrNoSite)
 		return
 	}
 	pr.site = site.Name
@@ -166,7 +167,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.balancer.Draining() && (p.balancer.Drained() || subscription) {
 		p.metrics.refused.Inc()
 		w.Header().Set(headerConnection, connectionClose)
-		http.Error(w, "load balancer is draining", http.StatusServiceUnavailable)
+		writeError(w, pr.errorPages, httpErrDraining)
 		return
 	}
 	parent := r.Context()
@@ -179,7 +180,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if pool == nil {
 		// A reload's new rules met the site of the old config, which lacks the upstream they name
 		pr.kind = kindRequest
-		http.Error(w, "no upstream available", http.StatusBadGateway)
+		writeError(w, pr.errorPages, httpErrUpstreamMissing)
 		return
 	}
 	pr.pool = pool.Name
@@ -417,18 +418,19 @@ func (p *proxy) rewrite(r *httputil.ProxyRequest) {
 
 func (p *proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	cause := context.Cause(r.Context())
+	pages := proxyRequestFromContext(r.Context()).errorPages
 	switch {
 	case errors.Is(cause, balancer.ErrDrained):
 		w.Header().Set(headerConnection, connectionClose)
-		w.WriteHeader(http.StatusServiceUnavailable)
+		writeError(w, pages, httpErrDrained)
 	case errors.Is(cause, errUpstreamReadTimeout), isTimeout(err):
-		w.WriteHeader(http.StatusGatewayTimeout)
+		writeError(w, pages, httpErrUpstreamTimeout)
 	case r.Context().Err() != nil:
 		// Client went away, nobody to answer
 	case errors.Is(err, errNoUpstream):
-		w.WriteHeader(http.StatusServiceUnavailable)
+		writeError(w, pages, httpErrNoHealthyUpstream)
 	default:
-		w.WriteHeader(http.StatusBadGateway)
+		writeError(w, pages, httpErrUpstreamFailed)
 	}
 }
 

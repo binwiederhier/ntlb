@@ -54,9 +54,9 @@ rules:
 	require.True(t, r.Program.Match(match.NewEnv(httptest.NewRequest("GET", "/sp_x", nil))))
 	require.Zero(t, c.Rules[1].Status)
 
-	// Limit: 429 by default, rate parsed; no match means every request
+	// Limit: rate parsed (it always answers 429, no status); no match means every request
 	l := c.Rules[2]
-	require.Equal(t, 429, l.Status)
+	require.Zero(t, l.Status)
 	require.InDelta(t, 0.75, l.RatePerSecond, 1e-9)
 	require.Equal(t, 1000, l.Burst)
 	require.Nil(t, l.Program)
@@ -118,6 +118,7 @@ func TestParse_RulesInvalid(t *testing.T) {
 		"static with status":        "rules: [{name: a, action: static, root: /srv, status: 200}]",
 		"root on block":             "rules: [{name: a, action: block, root: /srv}]",
 		"location on limit":         "rules: [{name: a, action: limit, rate: 1/s, location: '\"/x\"'}]",
+		"status on limit":           "rules: [{name: a, action: limit, rate: 1/s, status: 503}]",
 		"rate on redirect":          "rules: [{name: a, action: redirect, location: '\"/x\"', rate: 1/s}]",
 		"strike on redirect":        rulesTestBans + "rules: [{name: a, action: redirect, location: '\"/x\"', strike: 1}]",
 		"location on static":        "rules: [{name: a, action: static, root: /srv, location: '\"/x\"'}]",
@@ -158,7 +159,7 @@ func TestLoad_PackagingExampleRules(t *testing.T) {
 	require.True(t, byName["ntfy/abuse-topic-count"].Program.Match(topics(150)))
 	require.False(t, byName["ntfy/abuse-topic-count"].Program.Match(topics(149)))
 	require.Equal(t, ActionAllow, byName["ntfy/limit-exempt"].Action)
-	require.Equal(t, 503, byName["ntfy/limit"].Status)
+	require.Equal(t, ActionLimit, byName["ntfy/limit"].Action)
 	require.True(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/a,bad-bets/json", nil))))
 	require.False(t, byName["ntfy/abuse-topics"].Program.Match(match.NewEnv(httptest.NewRequest("GET", "/bad-bets2/json", nil))))
 	require.Greater(t, byName["ntfy/abuse-topics"].Strike, c.Bans.Threshold) // Bans on the first request

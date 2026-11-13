@@ -36,6 +36,7 @@ type Site struct {
 	AccessLogs  []*AccessLog         `yaml:"access-logs"`  // Replace the global access logs for this site
 	Bans        *Bans                `yaml:"bans"`         // Replace the global bans settings for this site (usually there are only global ones)
 	Gzip        *Gzip                `yaml:"gzip"`         // Replace the global gzip settings for this site
+	Errors      *ErrorPages          `yaml:"errors"`       // Replace the global error pages for this site
 	Streams     *Streams             `yaml:"streams"`      // Which requests are long-lived streams
 	Upstreams   map[string]*Upstream `yaml:"upstreams"`    // The servers, and how requests reach them, by name: "default" takes what no proxy rule routes
 	Rules       []*Rule              `yaml:"rules"`        // Checked after the global rules
@@ -148,6 +149,15 @@ func (c *Config) GzipFor(site *Site) *Gzip {
 	return c.Gzip
 }
 
+// ErrorPagesFor returns how a site answers what it does not proxy: its own settings, else the
+// global ones, else the default HTML pages; site is nil for requests no site serves
+func (c *Config) ErrorPagesFor(site *Site) *ErrorPages {
+	if site != nil && site.Errors != nil {
+		return site.Errors
+	}
+	return c.Errors
+}
+
 // UpstreamCount returns the number of servers over all sites and their upstreams
 func (c *Config) UpstreamCount() int {
 	n := 0
@@ -245,6 +255,7 @@ func (s *Site) applyDefaults() {
 		s.Streams.Match = DefaultStreamsMatch
 	}
 	s.Bans.applyDefaults()
+	s.Errors.applyDefaults()
 	applyRuleDefaults(s.Rules)
 }
 
@@ -302,6 +313,8 @@ func (s *Site) validate(bans *Bans) error {
 	} else if err := validateBans(s.Bans); err != nil {
 		return err
 	} else if err := s.Gzip.validate(); err != nil {
+		return err
+	} else if err := s.Errors.validate(); err != nil {
 		return err
 	}
 	var err error

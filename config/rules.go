@@ -19,7 +19,7 @@ const (
 // Rule actions
 const (
 	ActionBlock    = "block"    // Answer with status (default 403)
-	ActionLimit    = "limit"    // Rate limit per client key; over the limit, answer with status (default 429)
+	ActionLimit    = "limit"    // Rate limit per client key; over the limit, answer 429
 	ActionAllow    = "allow"    // Stop checking rules and proxy the request, e.g. to exempt clients from a limit
 	ActionRedirect = "redirect" // Answer with a redirect to location (default 302)
 	ActionStatic   = "static"   // Serve a file from root, or fallback if there is none
@@ -29,7 +29,6 @@ const (
 // Rule defaults
 const (
 	DefaultBlockStatus    = http.StatusForbidden
-	DefaultLimitStatus    = http.StatusTooManyRequests
 	DefaultRedirectStatus = http.StatusFound
 )
 
@@ -46,7 +45,7 @@ type Rule struct {
 	On       string  `yaml:"on"`       // request (default) or response
 	Match    string  `yaml:"match"`    // A request or response expression, see package match
 	Action   string  `yaml:"action"`   // Request rules only, required
-	Status   int     `yaml:"status"`   // block, limit, redirect
+	Status   int     `yaml:"status"`   // block, redirect (a limit always answers 429)
 	Rate     string  `yaml:"rate"`     // limit: requests per period, e.g. 45/m (s, m, h)
 	Burst    int     `yaml:"burst"`    // limit: extra requests allowed at once (like limit_req burst, nodelay)
 	Location string  `yaml:"location"` // redirect: a string expression, e.g. '"https://" + host + uri'
@@ -76,8 +75,6 @@ func applyRuleDefaults(rules []*Rule) {
 			switch r.Action {
 			case ActionBlock:
 				r.Status = DefaultBlockStatus
-			case ActionLimit:
-				r.Status = DefaultLimitStatus
 			case ActionRedirect:
 				r.Status = DefaultRedirectStatus
 			}
@@ -157,8 +154,8 @@ func (r *Rule) compileAction() error {
 			return errors.New("block takes status and strike only")
 		}
 	case ActionLimit:
-		if r.Location != "" || hasStatic || hasUpstream {
-			return errors.New("limit takes rate, burst, status and strike only")
+		if r.Status != 0 || r.Location != "" || hasStatic || hasUpstream {
+			return errors.New("limit takes rate, burst and strike only")
 		}
 		perSecond, err := parseRate(r.Rate)
 		if err != nil {

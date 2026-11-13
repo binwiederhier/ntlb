@@ -12,6 +12,11 @@ sites:
     #   - file: /var/log/ntlb/ntfy.log
     # bans: {file: /var/log/ntlb/ntfy-ban.log, window: 10m, threshold: 100}
 
+    # ntfy's clients read JSON errors ({"code":42999,"http":429,"error":"rate limited","origin":"ntlb"}), so ntlb's
+    # own answers (blocks, limits, no healthy upstream) are JSON too
+    errors:
+      format: json
+
     # The certificate is re-read on reload. Running as a regular user, ntlb cannot read
     # /etc/letsencrypt: a certbot deploy hook copies the files to a directory ntlb owns, then runs
     # "systemctl reload ntlb" (see "Running as a regular user" in the README)
@@ -117,5 +122,4 @@ sites:
         action: limit
         rate: 45/m
         burst: 1000
-        status: 503 # What nginx's limit_req answers by default
         strike: 1

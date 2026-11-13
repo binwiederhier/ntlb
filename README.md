@@ -140,6 +140,9 @@ sequenceDiagram
   over a duration. A draining load balancer turns away new *subscriptions* (so clients back off or
   go to another load balancer instead of coming back to be drained again) but keeps serving
   publishes.
+- **Error pages with codes** for what ntlb answers itself (blocked, rate limited, no healthy
+  upstream, draining...): HTML by default, JSON like ntfy's (`{"code":42999,"http":429,"error":...,"origin":"ntlb"}`),
+  text, or a template of your own. See [Error pages](docs/configuration.md#error-pages).
 - **gzip** of responses, like nginx's `gzip` with `gzip_proxied any`: listed media types, level 6,
   at least 1100 bytes, streamed responses compressed as they go; subscriptions are never compressed.
 - **`/v1/health` and `/v1/ready`** like ntfy's, plus a status API, Prometheus metrics (client

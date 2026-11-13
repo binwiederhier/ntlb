@@ -75,6 +75,7 @@ type Config struct {
 	ClientKey             *ClientKey    `yaml:"client-key"`
 	Bans                  *Bans         `yaml:"bans"`
 	Gzip                  *Gzip         `yaml:"gzip"`    // For sites without their own
+	Errors                *ErrorPages   `yaml:"errors"`  // For sites without their own, and requests no site serves
 	Rules                 []*Rule       `yaml:"rules"`   // Checked for every request, before its site's rules
 	Include               []string      `yaml:"include"` // Globs of files merged into this one, relative to its directory
 	Sites                 []*Site       `yaml:"sites"`
@@ -260,6 +261,10 @@ func (c *Config) applyDefaults() {
 		c.ClientKey.IPv6PrefixBits = DefaultClientKeyIPv6PrefixBits
 	}
 	c.Bans.applyDefaults()
+	if c.Errors == nil {
+		c.Errors = &ErrorPages{}
+	}
+	c.Errors.applyDefaults()
 	applyRuleDefaults(c.Rules)
 	for _, site := range c.Sites {
 		if site != nil {
@@ -285,6 +290,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.Gzip.validate(); err != nil {
+		return err
+	}
+	if err := c.Errors.validate(); err != nil {
 		return err
 	}
 	if err := validateBans(c.Bans); err != nil {

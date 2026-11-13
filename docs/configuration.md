@@ -17,6 +17,7 @@ ntfy.sh setup). How it works inside is in [architecture.md](architecture.md) and
 - [Rules](#rules)
 - [Bans](#bans)
 - [Compression](#compression)
+- [Error pages](#error-pages)
 - [The expression language](#the-expression-language)
 - [Recipes](#recipes)
 - [Running as a regular user, and certificates](#running-as-a-regular-user-and-certificates)
@@ -70,6 +71,7 @@ flowchart LR
 | `client-key` | `{ipv4-prefix-bits: 32, ipv6-prefix-bits: 64}` | What identifies a client for `balance: hash`, limits and bans: its IP, shortened to a prefix. |
 | `bans` | off | Strike counting and the ban file. See [Bans](#bans). |
 | `gzip` | off | Compression for sites without their own. See [Compression](#compression). |
+| `errors` | `{format: html}` | How ntlb answers what it does not proxy, for sites without their own and requests no site serves. See [Error pages](#error-pages). |
 | `rules` | none | Global rules, checked for every request before its site's rules. See [Rules](#rules). |
 | `include` | none | Globs of files to merge in. |
 | `sites` | required | At least one. See [Sites](#sites). |
@@ -107,7 +109,7 @@ balancing, timeouts, health checks), streams, rules and (optionally) logs, bans 
 | `upstreams` | required | The servers and how requests reach them, by name; `default` is required and takes every request no `proxy` rule routes. Each has `balance`, `timeouts`, `keepalive`, `healthcheck`, `servers`. See [Upstreams](#upstreams-servers-balancing-and-timeouts) and [Routing by path](#routing-by-path). |
 | `streams` | none | Which requests are long-lived streams. See [Streams](#streams). |
 | `rules` | none | Checked after the global rules; named `<site>/<name>` in logs and metrics. |
-| `access-logs`, `bans`, `gzip` | the global ones | Replace the global setting for this site's requests. |
+| `access-logs`, `bans`, `gzip`, `errors` | the global ones | Replace the global setting for this site's requests. |
 
 Several sites can share listen addresses. A request goes to a site by its `Host` header (port and
 trailing dot ignored, case-insensitive):
@@ -552,7 +554,7 @@ request.
 | `action` | Settings | Does |
 |---|---|---|
 | `block` | `status` (default 403), `strike` | Answers `status` with a short text body. |
-| `limit` | `rate` (required), `burst` (default 0), `status` (default 429), `strike` | A token bucket per client key and rule: `rate` requests per `s`, `m` or `h`, plus `burst` at once (nginx's `limit_req burst=N nodelay`). Over it, answers `status`; `strike` counts per limited request. |
+| `limit` | `rate` (required), `burst` (default 0), `strike` | A token bucket per client key and rule: `rate` requests per `s`, `m` or `h`, plus `burst` at once (nginx's `limit_req burst=N nodelay`). Over it, answers 429 (nginx's `limit_req` answers 503 by default, which counts a limit as a server error); `strike` counts per limited request. |
 | `allow` | none | Stops checking and proxies. For exemptions: put it before the rules it exempts from. |
 | `proxy` | `upstream` (a name in the site's `upstreams`; default: `default`) | Stops checking and proxies to that upstream. Site rules only. See [Routing by path](#routing-by-path). |
 | `redirect` | `location` (required, a string expression), `status` (default 302; 300-399) | Answers a redirect. |
@@ -669,6 +671,56 @@ gzip:
 A streamed (flushed) response is compressed as it goes. Streams (`streams.match`), WebSockets and
 `HEAD` requests never are. A site may have its own `gzip` instead. Default: off.
 
+## Error pages
+
+What ntlb answers itself (a `block` or `limit` rule, no healthy upstream, a failed upstream, a
+drain) is an error page with a code that names the reason. The codes are shaped like ntfy's
+(status * 100 + n), but ntfy's count up from 01 and ntlb's down from 99, so a client never takes
+one for the other. What an upstream answers, errors
+included, passes through as it is.
+
+```yaml
+errors:
+  format: json     # html (default), json or text
+```
+
+| Format | Content-Type | Body |
+|---|---|---|
+| `html` | `text/html` | A small page: `403 Forbidden`, `Error 40399: blocked` |
+| `json` | `application/json` | `{"code":40399,"http":403,"error":"blocked","origin":"ntlb"}`, like ntfy's errors |
+| `text` | `text/plain` | `Error 40399: blocked` |
+
+Or a Go template of your own instead of a format; a `.html` or `.htm` file is parsed with
+`html/template`, which escapes the values, any other with `text/template`. The `Content-Type` comes
+from the file's extension. It gets `.Code` (40399), `.HTTP` (403), `.Status` (`Forbidden`),
+`.Error` (`blocked`) and `.Origin` (`ntlb`). A template that fails answers with the text format.
+
+```yaml
+errors:
+  template: /etc/ntlb/error.html
+```
+
+The codes. The first three digits are the status; a `block` rule can answer another one with
+`status`, the code stays.
+
+| Code | Status | Error | When |
+|---|---|---|---|
+| 40099 | 400 | bad request | A request ntlb cannot proxy (say, an invalid HTTP/2 path) |
+| 40399 | 403 | blocked | A `block` rule |
+| 40499 | 404 | no site for this host | No site on this listener serves the Host |
+| 40498 | 404 | not found | A `static` rule found no file (and no `fallback`) |
+| 42999 | 429 | rate limited | A `limit` rule |
+| 50099 | 500 | redirect has no location | A `redirect` rule's `location` was empty |
+| 50299 | 502 | upstream failed | The upstream did not answer (refused, reset, not HTTP), on every try |
+| 50298 | 502 | upstream not configured | A reload removed the upstream a request was routed to |
+| 50399 | 503 | load balancer is draining | A new subscription, or any request once drained |
+| 50398 | 503 | listener closed, reconnect | A request on a listener a reload removed |
+| 50397 | 503 | no upstream available | No healthy server |
+| 50396 | 503 | drained, reconnect | A drain closed the request |
+| 50499 | 504 | upstream timed out | The upstream did not answer within `timeouts.read` |
+
+A site may have its own `errors` instead; requests no site serves get the global one.
+
 ## The expression language
 
 `match` (rules, streams, access logs) and `location` (redirects) are expressions in
@@ -768,7 +820,7 @@ status == 404 && path endsWith ".php"                  # probing for PHP
 status == 400 && upstream_status == 0                  # garbage the load balancer could not parse
 status == 502 && upstream_status == 0                  # no upstream reachable
 status == 499                                          # the client left before an answer
-(status == 429 || status == 503) && rule != ""         # limited by a rule
+status == 429 && rule != ""                            # limited by a rule
 rule == "limit" || rule endsWith "/limit"              # the global or any site's rule "limit"
 rule startsWith "api/"                                 # any rule of the site "api"
 site == "api" && status >= 400

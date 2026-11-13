@@ -1050,8 +1050,9 @@ func TestServer_NtfyPackagedConfig(t *testing.T) {
 	})
 
 	t.Run("abusive topics are blocked and banned", func(t *testing.T) {
-		resp, _ := newNtfyClient(t, s, "127.0.0.21").do(http.MethodGet, "https", "/spam-offers/json", "")
+		resp, body := newNtfyClient(t, s, "127.0.0.21").do(http.MethodGet, "https", "/spam-offers/json", "")
 		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		require.Equal(t, `{"code":40399,"http":403,"error":"blocked","origin":"ntlb"}`+"\n", body)      // JSON, like ntfy's errors
 		resp, _ = newNtfyClient(t, s, "127.0.0.22").do(http.MethodPost, "https", "/news,bad-bets", "x") // Inside a topic list
 		require.Equal(t, http.StatusForbidden, resp.StatusCode)
 		resp, _ = newNtfyClient(t, s, "127.0.0.22").do(http.MethodGet, "https", "/bad-betsy/json?poll=1", "") // A near miss
@@ -1085,7 +1086,7 @@ func TestServer_NtfyPackagedConfig(t *testing.T) {
 			require.Equal(t, http.StatusOK, resp.StatusCode)
 		}
 		resp, _ := c.do(http.MethodPost, "https", "/mytopic", "x")
-		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode) // nginx's limit_req status
+		require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
 		exempt := newNtfyClient(t, s, "127.0.0.41")
 		for range 10 {
 			resp, _ := exempt.do(http.MethodPost, "https", "/mytopic", "x")

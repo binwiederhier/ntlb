@@ -130,7 +130,7 @@ flowchart TD
     site --> valid{"Valid path<br/>and Host?"}
     valid -- no --> v400["400"]
     valid -- yes --> rules{"Request rules<br/>global, then the site's"}
-    rules -- "block / limit" --> deny["403 / 429 / 503<br/>+ strikes"]
+    rules -- "block / limit" --> deny["403 / 429<br/>+ strikes"]
     rules -- "redirect / static" --> serve["Answer from ntlb"]
     rules -- "allow / none" --> kind{"Subscription?<br/>streams.match"}
     kind -- "no: request" --> rp["ReverseProxy<br/>RoundTrip with retries"]

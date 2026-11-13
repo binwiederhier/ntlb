@@ -64,6 +64,12 @@ bans:
   window: 10m
   threshold: 100
 
+# How ntlb answers what it does not proxy (blocks, limits, no healthy upstream...): html (the
+# default), json ({"code":42999,"http":429,"error":"rate limited","origin":"ntlb"}) or text, or a template of your
+# own. A site may have its own.
+# errors:
+#   format: html
+
 # Compression, like nginx's gzip with gzip_proxied any (level 6, at least 1100 bytes): responses of
 # these media types with status 200, 403 or 404, to HTTP/1.1+ clients that accept gzip, unless the
 # upstream encoded them already. A flushed response is compressed as it goes (sync flushes);
@@ -91,8 +97,8 @@ gzip:
 #
 #   action: block      answer status (default 403)
 #   action: limit      a token bucket per client key: rate (per s, m or h) plus burst at once,
-#                      like nginx's limit_req burst=N nodelay; over it, answer status (default
-#                      429); under it, check the next rules
+#                      like nginx's limit_req burst=N nodelay; over it, answer 429; under it,
+#                      check the next rules
 #   action: allow      stop checking and proxy, e.g. to exempt clients from a limit
 #   action: redirect   answer status (default 302) with location, a string expression
 #   action: static     serve a file from root, or fallback (relative to root) for paths that are
