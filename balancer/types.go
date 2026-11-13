@@ -34,6 +34,7 @@ var (
 type Status struct {
 	Healthy       bool              `json:"healthy"`
 	Ready         bool              `json:"ready"`
+	Withdrawing   bool              `json:"withdrawing"`
 	Draining      bool              `json:"draining"`
 	Drained       bool              `json:"drained"`
 	DrainDeadline *time.Time        `json:"drain_deadline,omitempty"`

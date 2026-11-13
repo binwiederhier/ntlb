@@ -86,9 +86,9 @@ func TestNewClient_AdminURLFlag(t *testing.T) {
 
 	// --admin-url wins over the config file
 	filename := writeConfig(t, "127.0.0.1:"+other.port())
-	_, err := runApp("--config", filename, "--admin-url", f.srv.URL+"/", "undrain")
+	_, err := runApp("--config", filename, "--admin-url", f.srv.URL+"/", "upstream", "undrain", "app1")
 	require.NoError(t, err)
-	require.Equal(t, "/v1/drain", f.path)
+	require.Equal(t, "/v1/upstreams/app1/drain", f.path)
 	require.Empty(t, other.path)
 }
 
@@ -118,9 +118,9 @@ func TestNewClient_ListenAdminFromConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
 			filename := writeConfig(t, tt.listenAdmin(f.port()))
-			out, err := runApp("--config", filename, "undrain")
+			out, err := runApp("--config", filename, "upstream", "undrain", "app1")
 			require.NoError(t, err)
-			require.Equal(t, "Load balancer undrained\n", out)
+			require.Equal(t, "Upstream app1 undrained\n", out)
 			require.Equal(t, "127.0.0.1:"+f.port(), f.host)
 		})
 	}
@@ -129,7 +129,7 @@ func TestNewClient_ListenAdminFromConfig(t *testing.T) {
 func TestNewClient_Env(t *testing.T) {
 	f := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
 	t.Setenv("NTLB_ADMIN_URL", f.srv.URL)
-	_, err := runApp("undrain")
+	_, err := runApp("upstream", "undrain", "app1")
 	require.NoError(t, err)
 	require.Equal(t, http.MethodDelete, f.method)
 
@@ -138,11 +138,11 @@ func TestNewClient_Env(t *testing.T) {
 	g := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
 	h := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
 	t.Setenv("NTLB_ADMIN_URL", "")
-	_, err = runApp("--config", writeConfig(t, "127.0.0.1:"+h.port()), "undrain")
+	_, err = runApp("--config", writeConfig(t, "127.0.0.1:"+h.port()), "upstream", "undrain", "app1")
 	require.NoError(t, err)
 	require.Equal(t, http.MethodDelete, h.method)
 	t.Setenv("NTLB_CONFIG", writeConfig(t, "127.0.0.1:"+g.port()))
-	_, err = runApp("undrain")
+	_, err = runApp("upstream", "undrain", "app1")
 	require.NoError(t, err)
 	require.Equal(t, http.MethodDelete, g.method)
 }
@@ -150,11 +150,11 @@ func TestNewClient_Env(t *testing.T) {
 func TestNewClient_DefaultListenAdmin(t *testing.T) {
 	// Without a readable config file (missing, or no listen-admin), the default address is used
 	f := newFakeAdminOn(t, config.DefaultListenAdmin, http.StatusOK, `{"success":true}`)
-	_, err := runApp("--config", filepath.Join(t.TempDir(), "missing.yml"), "undrain")
+	_, err := runApp("--config", filepath.Join(t.TempDir(), "missing.yml"), "upstream", "undrain", "app1")
 	require.NoError(t, err)
 	require.Equal(t, config.DefaultListenAdmin, f.host)
 	f.host = ""
-	_, err = runApp("--config", writeConfig(t, ""), "undrain")
+	_, err = runApp("--config", writeConfig(t, ""), "upstream", "undrain", "app1")
 	require.NoError(t, err)
 	require.Equal(t, config.DefaultListenAdmin, f.host)
 }
@@ -163,7 +163,7 @@ func TestNewClient_InvalidConfigFallsBack(t *testing.T) {
 	f := newFakeAdminOn(t, config.DefaultListenAdmin, http.StatusOK, `{"success":true}`)
 	filename := filepath.Join(t.TempDir(), "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte("listen-admin: '127.0.0.1:1'\n"), 0600)) // No upstreams
-	_, err := runApp("--config", filename, "undrain")
+	_, err := runApp("--config", filename, "upstream", "undrain", "app1")
 	require.NoError(t, err)
 	require.Equal(t, config.DefaultListenAdmin, f.host)
 }
@@ -172,9 +172,9 @@ func TestNewClient_InvalidConfigFallsBack(t *testing.T) {
 
 func TestApp_FlagsAfterSubcommand(t *testing.T) {
 	f := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
-	_, err := runApp("undrain", "--admin-url", f.srv.URL)
+	_, err := runApp("upstream", "undrain", "app1", "--admin-url", f.srv.URL)
 	require.NoError(t, err)
-	require.Equal(t, "/v1/drain", f.path)
+	require.Equal(t, "/v1/upstreams/app1/drain", f.path)
 	_, err = runApp("upstream", "undrain", "app1", "-a", f.srv.URL)
 	require.NoError(t, err)
 	require.Equal(t, "/v1/upstreams/app1/drain", f.path)
@@ -185,14 +185,14 @@ func TestApp_LogLevel(t *testing.T) {
 		slog.SetLogLoggerLevel(slog.LevelInfo)
 	})
 	f := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
-	_, err := runApp("--log-level", "debug", "--admin-url", f.srv.URL, "undrain")
+	_, err := runApp("--log-level", "debug", "--admin-url", f.srv.URL, "upstream", "undrain", "app1")
 	require.NoError(t, err)
 	require.True(t, slog.Default().Enabled(context.Background(), slog.LevelDebug))
-	_, err = runApp("--log-level", "WARN", "--admin-url", f.srv.URL, "undrain")
+	_, err = runApp("--log-level", "WARN", "--admin-url", f.srv.URL, "upstream", "undrain", "app1")
 	require.NoError(t, err)
 	require.False(t, slog.Default().Enabled(context.Background(), slog.LevelInfo))
 	require.True(t, slog.Default().Enabled(context.Background(), slog.LevelWarn))
-	_, err = runApp("--log-level", "loud", "--admin-url", f.srv.URL, "undrain")
+	_, err = runApp("--log-level", "loud", "--admin-url", f.srv.URL, "upstream", "undrain", "app1")
 	require.EqualError(t, err, `invalid log level "loud"`)
 }
 

@@ -41,6 +41,11 @@ func (s *Server) MetricsAddr() string {
 	return s.listenerAddr(listenerMetrics)
 }
 
+// HealthAddr returns the address the health listener is bound to, or "" if there is none
+func (s *Server) HealthAddr() string {
+	return s.listenerAddr(listenerHealth)
+}
+
 // ProfilerAddr returns the address the profiler listener is bound to, or "" if there is none
 func (s *Server) ProfilerAddr() string {
 	return s.listenerAddr(listenerProfiler)
@@ -78,6 +83,16 @@ func (s *Server) listen(conf *config.Config) error {
 		}
 		s.listeners[listenerMetrics] = ln
 		s.metricsSrv = newHTTPServer(listenerMetrics, s.metricsHandler())
+	}
+
+	// Health listener
+	if conf.ListenHealth != "" {
+		ln, err := net.Listen("tcp", conf.ListenHealth)
+		if err != nil {
+			return err
+		}
+		s.listeners[listenerHealth] = ln
+		s.healthSrv = newHTTPServer(listenerHealth, s.healthHandler())
 	}
 
 	// Profiler listener

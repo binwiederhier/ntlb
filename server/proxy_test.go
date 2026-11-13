@@ -162,10 +162,6 @@ func TestProxy_DrainedRejectsNewRequests(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 	require.True(t, resp.Close)
-	s.balancer.Undrain()
-	status, body := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
-	require.Equal(t, http.StatusOK, status)
-	require.Equal(t, "app1", body)
 }
 
 func TestProxy_DrainingRefusesNewSubscriptions(t *testing.T) {

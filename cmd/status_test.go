@@ -49,7 +49,7 @@ func startTestServer(t *testing.T, filename string) *server.Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	go s.Serve(ctx)
 	t.Cleanup(func() {
-		s.Shutdown(0)
+		s.Shutdown(0, 0)
 		cancel()
 	})
 	waitReady(t, s.AdminAddr())
@@ -317,12 +317,13 @@ func TestStatus_LiveDrains(t *testing.T) {
 	require.Regexp(t, `app1\s+draining\s.*drained in (1h0m0s|59m59s) \(`, out)
 	require.Regexp(t, `app2\s+drained\s`, out)
 	require.Contains(t, out, "Load balancer: unhealthy")
-	_, err = run(t, s, "drain", "-d", "0s")
-	require.NoError(t, err)
+
+	// A shutdown withdraws first: not ready, still serving
+	go s.Shutdown(time.Second, 0)
 	require.Eventually(t, func() bool {
 		out, err := run(t, s, "status")
 		require.NoError(t, err)
-		return strings.Contains(out, "Load balancer: drained (turning requests away)")
+		return strings.Contains(out, "Load balancer: withdrawing (not ready, still serving everything)")
 	}, 5*time.Second, 20*time.Millisecond)
 }
 

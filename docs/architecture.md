@@ -55,7 +55,7 @@ flowchart TB
     main["main.go"] --> cmd
     subgraph cmd["cmd: CLI (urfave/cli v3)"]
         serve["serve"]
-        cli["status, reload, drain,<br/>undrain, upstream, check-config"]
+        cli["status, reload,<br/>upstream drain/undrain, check-config"]
     end
     cli -- "admin API" --> client["client: admin API client"]
     serve --> server
@@ -305,9 +305,11 @@ sequenceDiagram
 
 ### Draining the load balancer (SIGTERM)
 
-On shutdown (or `ntlb drain`) ntlb turns unready and turns away new subscriptions (so clients go
-to another load balancer instead of being drained again), but keeps serving publishes until it is
-drained.
+On shutdown (SIGTERM), like ntfy's drain, ntlb first withdraws for `shutdown-drain-delay`: it
+turns unready (on the admin and `listen-health` listeners), so the health check in front (e.g.
+Route53) takes it out, but still serves everything, since clients keep its address for up to the
+DNS TTL. Then it drains: new subscriptions are turned away (so clients go to another load
+balancer instead of being drained again), publishes are served until it is drained.
 
 ```mermaid
 sequenceDiagram
@@ -317,8 +319,9 @@ sequenceDiagram
     participant B as Balancer
     participant C as Clients
     SD->>S: SIGTERM
+    S->>B: Withdraw (shutdown-drain-delay)
+    Note over S: /v1/ready is 503 (admin, listen-health), everything still served
     S->>B: Drain(shutdown-drain-duration)
-    Note over S: admin /v1/ready is 503 (for an external check)
     C->>S: new subscription
     S-->>C: 503, Connection: close
     C->>S: publish

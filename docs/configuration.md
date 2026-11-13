@@ -63,11 +63,13 @@ flowchart LR
 |---|---|---|
 | `listen-admin` | `127.0.0.1:2590` | Admin API, `/metrics`, `/debug/pprof/`. **No auth**: keep it local. |
 | `listen-metrics` | off | Only `/metrics`, e.g. on a private network for Prometheus. |
+| `listen-health` | off | Only `/v1/ready` (200 if ready, else 503), on a port of its own, for a health check in front of ntlb (Route53, a cloud load balancer) that must not reach the admin API. Unlike a path on the sites, it cannot shadow an upstream's. |
 | `listen-profiler` | off | Only `/debug/pprof/`, to profile under load without exposing the admin API. |
 | `access-logs` | none | Access logs for sites without their own, and for requests no site serves. See [Access logs](#access-logs). |
 | `client-keepalive` | `{idle: 1m, interval: 15s, count: 4}` | TCP keepalive towards clients; a dead peer is noticed after `idle + interval * count`. `{disable: true}` turns it off. |
-| `drain-duration` | `5m` | Default for `drain` commands, and for servers removed from the config. |
-| `shutdown-drain-duration` | `2m` | On SIGTERM: not ready right away, streams closed over this long, then exit. |
+| `drain-duration` | `5m` | Default for `upstream drain`, and for servers removed from the config. |
+| `shutdown-drain-delay` | `0` | On SIGTERM, before the drain: withdrawing, i.e. not ready but still serving everything (new streams too), so the health check in front takes ntlb out before streams close. Set it to that check's detection time plus the DNS TTL. Like ntfy's `cluster-drain-delay`. |
+| `shutdown-drain-duration` | `2m` | On SIGTERM (after `shutdown-drain-delay`): not ready, streams closed over this long, then exit. |
 | `client-key` | `{ipv4-prefix-bits: 32, ipv6-prefix-bits: 64}` | What identifies a client for `balance: hash`, limits and bans: its IP, shortened to a prefix. |
 | `bans` | off | Strike counting and the ban file. See [Bans](#bans). |
 | `gzip` | off | Compression for sites without their own. See [Compression](#compression). |

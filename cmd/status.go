@@ -52,6 +52,8 @@ func lbState(s *balancer.Status) string {
 		return "drained (turning requests away)"
 	case s.Draining:
 		return "draining, done " + until(*s.DrainDeadline)
+	case s.Withdrawing:
+		return "withdrawing (not ready, still serving everything)"
 	case s.Ready:
 		return "ready"
 	default:

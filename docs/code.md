@@ -232,12 +232,13 @@ sequenceDiagram
     S->>S: loadCerts, openLogFiles, listen (bind every address now, so a bad one fails here)
     C->>S: go Serve(ctx)
     S->>B: Start: one probe round (blocking), then go healthLoop, go drainLoop
-    S->>S: go serve() per listener (public, admin, metrics, profiler)
+    S->>S: go serve() per listener (public, admin, metrics, health, profiler)
     C->>C: handleSignals
     OS->>C: SIGHUP
     C->>S: Reload()
     OS->>C: SIGTERM
-    C->>S: go Shutdown(shutdown-drain-duration)
+    C->>S: go Shutdown(shutdown-drain-delay, shutdown-drain-duration)
+    S->>B: Withdraw, sleep(delay): not ready, still serving everything
     S->>B: Drain(d), WaitIdle
     S->>S: proxy.closeAll, http.Server.Shutdown each, files.close
     S-->>C: Serve returns

@@ -66,8 +66,6 @@ func New() *cli.Command {
 			newCheckConfigCommand(),
 			newStatusCommand(),
 			newReloadCommand(),
-			newDrainCommand(),
-			newUndrainCommand(),
 			newUpstreamCommand(),
 		},
 	}
@@ -85,7 +83,7 @@ func newClient(cmd *cli.Command) *client.Client {
 	return client.New("http://" + dialAddr(listenAdmin))
 }
 
-// newDurationFlag returns the --duration flag of the drain commands
+// newDurationFlag returns the --duration flag of the upstream drain command
 func newDurationFlag() *cli.StringFlag {
 	return &cli.StringFlag{
 		Name:    flagDuration,

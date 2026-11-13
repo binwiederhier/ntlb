@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/urfave/cli/v3"
 	"heckel.io/ntlb/config"
@@ -79,11 +80,12 @@ func handleSignals(s *server.Server, configFile string, signals <-chan os.Signal
 			exit()
 		default:
 			stopping = true
+			var delay time.Duration
 			d := config.DefaultShutdownDrainDuration
 			if conf, err := config.Load(configFile); err == nil {
-				d = conf.ShutdownDrainDuration
+				delay, d = conf.ShutdownDrainDelay, conf.ShutdownDrainDuration
 			}
-			go s.Shutdown(d)
+			go s.Shutdown(delay, d)
 		}
 	}
 }

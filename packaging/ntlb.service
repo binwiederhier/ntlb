@@ -6,7 +6,8 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/bin/ntlb serve --config /etc/ntlb/config.yml
 ExecReload=/bin/kill -HUP $MAINPID
-# SIGTERM drains over shutdown-drain-duration (default 2m) before exiting: give it that plus a margin
+# SIGTERM withdraws for shutdown-drain-delay (default 0), then drains over shutdown-drain-duration
+# (default 2m) before exiting: give it both plus a margin
 TimeoutStopSec=5m
 KillMode=mixed
 # Every restart is a reconnect storm for all clients of this load balancer: back off if it

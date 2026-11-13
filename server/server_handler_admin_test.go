@@ -42,19 +42,14 @@ func TestAdmin_HealthAndReady(t *testing.T) {
 	require.JSONEq(t, `{"healthy":true}`, body)
 	code, body = adminDo(t, s, http.MethodGet, "/v1/ready", "")
 	require.Equal(t, http.StatusOK, code)
-	require.JSONEq(t, `{"ready":true,"draining":false}`, body)
+	require.JSONEq(t, `{"ready":true,"draining":false,"withdrawing":false}`, body)
 
 	// Not ready while draining, still healthy
-	code, _ = adminDo(t, s, http.MethodPost, "/v1/drain", `{"duration":"1h"}`)
-	require.Equal(t, http.StatusOK, code)
+	s.balancer.Drain(time.Hour)
 	code, body = adminDo(t, s, http.MethodGet, "/v1/ready", "")
 	require.Equal(t, http.StatusServiceUnavailable, code)
-	require.JSONEq(t, `{"ready":false,"draining":true}`, body)
+	require.JSONEq(t, `{"ready":false,"draining":true,"withdrawing":false}`, body)
 	code, _ = adminDo(t, s, http.MethodGet, "/v1/health", "")
-	require.Equal(t, http.StatusOK, code)
-	code, _ = adminDo(t, s, http.MethodDelete, "/v1/drain", "")
-	require.Equal(t, http.StatusOK, code)
-	code, _ = adminDo(t, s, http.MethodGet, "/v1/ready", "")
 	require.Equal(t, http.StatusOK, code)
 }
 
@@ -193,4 +188,16 @@ func TestAdmin_MetricsStreamsByProtocol(t *testing.T) {
 	_, body := adminDo(t, s, http.MethodGet, "/metrics", "")
 	require.Contains(t, body, `ntlb_streams{protocol="http1"} 1`)
 	require.Contains(t, body, `ntlb_streams{protocol="http2"} 1`)
+}
+
+func TestAdmin_NoLoadBalancerDrain(t *testing.T) {
+	// A load balancer leaves on SIGTERM only (withdraw, then drain, then exit), like ntfy: there
+	// is no drain of its own to start or end through the admin API
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "", app1)
+	for _, method := range []string{http.MethodPost, http.MethodDelete} {
+		status, _ := adminDo(t, s, method, "/v1/drain", "")
+		require.Equal(t, http.StatusNotFound, status, method)
+	}
+	require.True(t, s.balancer.Status().Ready)
 }

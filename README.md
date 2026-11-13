@@ -366,11 +366,10 @@ Flags go anywhere on the command line. The CLI finds the admin API from `--admin
 `listen-admin` in `--config` (default `/etc/ntlb/config.yml`).
 
 ```
-ntlb serve                              run (SIGHUP reloads, SIGTERM drains then exits)
+ntlb serve                              run (SIGHUP reloads; SIGTERM withdraws, drains, exits)
 ntlb check-config [-c FILE]             validate a config file
 ntlb status [--json]                    load balancer + upstream state, streams, counters
 ntlb reload                             re-read the config file
-ntlb drain [-d 10m] / undrain           drain the load balancer itself
 ntlb upstream drain NAME [-d 10m]       take a node out of rotation, close its streams over 10m
                                         (SITE/NAME if several sites have an upstream NAME)
 ntlb upstream undrain NAME              put it back
@@ -399,8 +398,7 @@ On `listen-admin` only (the public listeners proxy everything, including ntfy's 
 | `GET /v1/ready` | `{"ready":true,"draining":false}`; 200 if healthy and not draining, else 503 |
 | `GET /v1/status` | full status (JSON), what `ntlb status` shows |
 | `POST /v1/reload` | re-read the config; 400 with `{"error":...}` if it is invalid (nothing changes); `restart_required` lists changed settings that need a restart |
-| `POST /v1/drain`, `DELETE /v1/drain` | drain / undrain the load balancer; optional body `{"duration":"10m"}` |
-| `POST /v1/upstreams/{name}/drain`, `DELETE ...` | drain / undrain one upstream (`site%2Fname` if several sites have one of that name: 400 otherwise); same body |
+| `POST /v1/upstreams/{name}/drain`, `DELETE ...` | drain / undrain one upstream (`site%2Fname` if several sites have one of that name: 400 otherwise); optional body `{"duration":"10m"}` |
 | `GET /metrics` | Prometheus, see [docs/design.md](docs/design.md#metrics-servermetricsgo) |
 | `GET /debug/pprof/` | Go profiles |
 
@@ -409,9 +407,14 @@ On `listen-admin` only (the public listeners proxy everything, including ntfy's 
 - **Take a node out**: `ntlb upstream drain app3 -d 10m` on every load balancer (or remove it
   from the config and reload). Its clients move to their next node in hash order, about
   `streams / 600` per second.
-- **Take a load balancer out**: `ntlb drain -d 10m` (or `systemctl stop`, which uses
-  `shutdown-drain-duration`). `/v1/ready` fails right away; streams close evenly over the duration;
-  new subscriptions get 503 + `Connection: close`; publishes are served until the end.
+- **Take a load balancer out** (reboot, upgrade): `systemctl stop` (SIGTERM), in two phases like
+  ntfy's drain. Withdrawing for `shutdown-drain-delay`: `/v1/ready` fails, so the health check in
+  front (e.g. Route53, on `listen-health`) takes it out of DNS, but everything is still served,
+  since clients keep their cached address for up to the TTL. Then draining for
+  `shutdown-drain-duration`: streams close evenly, new subscriptions get 503 +
+  `Connection: close`, publishes are served until the end; then it exits. A second SIGTERM exits
+  right away. There is no drain command for the load balancer itself: like ntfy, it leaves on
+  SIGTERM only.
 - **Certificate renewal**: a certbot deploy hook that makes the new files readable for ntlb and
   runs `systemctl reload ntlb`, see
   [Running as a regular user](docs/configuration.md#running-as-a-regular-user-and-certificates). Unlike an nginx
@@ -419,7 +422,8 @@ On `listen-admin` only (the public listeners proxy everything, including ntfy's 
 - **Log rotation** (access logs, ban file): `postrotate systemctl reload ntlb`.
 - **Kernel**: Go listens with a backlog of `net.core.somaxconn`, so set that to 4096 or more
   (nginx used `backlog=4096`), and widen `net.ipv4.ip_local_port_range` for upstream connections.
-- **systemd**: `TimeoutStopSec` must exceed `shutdown-drain-duration` (the unit uses 5m).
+- **systemd**: `TimeoutStopSec` must exceed `shutdown-drain-delay` plus `shutdown-drain-duration`
+  (the unit uses 5m; raise it with a drop-in when you set a delay).
 
 ## nginx parity
 

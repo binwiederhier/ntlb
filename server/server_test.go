@@ -325,7 +325,7 @@ func startTestServer(t testing.TB, filename string) *Server {
 		s.Serve(ctx)
 	}()
 	t.Cleanup(func() {
-		s.Shutdown(0)
+		s.Shutdown(0, 0)
 		cancel()
 		<-done
 	})
@@ -474,7 +474,7 @@ func TestServer_DrainAndShutdown(t *testing.T) {
 	defer closeStream()
 	done := make(chan struct{})
 	go func() {
-		s.Shutdown(1500 * time.Millisecond)
+		s.Shutdown(0, 1500*time.Millisecond)
 		close(done)
 	}()
 	waitFor(t, func() bool {
@@ -741,7 +741,7 @@ func TestServer_ShutdownAfterContextCanceled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.Shutdown(100 * time.Millisecond)
+		s.Shutdown(0, 100*time.Millisecond)
 	}()
 	select {
 	case <-done:
@@ -814,7 +814,7 @@ func TestServer_NoReloadWhileShuttingDown(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.Shutdown(500 * time.Millisecond)
+		s.Shutdown(0, 500*time.Millisecond)
 	}()
 	waitFor(t, func() bool {
 		return s.balancer.Draining()

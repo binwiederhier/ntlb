@@ -66,11 +66,13 @@ var (
 type Config struct {
 	ListenAdmin           string        `yaml:"listen-admin"`    // Admin API, status, metrics, pprof; no auth
 	ListenMetrics         string        `yaml:"listen-metrics"`  // Only /metrics, e.g. for Prometheus on a private network
+	ListenHealth          string        `yaml:"listen-health"`   // Only /v1/ready, e.g. for Route53 health checks
 	ListenProfiler        string        `yaml:"listen-profiler"` // Only /debug/pprof/, e.g. on a private network
 	AccessLogs            []*AccessLog  `yaml:"access-logs"`     // For sites without their own, and requests no site serves
 	ClientKeepalive       *Keepalive    `yaml:"client-keepalive"`
 	DrainDuration         time.Duration `yaml:"drain-duration"`
 	ShutdownDrainDuration time.Duration `yaml:"shutdown-drain-duration"`
+	ShutdownDrainDelay    time.Duration `yaml:"shutdown-drain-delay"` // Withdrawing before the drain: not ready, still serving
 	ClientKey             *ClientKey    `yaml:"client-key"`
 	Bans                  *Bans         `yaml:"bans"`
 	Gzip                  *Gzip         `yaml:"gzip"`    // For sites without their own
@@ -143,7 +145,7 @@ func Parse(b []byte) (*Config, error) {
 }
 
 // RestartRequired returns the settings that differ between c and other but that a reload cannot
-// apply: the admin, metrics and profiler listeners, and the keepalives of the sites' listeners.
+// apply: the admin, metrics, health and profiler listeners, and the keepalives of the sites' listeners.
 // (A reload binds and closes the sites' listen addresses.)
 func (c *Config) RestartRequired(other *Config) []string {
 	var settings []string
@@ -152,6 +154,9 @@ func (c *Config) RestartRequired(other *Config) []string {
 	}
 	if c.ListenMetrics != other.ListenMetrics {
 		settings = append(settings, "listen-metrics")
+	}
+	if c.ListenHealth != other.ListenHealth {
+		settings = append(settings, "listen-health")
 	}
 	if c.ListenProfiler != other.ListenProfiler {
 		settings = append(settings, "listen-profiler")
@@ -240,7 +245,7 @@ func (c *Config) validate() error {
 	if err := c.ClientKeepalive.validate("client-keepalive"); err != nil {
 		return err
 	}
-	if c.DrainDuration < 0 || c.ShutdownDrainDuration < 0 {
+	if c.DrainDuration < 0 || c.ShutdownDrainDuration < 0 || c.ShutdownDrainDelay < 0 {
 		return errors.New("drain durations must not be negative")
 	}
 	if c.ClientKey.IPv4PrefixBits < 1 || c.ClientKey.IPv4PrefixBits > 32 {

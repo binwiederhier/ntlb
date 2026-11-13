@@ -374,12 +374,6 @@ func TestBalancer_StatusLoadBalancerDrain(t *testing.T) {
 	status = b.Status()
 	require.True(t, status.Drained)
 	require.NotNil(t, status.DrainDeadline)
-	b.Undrain()
-	status = b.Status()
-	require.False(t, status.Draining)
-	require.False(t, status.Drained)
-	require.Nil(t, status.DrainDeadline)
-	require.True(t, status.Ready)
 }
 
 func TestBalancer_PickExcludesDrainingAndUnhealthy(t *testing.T) {
@@ -736,7 +730,7 @@ func TestBalancer_ConcurrencyStress(t *testing.T) {
 		if i%2 == 0 {
 			b.Drain(time.Duration(i%4) * 10 * time.Millisecond)
 		} else {
-			b.Undrain()
+			b.Withdraw()
 		}
 		time.Sleep(2 * time.Millisecond)
 	})

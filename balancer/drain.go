@@ -46,12 +46,14 @@ func (b *Balancer) Drain(d time.Duration) {
 	b.drain = newDrainState(time.Now(), d, false)
 }
 
-// Undrain ends a drain of the load balancer
-func (b *Balancer) Undrain() {
+// Withdraw turns the load balancer unready while it still serves everything, new streams included:
+// whatever sends it clients (DNS health checks, a load balancer in front) takes it out first, and
+// clients that still have its address do not fail meanwhile. A drain ends it.
+func (b *Balancer) Withdraw() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	slog.Info("Undraining load balancer")
-	b.drain = nil
+	slog.Info("Withdrawing load balancer: not ready, still serving everything")
+	b.withdrawn = true
 }
 
 // Draining returns true if the load balancer is draining (or drained)

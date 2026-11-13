@@ -221,6 +221,30 @@ func TestHandleSignals_ShutdownDrainDurationReadAtStop(t *testing.T) {
 	waitServed(t, served)
 }
 
+func TestHandleSignals_ShutdownDrainDelay(t *testing.T) {
+	// With a delay, SIGTERM first withdraws (not ready, everything still served, new streams too),
+	// then drains over the duration: both read from the config file when the signal arrives
+	s, filename, served, closeStreams := startStreamingServer(t, "shutdown-drain-delay: 1s\nshutdown-drain-duration: 1h\n")
+	signals, _ := startSignalHandler(t, s, filename)
+	openStream(t, s)
+	start := time.Now()
+	signals <- syscall.SIGTERM
+	require.Eventually(t, func() bool {
+		return fetchStatus(t, s).Withdrawing
+	}, 5*time.Second, 10*time.Millisecond)
+	status := fetchStatus(t, s)
+	require.False(t, status.Ready)
+	require.False(t, status.Draining)
+	resp, err := http.Get("http://" + s.HTTPAddr() + "/othertopic/json")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode) // Still served while withdrawing
+	require.WithinDuration(t, start.Add(time.Second+time.Hour), waitDraining(t, s), 5*time.Second)
+	require.Less(t, time.Since(start), 5*time.Second)
+	closeStreams()
+	waitServed(t, served)
+}
+
 func TestHandleSignals_ShutdownDefaultDuration(t *testing.T) {
 	// If the config file became unreadable, the default shutdown-drain-duration applies
 	s, filename, served, closeStreams := startStreamingServer(t, "shutdown-drain-duration: 1h\n")

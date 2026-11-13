@@ -56,16 +56,6 @@ func (c *Client) Reload(ctx context.Context) ([]string, error) {
 	return resp.RestartRequired, nil
 }
 
-// Drain drains the load balancer over duration, or the config's drain-duration if empty
-func (c *Client) Drain(ctx context.Context, duration string) error {
-	return c.do(ctx, http.MethodPost, "/v1/drain", &server.DrainRequest{Duration: duration}, nil)
-}
-
-// Undrain ends a drain of the load balancer
-func (c *Client) Undrain(ctx context.Context) error {
-	return c.do(ctx, http.MethodDelete, "/v1/drain", nil, nil)
-}
-
 // DrainUpstream drains one upstream over duration, or the config's drain-duration if empty
 func (c *Client) DrainUpstream(ctx context.Context, name, duration string) error {
 	return c.do(ctx, http.MethodPost, "/v1/upstreams/"+url.PathEscape(name)+"/drain", &server.DrainRequest{Duration: duration}, nil)

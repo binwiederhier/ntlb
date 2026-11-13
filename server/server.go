@@ -34,6 +34,7 @@ const (
 	listenerAdmin    = "admin"
 	listenerMetrics  = "metrics"
 	listenerProfiler = "profiler"
+	listenerHealth   = "health"
 )
 
 var (
@@ -65,6 +66,7 @@ type Server struct {
 	admin       *http.Server
 	metricsSrv  *http.Server // listen-metrics, if set
 	profilerSrv *http.Server // listen-profiler, if set
+	healthSrv   *http.Server // listen-health, if set
 	listeners   map[string]net.Listener
 	serving     bool       // Serve started the servers; ones added later start right away
 	errChan     chan error // A listener that failed; Serve shuts down
@@ -138,10 +140,13 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.profilerSrv != nil {
 		go s.serve(listenerProfiler, s.profilerSrv, s.listeners[listenerProfiler], false)
 	}
+	if s.healthSrv != nil {
+		go s.serve(listenerHealth, s.healthSrv, s.listeners[listenerHealth], false)
+	}
 	s.mu.Unlock()
 	select {
 	case err := <-s.errChan:
-		s.Shutdown(0)
+		s.Shutdown(0, 0)
 		return err
 	case <-s.stopped:
 		return nil
@@ -197,12 +202,18 @@ func (s *Server) Reload() ([]string, error) {
 
 // Shutdown drains the load balancer over d (not ready right away, streams closed oldest first),
 // then closes the listeners and returns once every response finished or the grace period passed
-func (s *Server) Shutdown(d time.Duration) {
+func (s *Server) Shutdown(delay, d time.Duration) {
 	s.stopOnce.Do(func() {
-		slog.Info("Shutting down", "drain", d)
+		slog.Info("Shutting down", "delay", delay, "drain", d)
 		s.reloadMu.Lock() // Waits for a reload in progress
 		s.stopping = true
 		s.reloadMu.Unlock()
+		if delay > 0 {
+			// Withdrawing, like ntfy's drain delay: not ready, so the health checks in front take
+			// the load balancer out, but still serving everything to clients that have its address
+			s.balancer.Withdraw()
+			time.Sleep(delay)
+		}
 		s.balancer.Drain(d)
 		ctx, cancel := context.WithTimeout(context.Background(), d+drainTickSlack)
 		defer cancel()
@@ -223,6 +234,9 @@ func (s *Server) Shutdown(d time.Duration) {
 		}
 		if s.profilerSrv != nil {
 			servers = append(servers, s.profilerSrv)
+		}
+		if s.healthSrv != nil {
+			servers = append(servers, s.healthSrv)
 		}
 		s.mu.Lock()
 		for _, ps := range s.public {

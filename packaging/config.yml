@@ -44,8 +44,14 @@ client-keepalive:
   interval: 15s
   count: 4
 
-drain-duration: 5m           # Default for "drain" commands and for servers removed from this file
+drain-duration: 5m           # Default for "upstream drain" and for servers removed from this file
 shutdown-drain-duration: 2m  # SIGTERM: not ready right away, streams closed over this long
+
+# Behind a health-checked DNS name (Route53) or another load balancer: on SIGTERM, first withdraw
+# (not ready, still serving everything) for the check's detection time plus the DNS TTL, so new
+# clients go elsewhere before the drain closes streams. The check polls listen-health's /v1/ready.
+#shutdown-drain-delay: 5m
+#listen-health: ":8081"
 
 # What identifies a client for sticky routing, rate limits and bans: its IP, shortened to a prefix
 # (like ntfy's visitor-prefix-bits-ipv4/-ipv6, so a client's limits stay on one node). Changing

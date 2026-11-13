@@ -138,6 +138,11 @@ func TestParse_Invalid(t *testing.T) {
 			errMsg: "invalid config",
 		},
 		{
+			name:   "negative shutdown drain delay",
+			config: "shutdown-drain-delay: -1s\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
+			errMsg: "drain durations must not be negative",
+		},
+		{
 			name:   "negative shutdown drain",
 			config: "shutdown-drain-duration: -1s\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
 			errMsg: "drain durations must not be negative",
@@ -418,6 +423,7 @@ func TestLoad_PackagingExample(t *testing.T) {
 	require.Equal(t, ListenAddrs{":443"}, c.Sites[0].ListenHTTPS)
 	require.Equal(t, DefaultListenAdmin, c.ListenAdmin)
 	require.Equal(t, DefaultShutdownDrainDuration, c.ShutdownDrainDuration)
+	require.Zero(t, c.ShutdownDrainDelay) // Nothing withdraws this load balancer from its clients by default
 	require.Len(t, c.Sites, 1)
 	require.Len(t, c.Sites[0].DefaultUpstream().Servers, 3)
 
@@ -525,6 +531,11 @@ func TestRestartRequired_Each(t *testing.T) {
 			name:     "listen-metrics",
 			config:   "listen-metrics: '10.0.0.1:9090'\n",
 			settings: []string{"listen-metrics"},
+		},
+		{
+			name:     "listen-health",
+			config:   "listen-health: ':8081'\n",
+			settings: []string{"listen-health"},
 		},
 		{
 			name:     "listen-profiler",

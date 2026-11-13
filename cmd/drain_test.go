@@ -13,20 +13,6 @@ import (
 	"heckel.io/ntlb/config"
 )
 
-func TestDrainUndrain(t *testing.T) {
-	s, _ := newTestServer(t, "app1")
-	_, err := run(t, s, "drain", "--duration", "1h")
-	require.NoError(t, err)
-	out, err := run(t, s, "status")
-	require.NoError(t, err)
-	require.Contains(t, out, "draining")
-	_, err = run(t, s, "undrain")
-	require.NoError(t, err)
-	out, err = run(t, s, "status")
-	require.NoError(t, err)
-	require.NotContains(t, out, "draining")
-}
-
 func TestUpstreamDrainUndrain(t *testing.T) {
 	s, _ := newTestServer(t, "app1", "app2")
 	_, err := run(t, s, "upstream", "drain", "app2", "--duration", "30m")
@@ -74,27 +60,10 @@ func TestCheckConfig(t *testing.T) {
 	require.ErrorContains(t, app.Run(context.Background(), []string{"ntlb", "check-config", "--config", filename}), "at least one site")
 }
 
-func TestDrain_Duration(t *testing.T) {
-	f := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
-	out, err := runApp("--admin-url", f.srv.URL, "drain", "-d", "10m")
-	require.NoError(t, err)
-	require.Equal(t, "Draining the load balancer\n", out)
-	require.Equal(t, http.MethodPost, f.method)
-	require.Equal(t, "/v1/drain", f.path)
-	require.JSONEq(t, `{"duration":"10m"}`, f.body)
-
-	// A new app does not remember the last run's flags
-	_, err = runApp("--admin-url", f.srv.URL, "drain")
-	require.NoError(t, err)
-	require.JSONEq(t, `{}`, f.body)
-}
-
 func TestDrain_InvalidDuration(t *testing.T) {
 	s, _ := newTestServer(t, "app1")
 	for _, d := range []string{"abc", "-5m", "10"} {
-		_, err := run(t, s, "drain", "-d", d)
-		require.EqualError(t, err, `invalid duration "`+d+`"`)
-		_, err = run(t, s, "upstream", "drain", "app1", "-d", d)
+		_, err := run(t, s, "upstream", "drain", "app1", "-d", d)
 		require.EqualError(t, err, `invalid duration "`+d+`"`)
 	}
 	out, err := run(t, s, "status")
@@ -105,19 +74,18 @@ func TestDrain_InvalidDuration(t *testing.T) {
 
 func TestDrain_DefaultDurationFromConfig(t *testing.T) {
 	s, _ := newTestServer(t, "app1")
-	_, err := run(t, s, "drain")
+	_, err := run(t, s, "upstream", "drain", "app1")
 	require.NoError(t, err)
 	out, err := run(t, s, "status", "--json")
 	require.NoError(t, err)
 	status := &balancer.Status{}
 	require.NoError(t, json.Unmarshal([]byte(out), status))
-	require.True(t, status.Draining)
-	require.WithinDuration(t, time.Now().Add(config.DefaultDrainDuration), *status.DrainDeadline, 10*time.Second)
+	require.WithinDuration(t, time.Now().Add(config.DefaultDrainDuration), *status.Upstreams[0].DrainDeadline, 10*time.Second)
 }
 
 func TestDrain_Error(t *testing.T) {
 	f := newFakeAdmin(t, http.StatusInternalServerError, `{"error":"boom"}`)
-	for _, args := range [][]string{{"drain"}, {"undrain"}, {"reload"}, {"upstream", "drain", "a"}, {"upstream", "undrain", "a"}} {
+	for _, args := range [][]string{{"reload"}, {"upstream", "drain", "a"}, {"upstream", "undrain", "a"}} {
 		out, err := runApp(append([]string{"--admin-url", f.srv.URL}, args...)...)
 		require.EqualError(t, err, "boom", args)
 		require.Empty(t, out)
@@ -150,4 +118,11 @@ func TestUpstreamUndrain_Unknown(t *testing.T) {
 	s, _ := newTestServer(t, "app1")
 	_, err := run(t, s, "upstream", "undrain", "nope")
 	require.EqualError(t, err, "upstream not found")
+}
+
+func TestNoLoadBalancerDrainCommand(t *testing.T) {
+	// SIGTERM is the way to take a load balancer out; only upstreams have drain commands
+	for _, c := range New().Commands {
+		require.NotContains(t, []string{"drain", "undrain"}, c.Name)
+	}
 }

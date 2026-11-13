@@ -188,27 +188,6 @@ func TestBalancer_DrainUpstreamZeroClosesAllOnNextTick(t *testing.T) {
 	require.Equal(t, StateDrained, b.Status().Upstreams[0].State)
 }
 
-func TestBalancer_UndrainMidDrainKeepsRemainingStreams(t *testing.T) {
-	app1 := newTestUpstream(t, "app1")
-	b := newTestBalancer(t, app1)
-	var sessions []*testSession
-	for i := 0; i < 10; i++ {
-		sessions = append(sessions, newTestSession(b, "app1"))
-	}
-	start := time.Now()
-	b.Drain(10 * time.Second)
-	b.drainTick(start.Add(5 * time.Second))
-	closed := countCanceled(sessions)
-	require.InDelta(t, 5, closed, 1)
-	b.Undrain()
-	for sec := 6; sec <= 30; sec++ {
-		b.drainTick(start.Add(time.Duration(sec) * time.Second))
-	}
-	require.Equal(t, closed, countCanceled(sessions))
-	require.True(t, b.Status().Ready)
-	require.False(t, b.Draining())
-}
-
 func TestBalancer_UndrainUpstreamMidDrainKeepsRemainingStreams(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	b := newTestBalancer(t, app1)
@@ -262,7 +241,7 @@ func TestBalancer_RedrainWithDifferentDuration(t *testing.T) {
 	require.False(t, b.Drained())
 
 	// Same for an upstream
-	b.Undrain()
+	b = newTestBalancer(t, app1)
 	s := newTestSession(b, "app1")
 	require.NoError(t, b.DrainUpstream("app1", 100*time.Second))
 	require.NoError(t, b.DrainUpstream("app1", time.Second))
@@ -273,7 +252,7 @@ func TestBalancer_RedrainWithDifferentDuration(t *testing.T) {
 
 func TestBalancer_UpstreamDrainWaitsForLoadBalancerDrain(t *testing.T) {
 	// While the load balancer drains, it closes all streams at its own pace; the upstream drains
-	// wait, and catch up once it is undrained
+	// wait rather than closing their streams on top
 	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
 	b := newTestBalancer(t, app1, app2)
 	var sessions1, sessions2 []*testSession
@@ -293,15 +272,6 @@ func TestBalancer_UpstreamDrainWaitsForLoadBalancerDrain(t *testing.T) {
 	require.Equal(t, 2, countCanceled(sessions2))
 	require.Equal(t, StateDraining, b.Status().Upstreams[0].State)
 
-	// app1's drain is past its deadline: the next tick closes the rest of it
-	b.Undrain()
-	b.drainTick(start.Add(21 * time.Second))
-	require.Equal(t, 10, countCanceled(sessions1))
-	require.Equal(t, 2, countCanceled(sessions2))
-	for _, s := range sessions1 {
-		b.Close(s.Session)
-	}
-	require.Equal(t, StateDrained, b.Status().Upstreams[0].State)
 }
 
 func TestBalancer_DrainSkipsCanceledSessions(t *testing.T) {
@@ -547,9 +517,6 @@ func TestBalancer_Drain(t *testing.T) {
 	b.drainTick(start.Add(11 * time.Second))
 	require.Equal(t, 10, countCanceled(sessions))
 	require.True(t, b.Drained())
-	b.Undrain()
-	require.True(t, b.Status().Ready)
-	require.False(t, b.Drained())
 }
 
 func TestBalancer_Draining(t *testing.T) {
@@ -563,13 +530,9 @@ func TestBalancer_Draining(t *testing.T) {
 	b.drainTick(time.Now().Add(2 * time.Second))
 	require.True(t, b.Draining())
 	require.True(t, b.Drained())
-	b.Undrain()
-	require.False(t, b.Draining())
-	require.False(t, b.Drained())
-	b.Undrain() // Undraining when not draining is fine
-	require.False(t, b.Draining())
 
 	// An upstream drain is not a load balancer drain
+	b = newTestBalancer(t, app1)
 	require.NoError(t, b.DrainUpstream("app1", time.Second))
 	require.False(t, b.Draining())
 }

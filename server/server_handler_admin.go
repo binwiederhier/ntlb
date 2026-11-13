@@ -16,11 +16,9 @@ import (
 // Admin API, served on the admin listener only (keep it on localhost or a private address):
 //
 //	GET    /v1/health                    200 if at least one upstream is healthy, else 503
-//	GET    /v1/ready                     200 if healthy and not draining, else 503
+//	GET    /v1/ready                     200 if healthy and neither withdrawing nor draining, else 503
 //	GET    /v1/status                    the full balancer.Status
 //	POST   /v1/reload                    re-read the config file (like SIGHUP)
-//	POST   /v1/drain                     drain the load balancer, body {"duration":"5m"} (optional)
-//	DELETE /v1/drain                     undrain it
 //	POST   /v1/upstreams/{name}/drain    drain an upstream ("site%2Fname", or the name if only one
 //	                                     site has it), body {"duration":"5m"} (optional)
 //	DELETE /v1/upstreams/{name}/drain    undrain it
@@ -31,7 +29,6 @@ const (
 	apiReadyPath           = "/v1/ready"
 	apiStatusPath          = "/v1/status"
 	apiReloadPath          = "/v1/reload"
-	apiDrainPath           = "/v1/drain"
 	apiUpstreamDrainPath   = "/v1/upstreams/{name}/drain"
 	apiMetricsPath         = "/metrics"
 	apiPprofPath           = "/debug/pprof/"
@@ -52,8 +49,9 @@ type ReloadResponse struct {
 
 // ReadyResponse is the response to /v1/ready
 type ReadyResponse struct {
-	Ready    bool `json:"ready"`
-	Draining bool `json:"draining"`
+	Ready       bool `json:"ready"`
+	Draining    bool `json:"draining"`
+	Withdrawing bool `json:"withdrawing"`
 }
 
 // DrainRequest is the optional body of the drain calls; without a duration, the config's
@@ -87,8 +85,6 @@ func (s *Server) adminHandler() http.Handler {
 	mux.HandleFunc("GET "+apiReadyPath, s.handleAdmin(s.handleReady))
 	mux.HandleFunc("GET "+apiStatusPath, s.handleAdmin(s.handleStatus))
 	mux.HandleFunc("POST "+apiReloadPath, s.handleAdmin(s.handleReload))
-	mux.HandleFunc("POST "+apiDrainPath, s.handleAdmin(s.handleDrain))
-	mux.HandleFunc("DELETE "+apiDrainPath, s.handleAdmin(s.handleUndrain))
 	mux.HandleFunc("POST "+apiUpstreamDrainPath, s.handleAdmin(s.handleUpstreamDrain))
 	mux.HandleFunc("DELETE "+apiUpstreamDrainPath, s.handleAdmin(s.handleUpstreamUndrain))
 	mux.Handle("GET "+apiMetricsPath, promhttp.HandlerFor(s.metrics.registry, promhttp.HandlerOpts{}))
@@ -117,7 +113,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) error {
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) error {
 	status := s.balancer.Status()
-	return writeJSON(w, statusFor(status.Ready), &ReadyResponse{Ready: status.Ready, Draining: status.Draining})
+	return writeJSON(w, statusFor(status.Ready), &ReadyResponse{
+		Ready:       status.Ready,
+		Draining:    status.Draining,
+		Withdrawing: status.Withdrawing,
+	})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) error {
@@ -130,20 +130,6 @@ func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) error {
 		return &adminError{status: http.StatusBadRequest, err: err}
 	}
 	return writeJSON(w, http.StatusOK, &ReloadResponse{Success: true, RestartRequired: restart})
-}
-
-func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) error {
-	d, err := s.readDrainDuration(r)
-	if err != nil {
-		return err
-	}
-	s.balancer.Drain(d)
-	return writeJSON(w, http.StatusOK, &SuccessResponse{Success: true})
-}
-
-func (s *Server) handleUndrain(w http.ResponseWriter, _ *http.Request) error {
-	s.balancer.Undrain()
-	return writeJSON(w, http.StatusOK, &SuccessResponse{Success: true})
 }
 
 func (s *Server) handleUpstreamDrain(w http.ResponseWriter, r *http.Request) error {

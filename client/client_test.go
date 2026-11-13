@@ -76,28 +76,6 @@ func TestClient_Reload_RestartRequired(t *testing.T) {
 	require.Equal(t, []string{"listen-http", "client-keepalive"}, restart)
 }
 
-func TestClient_Drain(t *testing.T) {
-	c, rec := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
-	require.NoError(t, c.Drain(context.Background(), "10m"))
-	require.Equal(t, http.MethodPost, rec.method)
-	require.Equal(t, "/v1/drain", rec.uri)
-	require.JSONEq(t, `{"duration":"10m"}`, rec.body)
-}
-
-func TestClient_Drain_DefaultDuration(t *testing.T) {
-	c, rec := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
-	require.NoError(t, c.Drain(context.Background(), ""))
-	require.JSONEq(t, `{}`, rec.body)
-}
-
-func TestClient_Undrain(t *testing.T) {
-	c, rec := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
-	require.NoError(t, c.Undrain(context.Background()))
-	require.Equal(t, http.MethodDelete, rec.method)
-	require.Equal(t, "/v1/drain", rec.uri)
-	require.Empty(t, rec.body)
-}
-
 func TestClient_DrainUpstream(t *testing.T) {
 	c, rec := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
 	require.NoError(t, c.DrainUpstream(context.Background(), "app1", "30s"))
@@ -132,20 +110,18 @@ func TestClient_ErrorJSON(t *testing.T) {
 	require.EqualError(t, err, "upstream not found")
 	_, err = c.Status(context.Background())
 	require.EqualError(t, err, "upstream not found")
-	require.EqualError(t, c.Drain(context.Background(), ""), "upstream not found")
-	require.EqualError(t, c.Undrain(context.Background()), "upstream not found")
 	require.EqualError(t, c.UndrainUpstream(context.Background(), "nope"), "upstream not found")
 }
 
 func TestClient_ErrorNotJSON(t *testing.T) {
 	c, _ := newFakeAdmin(t, http.StatusBadGateway, "bad gateway\n")
-	err := c.Undrain(context.Background())
+	err := c.UndrainUpstream(context.Background(), "app1")
 	require.EqualError(t, err, "unexpected status 502: bad gateway")
 }
 
 func TestClient_ErrorJSONWithoutMessage(t *testing.T) {
 	c, _ := newFakeAdmin(t, http.StatusInternalServerError, `{"success":false}`)
-	err := c.Undrain(context.Background())
+	err := c.UndrainUpstream(context.Background(), "app1")
 	require.EqualError(t, err, `unexpected status 500: {"success":false}`)
 }
 
@@ -158,7 +134,7 @@ func TestClient_ErrorEmptyBody(t *testing.T) {
 func TestClient_NonOKSuccessStatus(t *testing.T) {
 	// Only 200 counts as success, even a 2xx with a valid body
 	c, _ := newFakeAdmin(t, http.StatusAccepted, `{"success":true}`)
-	err := c.Undrain(context.Background())
+	err := c.UndrainUpstream(context.Background(), "app1")
 	require.EqualError(t, err, `unexpected status 202: {"success":true}`)
 }
 
@@ -209,7 +185,7 @@ func TestClient_ContextCanceledBefore(t *testing.T) {
 	c, rec := newFakeAdmin(t, http.StatusOK, `{"success":true}`)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := c.Undrain(ctx)
+	err := c.UndrainUpstream(ctx, "app1")
 	require.ErrorIs(t, err, context.Canceled)
 	require.Empty(t, rec.method)
 }

@@ -17,26 +17,6 @@ func newReloadCommand() *cli.Command {
 	}
 }
 
-func newDrainCommand() *cli.Command {
-	return &cli.Command{
-		Name:  "drain",
-		Usage: "Drain the load balancer: turn unready and close all streams, oldest first",
-		Description: `Makes /v1/ready fail right away, then closes the open streams a few at a time, so that
-the last one closes after --duration. New requests are still served until then, and turned away
-with 503 after. "ntlb undrain" ends it.`,
-		Flags:  []cli.Flag{newDurationFlag()},
-		Action: execDrain,
-	}
-}
-
-func newUndrainCommand() *cli.Command {
-	return &cli.Command{
-		Name:   "undrain",
-		Usage:  "End a drain of the load balancer",
-		Action: execUndrain,
-	}
-}
-
 func newUpstreamCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "upstream",
@@ -72,22 +52,6 @@ func execReload(ctx context.Context, cmd *cli.Command) error {
 		return nil
 	}
 	fmt.Fprintln(cmd.Root().Writer, "Config reloaded")
-	return nil
-}
-
-func execDrain(ctx context.Context, cmd *cli.Command) error {
-	if err := newClient(cmd).Drain(ctx, cmd.String(flagDuration)); err != nil {
-		return err
-	}
-	fmt.Fprintln(cmd.Root().Writer, "Draining the load balancer")
-	return nil
-}
-
-func execUndrain(ctx context.Context, cmd *cli.Command) error {
-	if err := newClient(cmd).Undrain(ctx); err != nil {
-		return err
-	}
-	fmt.Fprintln(cmd.Root().Writer, "Load balancer undrained")
 	return nil
 }
 

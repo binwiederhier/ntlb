@@ -36,9 +36,10 @@ type Balancer struct {
 	sessions  map[uint64]*Session
 	nextID    uint64
 	drain     *drainState // Draining the load balancer itself
+	withdrawn bool        // Not ready, but serving everything (before a shutdown's drain)
 	turns     sync.Map    // Pool ID (config.Upstream.ID) -> *atomic.Uint64, the next turn of round-robin and least-conn
 	client    *http.Client
-	mu        sync.RWMutex // Protects config, upstreams, order, sessions, nextID, drain, and each Upstream's removed and drain
+	mu        sync.RWMutex // Protects config, upstreams, order, sessions, nextID, drain, withdrawn, and each Upstream's removed and drain
 }
 
 // Upstream is one backend node and its addresses. Several addresses (usually one node's ports) let
@@ -328,10 +329,11 @@ func (b *Balancer) Status() *Status {
 	now := time.Now()
 	healthy := b.healthyNoLock()
 	status := &Status{
-		Healthy:  healthy,
-		Ready:    healthy && b.drain == nil,
-		Draining: b.drain != nil,
-		Streams:  len(b.sessions),
+		Healthy:     healthy,
+		Ready:       healthy && b.drain == nil && !b.withdrawn,
+		Withdrawing: b.withdrawn && b.drain == nil,
+		Draining:    b.drain != nil,
+		Streams:     len(b.sessions),
 	}
 	if b.drain != nil {
 		status.Drained = b.drain.finished
