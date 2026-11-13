@@ -25,13 +25,13 @@ does (deployment, behavior, the flows as an operator sees them) is in
 
 About 7,300 lines of Go without tests. In this order, each step builds on the one before:
 
-1. `config/config.go`, `config/sites.go`, `config/rules.go`: the types everything else consumes.
+1. `config/config.go`, `config/sites.go`, `config/upstreams.go`, `config/rules.go`: the types everything else consumes.
    Skim the structs and their comments; the validation can wait.
 2. `server/server.go`: `New`, `Serve`, `Reload`, `Shutdown`, and above all `observe`, the handler
    every public request enters.
-3. `server/proxy.go`: `proxy.ServeHTTP` (the part after the rules) and `proxy.RoundTrip` (picking
-   and retrying upstreams).
-4. `balancer/service.go`: `Pick`, then the session calls `NewSession`, `Reserve`, `Attach`, `Close`.
+3. `server/proxy.go`: `proxy.ServeHTTP` (the part after the rules), then `proxy.RoundTrip` and
+   `tryUpstreams` (picking and retrying upstreams).
+4. `balancer/service.go`: `Pick`; `balancer/session.go`: `NewSession`, `Reserve`, `Attach`, `Close`.
 5. `server/stream.go`: the separate path for subscriptions.
 6. `rules/service.go` and `match/match.go`: rules and the expression language.
 7. `balancer/health.go`, `balancer/drain.go`: the two background loops.
@@ -43,11 +43,11 @@ About 7,300 lines of Go without tests. In this order, each step builds on the on
 | `main` | `main.go` | Calls `cmd.New().Run`. Nothing else. |
 | `cmd` | `app.go`, `serve.go`, `status.go`, `drain.go` | The CLI (urfave/cli v3): `serve` runs a `server.Server` and handles signals; `check-config` loads a config; `status`, `reload`, `drain`, `undrain`, `upstream drain/undrain` talk to the admin API through `client`. |
 | `client` | `client.go` | HTTP client for the admin API, used by the CLI. Shares the response types with `server` and `balancer`. |
-| `server` | `server.go` and 15 more | Everything HTTP: the listeners, `observe` (site, validation, rules, logs, metrics), the reverse proxy and its retries (`proxy.go`), the stream path (`stream.go`), answers by rules (`rules.go`), error pages, gzip, access logs, certificates, metrics, the admin API. |
-| `balancer` | `service.go`, `strategy.go`, `hash.go`, `health.go`, `drain.go`, `types.go` | The state of the upstreams: which are healthy, which are draining, the open sessions, and the order to try them in. No HTTP serving, only the health probes. |
+| `server` | `server.go` and 16 more | Everything HTTP: `observe` (site, validation, rules, logs, metrics), the listeners (`listeners.go`), the reverse proxy and its retries (`proxy.go`), the stream path (`stream.go`), the body and connection wrappers that bound reads and writes (`wrappers.go`), answers by rules (`rules.go`), error pages, gzip, access logs, certificates, metrics, the admin API. |
+| `balancer` | `service.go`, `session.go`, `strategy.go`, `hash.go`, `health.go`, `drain.go`, `types.go` | The state of the upstreams: which are healthy, which are draining, the open sessions, and the order to try them in. No HTTP serving, only the health probes. |
 | `rules` | `service.go`, `bans.go` | The rule engine: checks a request against the rules, keeps the token buckets of `limit` rules and the strikes towards bans. |
 | `match` | `match.go` | The expression language (on [expr](https://expr-lang.org)): compiles `match:` and `location:` strings, evaluates them against a request (`Env`) or an outcome (`ResponseEnv`). |
-| `config` | `config.go`, `sites.go`, `rules.go`, `errorpages.go` | Parses the YAML (and included files), applies defaults, validates, compiles the expressions, indexes the sites by listener and host. A `*config.Config` is immutable once loaded. |
+| `config` | `config.go`, `sites.go`, `upstreams.go`, `rules.go`, `errorpages.go` | Parses the YAML (and included files), applies defaults, validates, compiles the expressions, indexes the sites by listener and host. A `*config.Config` is immutable once loaded. |
 | `lab/replay` | `main.go` | Not part of the binary: sends the same requests to ntlb and nginx and compares the answers. |
 
 How they import each other (arrows point at the imported package). `config` and `match` are
@@ -306,7 +306,9 @@ sequenceDiagram
     O->>O: deferred pr.finish(): access log, CheckResponse, metrics
 ```
 
-What `RoundTrip` retries mirrors nginx's `proxy_next_upstream error timeout http_503`:
+What is retried mirrors nginx's `proxy_next_upstream error timeout http_503`. One loop,
+`tryUpstreams`, decides it for both the reverse proxy (`RoundTrip`) and the stream path
+(`connectStream`):
 
 | Failure | Retried? |
 |---|---|

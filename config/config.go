@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -99,15 +98,6 @@ type Keepalive struct {
 	Count    int           `yaml:"count"`
 }
 
-// HealthCheck configures the active health checks against every upstream
-type HealthCheck struct {
-	Path     string        `yaml:"path"`
-	Interval time.Duration `yaml:"interval"`
-	Timeout  time.Duration `yaml:"timeout"`
-	Fails    int           `yaml:"fails"`
-	Passes   int           `yaml:"passes"`
-}
-
 // Streams decides which requests are long-lived streams (a request expression; bodyless requests
 // only). Streams take the lean stream path, a draining load balancer turns new ones away, and
 // drains close them at a pace. The default is ntfy's subscriptions; "false" turns it off.
@@ -135,33 +125,6 @@ type Bans struct {
 // gzip with gzip_proxied any
 type Gzip struct {
 	Types []string `yaml:"types"` // Media types without parameters, e.g. text/html
-}
-
-// Upstream is a site's backend servers and how requests reach them, like nginx's upstream block
-// and its proxy_*_timeout settings
-type Upstream struct {
-	Name        string       `yaml:"-"`           // Its key in the site's upstreams
-	Balance     string       `yaml:"balance"`     // round-robin (default), least-conn, random-two or hash
-	Timeouts    *Timeouts    `yaml:"timeouts"`    //
-	Keepalive   *Keepalive   `yaml:"keepalive"`   // TCP keepalive towards the servers
-	HealthCheck *HealthCheck `yaml:"healthcheck"` // Active health checks against every server
-	Servers     []*Server    `yaml:"servers"`     // Server names are per site
-}
-
-// Timeouts bound the connections to a site's servers
-type Timeouts struct {
-	Connect time.Duration `yaml:"connect"` // An address that does not accept within this is down for the request
-	Read    time.Duration `yaml:"read"`    // Cut a response (or a WebSocket) after this long without a byte
-}
-
-// Server is one backend node. The name, not the address, is what clients are hashed to, so every
-// load balancer must use the same names for the same nodes to route a client the same way. An
-// address may be a port range ("10.0.0.1:2586-2589"), one address per port.
-type Server struct {
-	Name      string   `yaml:"name"`
-	Addresses []string `yaml:"addresses"`
-	Weight    int      `yaml:"weight"` // Its share relative to the others, 1 (default) to maxWeight
-	Backup    bool     `yaml:"backup"` // Only used if no other server is healthy, and as their last retries
 }
 
 // Load reads, defaults and validates a config file and the site files it includes
@@ -369,53 +332,6 @@ func validateBans(b *Bans) error {
 	return nil
 }
 
-// expandAddresses checks host:port addresses and expands port ranges (host:from-to)
-func expandAddresses(addresses []string) ([]string, error) {
-	var expanded []string
-	seen := make(map[string]bool)
-	for _, addr := range addresses {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil || host == "" || port == "" {
-			return nil, fmt.Errorf("invalid address %q, expected host:port or host:from-to", addr)
-		}
-		from, to, isRange := strings.Cut(port, "-")
-		if !isRange {
-			to = from
-		}
-		first, last, err := parsePortRange(from, to)
-		if err != nil {
-			return nil, fmt.Errorf("invalid address %q, expected host:port or host:from-to", addr)
-		}
-		for p := first; p <= last; p++ {
-			a := net.JoinHostPort(host, strconv.Itoa(p))
-			if !isRange {
-				a = addr // As written, e.g. a hostname
-			}
-			if seen[a] {
-				return nil, fmt.Errorf("duplicate address %s", a)
-			}
-			seen[a] = true
-			expanded = append(expanded, a)
-		}
-	}
-	return expanded, nil
-}
-
-// parsePortRange parses the first and last port of a range, at most maxPortRange ports
-func parsePortRange(from, to string) (int, int, error) {
-	first, err := strconv.Atoi(from)
-	if err != nil {
-		return 0, 0, err
-	}
-	last, err := strconv.Atoi(to)
-	if err != nil {
-		return 0, 0, err
-	} else if first < 1 || last > 65535 || last < first || last-first >= maxPortRange {
-		return 0, 0, errors.New("invalid port range")
-	}
-	return first, last, nil
-}
-
 func (k *Keepalive) applyDefaults() {
 	if k.Idle == 0 {
 		k.Idle = DefaultKeepaliveIdle
@@ -436,40 +352,6 @@ func (k *Keepalive) validate(section string) error {
 		return fmt.Errorf("%s.interval must be positive", section)
 	} else if k.Count <= 0 {
 		return fmt.Errorf("%s.count must be positive", section)
-	}
-	return nil
-}
-
-func (h *HealthCheck) applyDefaults() {
-	if h.Path == "" {
-		h.Path = DefaultHealthPath
-	}
-	if h.Interval == 0 {
-		h.Interval = DefaultHealthInterval
-	}
-	if h.Timeout == 0 {
-		h.Timeout = DefaultHealthTimeout
-	}
-	if h.Fails == 0 {
-		h.Fails = DefaultHealthFails
-	}
-	if h.Passes == 0 {
-		h.Passes = DefaultHealthPasses
-	}
-}
-
-// validate checks the values after defaulting. A non-positive interval would probe in a tight loop.
-func (h *HealthCheck) validate(section string) error {
-	if h.Interval <= 0 {
-		return fmt.Errorf("%s.interval must be positive", section)
-	} else if h.Timeout <= 0 {
-		return fmt.Errorf("%s.timeout must be positive", section)
-	} else if h.Timeout >= h.Interval {
-		return fmt.Errorf("%s.timeout must be shorter than its interval", section)
-	} else if h.Fails <= 0 {
-		return fmt.Errorf("%s.fails must be positive", section)
-	} else if h.Passes <= 0 {
-		return fmt.Errorf("%s.passes must be positive", section)
 	}
 	return nil
 }

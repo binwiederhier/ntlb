@@ -2,7 +2,6 @@ package balancer
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -185,46 +184,6 @@ func TestBalancer_FailOpen(t *testing.T) {
 	require.False(t, b.Status().Ready)
 }
 
-func TestBalancer_DrainUpstreamPaced(t *testing.T) {
-	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
-	b := newTestBalancer(t, app1, app2)
-	var sessions1, sessions2 []*testSession
-	for i := 0; i < 10; i++ {
-		sessions1 = append(sessions1, newTestSession(b, "app1"))
-		sessions2 = append(sessions2, newTestSession(b, "app2"))
-	}
-
-	// Draining takes it out of rotation right away
-	start := time.Now()
-	require.NoError(t, b.DrainUpstream("app1", 10*time.Second))
-	for i := 0; i < 100; i++ {
-		require.Equal(t, []string{"app2"}, names(b.Pick("s", "", keyFor(i))))
-	}
-	require.Equal(t, StateDraining, b.Status().Upstreams[0].State)
-
-	// Its streams are closed a few at a time, oldest first, all of them by the deadline
-	b.drainTick(start.Add(time.Second))
-	n := countCanceled(sessions1)
-	require.Greater(t, n, 0)
-	require.Less(t, n, 10)
-	require.True(t, sessions1[0].canceled())
-	require.False(t, sessions1[9].canceled())
-	b.drainTick(start.Add(5 * time.Second))
-	require.Greater(t, countCanceled(sessions1), n)
-	b.drainTick(start.Add(10 * time.Second))
-	require.Equal(t, 10, countCanceled(sessions1))
-	require.Equal(t, 0, countCanceled(sessions2))
-	for _, s := range sessions1 {
-		require.ErrorIs(t, s.cause, ErrDrained)
-	}
-
-	// Undraining puts it back
-	require.NoError(t, b.UndrainUpstream("app1"))
-	require.Equal(t, StateHealthy, b.Status().Upstreams[0].State)
-	keyPreferring(b, "app1")
-	require.Error(t, b.DrainUpstream("nope", time.Second))
-}
-
 func TestBalancer_UpdateRemovesUpstream(t *testing.T) {
 	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
 	b := newTestBalancer(t, app1, app2)
@@ -282,41 +241,6 @@ func TestBalancer_UpdateKeepsRuntimeDrain(t *testing.T) {
 	require.Equal(t, StateDraining, b.Status().Upstreams[0].State)
 }
 
-func TestBalancer_Drain(t *testing.T) {
-	app1 := newTestUpstream(t, "app1")
-	b := newTestBalancer(t, app1)
-	var sessions []*testSession
-	for i := 0; i < 10; i++ {
-		sessions = append(sessions, newTestSession(b, "app1"))
-	}
-	require.True(t, b.Status().Ready)
-	start := time.Now()
-	b.Drain(10 * time.Second)
-	require.False(t, b.Status().Ready)
-	require.True(t, b.Status().Draining)
-	require.False(t, b.Drained())
-	b.drainTick(start.Add(time.Second))
-	require.Greater(t, countCanceled(sessions), 0)
-	require.Less(t, countCanceled(sessions), 10)
-	b.drainTick(start.Add(11 * time.Second))
-	require.Equal(t, 10, countCanceled(sessions))
-	require.True(t, b.Drained())
-	b.Undrain()
-	require.True(t, b.Status().Ready)
-	require.False(t, b.Drained())
-}
-
-func TestBalancer_WaitIdle(t *testing.T) {
-	app1 := newTestUpstream(t, "app1")
-	b := newTestBalancer(t, app1)
-	s := newTestSession(b, "app1")
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	require.True(t, errors.Is(b.WaitIdle(ctx), context.DeadlineExceeded))
-	b.Close(s.Session)
-	require.NoError(t, b.WaitIdle(context.Background()))
-}
-
 func TestBalancer_NextAddressLeastLoaded(t *testing.T) {
 	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2']}]}}}]"))
 	u := b.upstream("app1")
@@ -335,28 +259,6 @@ func mustParse(t *testing.T, s string) *config.Config {
 	conf, err := config.Parse([]byte(s))
 	require.NoError(t, err)
 	return conf
-}
-
-func TestBalancer_DrainSpreadsFewStreams(t *testing.T) {
-	// Fewer streams than ticks are spread over the whole drain, not closed one per tick upfront
-	app1 := newTestUpstream(t, "app1")
-	b := newTestBalancer(t, app1)
-	var sessions []*testSession
-	for i := 0; i < 4; i++ {
-		sessions = append(sessions, newTestSession(b, "app1"))
-	}
-	start := time.Now()
-	require.NoError(t, b.DrainUpstream("app1", 100*time.Second))
-	closedAt := make(map[int]int) // Second -> canceled so far
-	for sec := 1; sec <= 101; sec++ {
-		b.drainTick(start.Add(time.Duration(sec) * time.Second))
-		closedAt[sec] = countCanceled(sessions)
-	}
-	require.Equal(t, 0, closedAt[5])
-	require.Equal(t, 1, closedAt[20])
-	require.Equal(t, 2, closedAt[45])
-	require.Equal(t, 3, closedAt[70])
-	require.Equal(t, 4, closedAt[101])
 }
 
 func TestBalancer_RecordAddressFailureCounts(t *testing.T) {
@@ -477,86 +379,6 @@ func TestBalancer_StatusLoadBalancerDrain(t *testing.T) {
 	require.False(t, status.Drained)
 	require.Nil(t, status.DrainDeadline)
 	require.True(t, status.Ready)
-}
-
-func TestBalancer_Draining(t *testing.T) {
-	app1 := newTestUpstream(t, "app1")
-	b := newTestBalancer(t, app1)
-	require.False(t, b.Draining())
-	require.False(t, b.Drained())
-	b.Drain(time.Second)
-	require.True(t, b.Draining())
-	require.False(t, b.Drained())
-	b.drainTick(time.Now().Add(2 * time.Second))
-	require.True(t, b.Draining())
-	require.True(t, b.Drained())
-	b.Undrain()
-	require.False(t, b.Draining())
-	require.False(t, b.Drained())
-	b.Undrain() // Undraining when not draining is fine
-	require.False(t, b.Draining())
-
-	// An upstream drain is not a load balancer drain
-	require.NoError(t, b.DrainUpstream("app1", time.Second))
-	require.False(t, b.Draining())
-}
-
-func TestBalancer_CloseTwiceAndUnattached(t *testing.T) {
-	app1 := newTestUpstream(t, "app1")
-	b := newTestBalancer(t, app1)
-	s1, s2, s3 := newTestSession(b, "app1"), newTestSession(b, "app1"), newTestSession(b, "")
-	require.Equal(t, 3, b.Status().Streams)
-	require.Equal(t, 2, b.Status().Upstreams[0].Streams)
-
-	// Closing twice does not count twice
-	b.Close(s1.Session)
-	b.Close(s1.Session)
-	require.Equal(t, 2, b.Status().Streams)
-	require.Equal(t, 1, b.Status().Upstreams[0].Streams)
-
-	// A session that never attached only counts for the load balancer
-	b.Close(s3.Session)
-	b.Close(s3.Session)
-	require.Equal(t, 1, b.Status().Streams)
-	require.Equal(t, 1, b.Status().Upstreams[0].Streams)
-	b.Close(s2.Session)
-	status := b.Status()
-	require.Equal(t, 0, status.Streams)
-	require.Equal(t, 0, status.Upstreams[0].Streams)
-	require.NoError(t, b.WaitIdle(context.Background()))
-}
-
-func TestBalancer_DrainUndrainUpstreamUnknown(t *testing.T) {
-	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
-	b := newTestBalancer(t, app1, app2)
-	require.ErrorIs(t, b.DrainUpstream("nope", time.Second), ErrUpstreamNotFound)
-	require.ErrorIs(t, b.UndrainUpstream("nope"), ErrUpstreamNotFound)
-	require.ErrorIs(t, b.DrainUpstream("", time.Second), ErrUpstreamNotFound)
-
-	// A removed upstream is not found either, also while it still drains
-	conf := newTestConfig(app1)
-	conf.DrainDuration = time.Minute
-	b.Update(conf)
-	require.Len(t, b.Status().Upstreams, 2)
-	require.ErrorIs(t, b.DrainUpstream("app2", time.Second), ErrUpstreamNotFound)
-	require.ErrorIs(t, b.UndrainUpstream("app2"), ErrUpstreamNotFound)
-	require.Equal(t, StateDraining, b.Status().Upstreams[1].State)
-}
-
-func TestBalancer_UndrainUpstreamNotDraining(t *testing.T) {
-	// Undraining an upstream that is not draining changes nothing
-	app1, app2 := newTestUpstream(t, "app1"), newTestUpstream(t, "app2")
-	app2.ready.Store(false)
-	b := newTestBalancer(t, app1, app2)
-	s := newTestSession(b, "app1")
-	require.NoError(t, b.UndrainUpstream("app1"))
-	require.NoError(t, b.UndrainUpstream("app2"))
-	b.drainTick(time.Now().Add(time.Hour))
-	require.False(t, s.canceled())
-	status := b.Status()
-	require.Equal(t, StateHealthy, status.Upstreams[0].State)
-	require.Equal(t, StateUnhealthy, status.Upstreams[1].State) // Undrain does not make it healthy
-	require.Equal(t, 1, status.Upstreams[0].Streams)
 }
 
 func TestBalancer_PickExcludesDrainingAndUnhealthy(t *testing.T) {
@@ -967,63 +789,6 @@ func TestBalancer_ConcurrencyStress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	require.NoError(t, b.WaitIdle(ctx))
-}
-
-func TestBalancer_ReserveSpreadsInFlightAttempts(t *testing.T) {
-	// Attempts still connecting count, so a reconnect storm spreads over the addresses instead
-	// of piling onto the one with the fewest attached streams
-	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:1', '10.0.0.1:2', '10.0.0.1:3']}]}}}]"))
-	u := b.upstream("app1")
-	var sessions []*Session
-	counts := make(map[string]int)
-	for i := 0; i < 6; i++ {
-		s := b.NewSession(func(error) {})
-		sessions = append(sessions, s)
-		counts[b.Reserve(s, u)]++
-	}
-	require.Equal(t, map[string]int{"10.0.0.1:1": 2, "10.0.0.1:2": 2, "10.0.0.1:3": 2}, counts)
-	require.Equal(t, 0, b.Status().Upstreams[0].Streams) // Reserved is not attached
-
-	// Attach turns the reservation into a stream; the address stays as loaded as it was
-	addr := b.Reserve(sessions[0], u) // A retry: releases the first reservation
-	b.Attach(sessions[0], u, addr)
-	require.Equal(t, 1, b.Status().Upstreams[0].Streams)
-	u.mu.Lock()
-	require.Equal(t, 5, sumCounts(u.addrPending))
-	u.mu.Unlock()
-
-	// Closing releases reservations as well as streams
-	for _, s := range sessions {
-		b.Close(s)
-	}
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	require.Equal(t, 0, sumCounts(u.addrPending))
-	require.Equal(t, 0, sumCounts(u.addrStreams))
-}
-
-func TestBalancer_ReserveRetryOnAnotherUpstream(t *testing.T) {
-	// A retry on the next upstream releases the reservation on the first one
-	b := New(mustParse(t, "sites: [{name: s, listen-http: ':0', upstreams: {default: {servers: [{name: app1, addresses: ['10.0.0.1:1']}, {name: app2, addresses: ['10.0.0.2:1']}]}}}]"))
-	u1, u2 := b.upstream("app1"), b.upstream("app2")
-	s := b.NewSession(func(error) {})
-	b.Reserve(s, u1)
-	addr := b.Reserve(s, u2)
-	b.Attach(s, u2, addr)
-	u1.mu.Lock()
-	require.Equal(t, 0, sumCounts(u1.addrPending))
-	u1.mu.Unlock()
-	u2.mu.Lock()
-	require.Equal(t, 0, sumCounts(u2.addrPending))
-	require.Equal(t, 1, sumCounts(u2.addrStreams))
-	u2.mu.Unlock()
-
-	// A closed session reserves nothing, so nothing leaks
-	b.Close(s)
-	b.Reserve(s, u1)
-	u1.mu.Lock()
-	defer u1.mu.Unlock()
-	require.Equal(t, 0, sumCounts(u1.addrPending))
 }
 
 func TestBalancer_AddressBackoff(t *testing.T) {

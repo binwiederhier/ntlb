@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,24 +73,23 @@ func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest, status int) {
 		site = pr.site
 	}
 	if pr.upstream != "" {
-		upstream, upstreamStatus = pr.upstream, fmt.Sprint(pr.upstreamStatus)
+		upstream, upstreamStatus = pr.upstream, strconv.Itoa(pr.upstreamStatus)
 	}
-	line := fmt.Sprintf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s site=%s request_time=%.3f upstream=%s upstream_status=%s",
+	line := fmt.Appendf(nil, "%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s site=%s request_time=%.3f upstream=%s upstream_status=%s",
 		e.remoteAddr, e.start.Format(accessLogTimeFormat), e.request, status, bytes,
 		orDash(e.referer), orDash(e.userAgent), orDash(e.host), site, time.Since(e.start).Seconds(), upstream, upstreamStatus)
 	if pr.rule != "" {
-		line += " rule=" + pr.rule
+		line = append(append(line, " rule="...), pr.rule...)
 	}
-	line += "\n"
-	l.writeLine(line)
+	l.writeLine(append(line, '\n'))
 }
 
 // writeLine writes a line that ends in a newline
-func (l *accessLog) writeLine(line string) {
+func (l *accessLog) writeLine(line []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.w != nil { // Closed while the request ran
-		l.w.WriteString(line)
+		l.w.Write(line)
 	}
 }
 

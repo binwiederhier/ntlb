@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -11,8 +10,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
-	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -241,79 +238,106 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // A request whose body was partly sent is never resent, as there is no copy of it.
 func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	pr := proxyRequestFromContext(req.Context())
-	candidates := p.balancer.Pick(pr.site, pr.pool, pr.key)
-	if len(candidates) == 0 || pr.conns == nil {
-		return nil, errNoUpstream
-	}
 	var body *trackingBody
 	if req.Body != nil && req.Body != http.NoBody {
 		body = &trackingBody{rc: req.Body}
 	}
-	transport := pr.conns.transport
+	send := func(transport *http.Transport, addr string) (*http.Response, int, func() bool, error) {
+		// A shallow copy per attempt, with its own URL: req is the reverse proxy's copy already,
+		// and a transport does not change a request's headers (Clone copied them every time)
+		out := req.WithContext(req.Context())
+		target := *req.URL
+		target.Scheme, target.Host = "http", addr
+		out.URL = &target
+		var attempt *attemptBody
+		if body != nil {
+			attempt = body.attempt()
+			out.Body = attempt
+		}
+		untouched := func() bool {
+			return attempt == nil || !attempt.retire()
+		}
+		resp, err := transport.RoundTrip(out)
+		if err != nil {
+			return nil, 0, untouched, err
+		}
+		return resp, resp.StatusCode, untouched, nil
+	}
+	drop := func(resp *http.Response) {
+		resp.Body.Close()
+	}
+	resp, err := tryUpstreams(p, req.Context(), pr, req.Method, send, drop)
+	if err != nil {
+		return nil, err
+	}
+	timeout := pr.readTimeout
+	timer := time.AfterFunc(timeout, func() {
+		pr.cancel(errUpstreamReadTimeout)
+	})
+	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
+		resp.Body = &upgradedBody{ // Must stay an io.ReadWriteCloser
+			rwc:     rwc,
+			timer:   timer,
+			timeout: timeout,
+			cancel:  pr.cancel,
+		}
+	} else {
+		resp.Body = &idleTimeoutBody{
+			rc:      resp.Body,
+			timer:   timer,
+			timeout: timeout,
+		}
+	}
+	return resp, nil
+}
+
+// tryUpstreams sends a request to the upstreams Pick returns for the client, best first, by the
+// rules RoundTrip describes, trying an upstream's other addresses first if one does not accept
+// the connection. send makes one attempt on an address and returns the answer, its status, and
+// a function that reports whether none of the request body was sent (it also stops that
+// attempt's reads); drop discards an answer that is retried (a 503). The session is attached to
+// the answer it returns. Shared by the reverse proxy and the stream path.
+func tryUpstreams[T any](p *proxy, ctx context.Context, pr *proxyRequest, method string, send func(transport *http.Transport, addr string) (T, int, func() bool, error), drop func(T)) (T, error) {
+	var zero T
+	candidates := p.balancer.Pick(pr.site, pr.pool, pr.key)
+	if len(candidates) == 0 || pr.conns == nil {
+		return zero, errNoUpstream
+	}
 	for i, u := range candidates {
 		last := i == len(candidates)-1
 		for try := 0; ; try++ {
 			addr := p.balancer.Reserve(pr.session, u)
-			// A shallow copy per attempt, with its own URL: req is the reverse proxy's copy already,
-			// and a transport does not change a request's headers (Clone copied them every time)
-			out := req.WithContext(req.Context())
-			target := *req.URL
-			target.Scheme, target.Host = "http", addr
-			out.URL = &target
-			var attempt *attemptBody
-			if body != nil {
-				attempt = body.attempt()
-				out.Body = attempt
-			}
-			resp, err := transport.RoundTrip(out)
+			answer, status, untouched, err := send(pr.conns.transport, addr)
 			if err != nil {
-				untouched := attempt == nil || !attempt.retire()
-				if req.Context().Err() != nil {
-					return nil, err // Client went away or the stream was drained
+				fresh := untouched()
+				if ctx.Err() != nil {
+					return zero, err // Client went away or the stream was drained
 				}
 				p.balancer.RecordAddressFailure(u, addr)
-				if isDialError(err) && untouched && try+1 < u.AddressCount() {
+				if isDialError(err) && fresh && try+1 < u.AddressCount() {
 					slog.Debug("Upstream address failed, trying another address", "upstream", u.Name(), "addr", addr, "error", err)
 					p.metrics.retries.WithLabelValues(retryConnect).Inc()
 					continue // Another port of the same node: its clients stay where their limits are
 				}
-				if !last && untouched && retryable(err, req.Method) {
+				if !last && fresh && retryable(err, method) {
 					slog.Debug("Upstream failed, trying the next one", "upstream", u.Name(), "error", err)
 					p.metrics.retries.WithLabelValues(retryReason(err)).Inc()
 					break
 				}
 				slog.Debug("Upstream failed", "upstream", u.Name(), "error", err)
-				return nil, err
+				return zero, err
 			}
-			if resp.StatusCode == http.StatusServiceUnavailable && !last && (attempt == nil || !attempt.retire()) {
-				resp.Body.Close()
+			if status == http.StatusServiceUnavailable && !last && untouched() {
+				drop(answer)
 				p.metrics.retries.WithLabelValues(retry503).Inc()
 				break
 			}
 			p.balancer.Attach(pr.session, u, addr)
-			pr.upstream, pr.upstreamStatus = u.Name(), resp.StatusCode
-			timeout := pr.readTimeout
-			timer := time.AfterFunc(timeout, func() {
-				pr.cancel(errUpstreamReadTimeout)
-			})
-			if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
-				resp.Body = &upgradedBody{ // Must stay an io.ReadWriteCloser
-					rwc:     rwc,
-					timer:   timer,
-					timeout: timeout,
-					cancel:  pr.cancel,
-				}
-			} else {
-				resp.Body = &idleTimeoutBody{
-					rc:      resp.Body,
-					timer:   timer,
-					timeout: timeout,
-				}
-			}
-			return resp, nil
+			pr.upstream, pr.upstreamStatus = u.Name(), status
+			return answer, nil
 		}
 	}
-	return nil, errNoUpstream // Not reached: the last candidate always returns
+	return zero, errNoUpstream // Not reached: the last candidate always returns
 }
 
 // track registers an open request, so Shutdown can end what the drain did not
@@ -474,259 +498,6 @@ func (e *dialError) Unwrap() error {
 	return e.err
 }
 
-// trackingBody wraps a request body so a failed attempt neither closes it (the transport closes
-// a request body on error) nor hides whether any of it was sent, which decides a retry
-type trackingBody struct {
-	rc      io.ReadCloser
-	touched atomic.Bool
-}
-
-func (b *trackingBody) Read(p []byte) (int, error) {
-	b.touched.Store(true)
-	return b.rc.Read(p)
-}
-
-func (b *trackingBody) attempt() *attemptBody {
-	return &attemptBody{body: b}
-}
-
-func (b *trackingBody) Close() error {
-	return nil // The server closes the real body when the handler returns
-}
-
-// attemptBody is one attempt's handle on the shared request body. The transport may still read
-// a failed attempt's body after RoundTrip returned (its writer runs on), so before the next
-// attempt the old handle is retired: it reads nothing more, and retire tells whether it read
-// anything, which rules out the retry.
-type attemptBody struct {
-	body    *trackingBody
-	retired bool
-	read    bool
-	mu      sync.Mutex // Protects retired and read
-}
-
-func (a *attemptBody) Read(p []byte) (int, error) {
-	a.mu.Lock()
-	if a.retired {
-		a.mu.Unlock()
-		return 0, errBodyRetired
-	}
-	a.read = true
-	a.mu.Unlock()
-	return a.body.Read(p)
-}
-
-func (a *attemptBody) Close() error {
-	return nil // The server closes the real body when the handler returns
-}
-
-// retire stops the handle from reading and returns true if the body was touched by any attempt
-func (a *attemptBody) retire() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.retired = true
-	return a.read || a.body.touched.Load()
-}
-
-// clientBody is the request body as read from the client: each read must make progress within
-// the timeout (a client that stalls an upload is cut, like nginx's client_body_timeout), and a
-// drain interrupts a blocked read (see ServeHTTP)
-type clientBody struct {
-	rc      io.ReadCloser
-	conn    *clientConn
-	timeout time.Duration
-}
-
-func (b *clientBody) Read(p []byte) (int, error) {
-	b.conn.setReadDeadline(time.Now().Add(b.timeout))
-	return b.rc.Read(p)
-}
-
-func (b *clientBody) Close() error {
-	return b.rc.Close()
-}
-
-// clientConn sets deadlines on the client connection for as long as the handler runs. A drain
-// cancels requests from other goroutines, and the transport may read a request body after the
-// handler returned; after that, the ResponseWriter must not be touched (an HTTP/2 one panics),
-// so the handler's end and every deadline change are serialized.
-type clientConn struct {
-	ctrl        *http.ResponseController
-	upgraded    net.Conn // The hijacked connection of an upgrade (WebSocket), once there is one
-	interrupted bool     // Deadlines are not extended any more
-	done        bool
-	mu          sync.Mutex // Protects upgraded, interrupted and done, and serializes ctrl calls with the handler's end
-}
-
-func (c *clientConn) setReadDeadline(t time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.done && !c.interrupted {
-		c.ctrl.SetReadDeadline(t)
-	}
-}
-
-func (c *clientConn) setWriteDeadline(t time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.done && !c.interrupted {
-		c.ctrl.SetWriteDeadline(t)
-	}
-}
-
-// interrupt makes blocked reads and writes on the client connection fail right away, also on a
-// hijacked one, which the upgrade copy then closes. Later deadlines do not undo it.
-func (c *clientConn) interrupt() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.interrupted = true
-	if c.upgraded != nil {
-		c.upgraded.SetDeadline(time.Now())
-	} else if !c.done {
-		c.ctrl.SetReadDeadline(time.Now())
-		c.ctrl.SetWriteDeadline(time.Now())
-	}
-}
-
-// hijack takes over the connection for an upgrade, keeping it so interrupt can reach it
-func (c *clientConn) hijack() (net.Conn, *bufio.ReadWriter, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	conn, brw, err := c.ctrl.Hijack()
-	if err == nil {
-		c.upgraded = conn
-	}
-	return conn, brw, err
-}
-
-// end is called when the handler returns; from then on, nothing touches the connection
-func (c *clientConn) end() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.done = true
-}
-
-// deadlineWriter bounds every write to the client by the timeout, so a client that stops reading
-// is cut instead of holding the handler (and the upstream) forever. Unwrap keeps Flush and
-// Hijack reachable for the reverse proxy.
-type deadlineWriter struct {
-	http.ResponseWriter
-	conn    *clientConn
-	timeout time.Duration
-}
-
-func (w *deadlineWriter) Write(p []byte) (int, error) {
-	w.conn.setWriteDeadline(time.Now().Add(w.timeout))
-	return w.ResponseWriter.Write(p)
-}
-
-func (w *deadlineWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
-
-// Hijack is what the reverse proxy takes over an upgraded connection with
-func (w *deadlineWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return w.conn.hijack()
-}
-
-// idleTimeoutBody cancels the request when the upstream sends nothing for the timeout, like
-// nginx's proxy_read_timeout
-type idleTimeoutBody struct {
-	rc      io.ReadCloser
-	timer   *time.Timer
-	timeout time.Duration
-}
-
-func (b *idleTimeoutBody) Read(p []byte) (int, error) {
-	n, err := b.rc.Read(p)
-	if n > 0 {
-		b.timer.Reset(b.timeout)
-	}
-	return n, err
-}
-
-func (b *idleTimeoutBody) Close() error {
-	b.timer.Stop()
-	return b.rc.Close()
-}
-
-// upgradedBody is the upstream side of an upgraded connection (WebSocket). Traffic either way
-// keeps it open; nothing for the timeout cancels the request, like nginx's proxy_read_timeout. When
-// the upstream ends it (ntfy closes a WebSocket that stopped answering pings), the request is
-// canceled too: the upgrade copy would otherwise wait for the client side, which a vanished
-// client never ends.
-type upgradedBody struct {
-	rwc     io.ReadWriteCloser
-	timer   *time.Timer
-	timeout time.Duration
-	cancel  context.CancelCauseFunc
-}
-
-func (b *upgradedBody) Read(p []byte) (int, error) {
-	n, err := b.rwc.Read(p)
-	if n > 0 {
-		b.timer.Reset(b.timeout)
-	}
-	if err != nil {
-		b.cancel(errUpstreamClosed)
-	}
-	return n, err
-}
-
-func (b *upgradedBody) Write(p []byte) (int, error) {
-	n, err := b.rwc.Write(p)
-	if n > 0 {
-		b.timer.Reset(b.timeout)
-	}
-	return n, err
-}
-
-func (b *upgradedBody) Close() error {
-	b.timer.Stop()
-	return b.rwc.Close()
-}
-
-// WriteTo copies the upstream side to the client with a small buffer: the reverse proxy's io.Copy
-// would take 32 KiB, held for the whole WebSocket while it waits for the next message
-func (b *upgradedBody) WriteTo(w io.Writer) (int64, error) {
-	return copySmall(w, b, upgradedDownBufferSize)
-}
-
-// ReadFrom copies the client side to the upstream, like WriteTo; clients send small frames
-// (pings, pongs; ntfy reads at most 64 bytes per message)
-func (b *upgradedBody) ReadFrom(r io.Reader) (int64, error) {
-	return copySmall(b, r, upgradedUpBufferSize)
-}
-
-// bufferPool hands out the reverse proxy's copy buffers
-type bufferPool struct {
-	pool sync.Pool
-}
-
-func (p *bufferPool) Get() []byte {
-	if b, ok := p.pool.Get().(*[]byte); ok {
-		return *b
-	}
-	return make([]byte, copyBufferSize)
-}
-
-func (p *bufferPool) Put(b []byte) {
-	p.pool.Put(&b)
-}
-
-// forwardedFor returns the request's X-Forwarded-For with the client IP appended, like nginx's
-// $proxy_add_x_forwarded_for, which is what ntfy's behind-proxy expects
-func forwardedFor(r *http.Request) string {
-	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		clientIP = r.RemoteAddr
-	}
-	if prior := r.Header.Values(headerXForwardedFor); len(prior) > 0 {
-		return strings.Join(prior, ", ") + ", " + clientIP
-	}
-	return clientIP
-}
-
 func withProxyRequest(ctx context.Context, pr *proxyRequest) context.Context {
 	return context.WithValue(ctx, proxyContextKey{}, pr)
 }
@@ -768,43 +539,4 @@ func retryReason(err error) string {
 		return retryConnect
 	}
 	return retryError
-}
-
-func isTimeout(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
-// safely runs f and contains a panic: f runs in a goroutine of our own (a detached stream, a
-// cancel callback), where a panic would end the process, and with it every stream on this load
-// balancer, which then all reconnect at once
-func safely(where string, f func()) {
-	defer func() {
-		if v := recover(); v != nil && v != http.ErrAbortHandler {
-			slog.Error("Recovered from panic", "where", where, "panic", v, "stack", string(debug.Stack()))
-		}
-	}()
-	f()
-}
-
-// copySmall copies until EOF or an error with a buffer of size bytes. A loop of its own, not
-// io.CopyBuffer, which would hand the copy to w's ReadFrom or r's WriteTo and their 32 KiB buffers.
-func copySmall(w io.Writer, r io.Reader, size int) (int64, error) {
-	buf := make([]byte, size)
-	var written int64
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			m, werr := w.Write(buf[:n])
-			written += int64(m)
-			if werr != nil {
-				return written, werr
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			return written, nil
-		} else if err != nil {
-			return written, err
-		}
-	}
 }

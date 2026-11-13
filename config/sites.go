@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -158,35 +157,6 @@ func (c *Config) ErrorPagesFor(site *Site) *ErrorPages {
 	return c.Errors
 }
 
-// UpstreamCount returns the number of servers over all sites and their upstreams
-func (c *Config) UpstreamCount() int {
-	n := 0
-	for _, site := range c.Sites {
-		for _, u := range site.AllUpstreams() {
-			n += len(u.Servers)
-		}
-	}
-	return n
-}
-
-// AllUpstreams returns the site's upstreams, the default first, then the others by name
-func (s *Site) AllUpstreams() []*Upstream {
-	return s.upstreams
-}
-
-// DefaultUpstream returns the site's upstream that takes every request no proxy rule routes
-func (s *Site) DefaultUpstream() *Upstream {
-	return s.Upstreams[UpstreamDefault]
-}
-
-// UpstreamNamed returns the site's upstream with a name ("" for the default), or nil
-func (s *Site) UpstreamNamed(name string) *Upstream {
-	if name == "" {
-		name = UpstreamDefault
-	}
-	return s.Upstreams[name]
-}
-
 // loadIncludes merges the files that the include globs match into c, in file name order per glob.
 // A relative glob is relative to dir.
 func (c *Config) loadIncludes(dir string) error {
@@ -327,41 +297,6 @@ func (s *Site) validate(bans *Bans) error {
 	return validateRules(s.Rules, s, bans != nil || s.Bans != nil)
 }
 
-// validateUpstreams checks the site's upstreams, and that server names are unique over all of
-// them: a name is what drains, the status and the metrics know a node by
-func (s *Site) validateUpstreams() error {
-	if _, ok := s.Upstreams[UpstreamDefault]; !ok {
-		return errors.New("upstreams.default is required")
-	}
-	others := slices.DeleteFunc(slices.Sorted(maps.Keys(s.Upstreams)), func(name string) bool {
-		return name == UpstreamDefault
-	})
-	s.upstreams = nil
-	for _, name := range slices.Concat([]string{UpstreamDefault}, others) {
-		u := s.Upstreams[name]
-		if !nameRegex.MatchString(name) {
-			return fmt.Errorf("invalid upstream name %q", name)
-		} else if u == nil {
-			return fmt.Errorf("upstreams.%s is empty", name)
-		}
-		u.Name = name
-		if err := u.validate("upstreams." + name); err != nil {
-			return err
-		}
-		s.upstreams = append(s.upstreams, u)
-	}
-	names := make(map[string]bool)
-	for _, u := range s.upstreams {
-		for _, srv := range u.Servers {
-			if names[srv.Name] {
-				return fmt.Errorf("duplicate server name %q", srv.Name)
-			}
-			names[srv.Name] = true
-		}
-	}
-	return nil
-}
-
 // addListeners adds the site to its listeners, creating those not seen yet
 func (c *Config) addListeners(site *Site) error {
 	seen := make(map[string]bool)
@@ -436,81 +371,6 @@ func (l *Listener) indexSites() error {
 	slices.SortStableFunc(l.index.wildcards, func(a, b *wildcard) int {
 		return len(b.suffix) - len(a.suffix)
 	})
-	return nil
-}
-
-func (u *Upstream) applyDefaults() {
-	if u.Balance == "" {
-		u.Balance = DefaultBalance
-	}
-	if u.Timeouts == nil {
-		u.Timeouts = &Timeouts{}
-	}
-	if u.Timeouts.Connect == 0 {
-		u.Timeouts.Connect = DefaultUpstreamConnectTimeout
-	}
-	if u.Timeouts.Read == 0 {
-		u.Timeouts.Read = DefaultUpstreamReadTimeout
-	}
-	if u.Keepalive == nil {
-		u.Keepalive = &Keepalive{}
-	}
-	u.Keepalive.applyDefaults()
-	if u.HealthCheck == nil {
-		u.HealthCheck = &HealthCheck{}
-	}
-	u.HealthCheck.applyDefaults()
-}
-
-// validate checks the upstream; section is where it is in the site, for errors ("upstreams.<name>")
-func (u *Upstream) validate(section string) error {
-	if !slices.Contains(balances, u.Balance) {
-		return fmt.Errorf("invalid %s.balance %q, expected one of %s", section, u.Balance, strings.Join(balances, ", "))
-	} else if u.Timeouts.Connect <= 0 {
-		return fmt.Errorf("%s.timeouts.connect must be positive", section)
-	} else if u.Timeouts.Read <= 0 {
-		return fmt.Errorf("%s.timeouts.read must be positive", section)
-	} else if err := u.Keepalive.validate(section + ".keepalive"); err != nil {
-		return err
-	} else if err := u.HealthCheck.validate(section + ".healthcheck"); err != nil {
-		return err
-	}
-	return validateServers(u.Servers, section)
-}
-
-func validateServers(servers []*Server, section string) error {
-	if len(servers) == 0 {
-		return fmt.Errorf("at least one server is required (%s.servers)", section)
-	}
-	names := make(map[string]bool)
-	for i, srv := range servers {
-		if srv == nil {
-			return fmt.Errorf("%s.servers[%d] is empty", section, i)
-		} else if !nameRegex.MatchString(srv.Name) {
-			return fmt.Errorf("invalid server name %q", srv.Name)
-		} else if names[srv.Name] {
-			return fmt.Errorf("duplicate server name %q", srv.Name)
-		} else if len(srv.Addresses) == 0 {
-			return fmt.Errorf("server %s has no addresses", srv.Name)
-		}
-		names[srv.Name] = true
-		if srv.Weight == 0 {
-			srv.Weight = 1
-		} else if srv.Weight < 1 || srv.Weight > maxWeight {
-			return fmt.Errorf("server %s: weight must be between 1 and %d", srv.Name, maxWeight)
-		}
-		addresses, err := expandAddresses(srv.Addresses)
-		if err != nil {
-			return fmt.Errorf("server %s: %w", srv.Name, err)
-		}
-		srv.Addresses = addresses
-	}
-	hasPrimary := slices.ContainsFunc(servers, func(srv *Server) bool {
-		return !srv.Backup
-	})
-	if !hasPrimary {
-		return errors.New("at least one server must not be a backup")
-	}
 	return nil
 }
 

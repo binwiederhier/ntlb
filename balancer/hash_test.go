@@ -149,3 +149,8 @@ func FuzzRankWeighted(f *testing.F) {
 		require.Equal(t, ranked, rankWeighted(key, reversed, reversedWeights))
 	})
 }
+
+// rank is rankWeighted without weights
+func rank(key []byte, names []string) []string {
+	return rankWeighted(key, names, nil)
+}

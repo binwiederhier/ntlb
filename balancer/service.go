@@ -157,83 +157,6 @@ func sorted(pool *config.Upstream, key []byte, turn uint64, upstreams, backups [
 	return append(upstreams, backups...)
 }
 
-// NewSession registers a proxied request; cancel is called (with ErrDrained) to drain it.
-// The caller must call Close when the request is done.
-func (b *Balancer) NewSession(cancel context.CancelCauseFunc) *Session {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.nextID++
-	s := &Session{
-		id:     b.nextID,
-		cancel: cancel,
-	}
-	b.sessions[s.id] = s
-	return s
-}
-
-// Reserve returns the address a session should try on an upstream, and counts the attempt
-// towards that address until the session attaches, reserves again (a retry) or closes, so that
-// concurrent attempts spread over the addresses. Use it instead of NextAddress for requests.
-func (b *Balancer) Reserve(s *Session, u *Upstream) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s.releaseNoLock()
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	addr := u.nextAddressNoLock(time.Now())
-	if _, ok := b.sessions[s.id]; ok { // A closed session would never release it
-		u.addrPending[addr]++
-		s.reserved, s.reservedAddr = u, addr
-	}
-	return addr
-}
-
-// Attach records that a session is being served by an upstream address. A session on an
-// upstream the drain already forgot (the request picked it before a reload removed it) is closed
-// right away: no drain would ever close it.
-func (b *Balancer) Attach(s *Session, u *Upstream, addr string) {
-	if b.attach(s, u, addr) {
-		s.cancel(ErrDrained)
-	}
-}
-
-// attach records the session, and reports whether its upstream was forgotten or is drained, so
-// that the caller cancels it (outside the lock)
-func (b *Balancer) attach(s *Session, u *Upstream, addr string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s.releaseNoLock()
-	s.upstream, s.addr = u, addr
-	u.requests.Add(1)
-	u.mu.Lock()
-	u.addrStreams[addr]++
-	delete(u.addrFails, addr)
-	delete(u.addrRetry, addr)
-	u.mu.Unlock()
-	late := b.upstreams[u.id] != u || (u.drain != nil && u.drain.finished) // Forgotten, or drained: no tick closes it
-	if late && !s.canceled {
-		s.canceled = true
-		return true
-	}
-	return false
-}
-
-// Close unregisters a session
-func (b *Balancer) Close(s *Session) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, ok := b.sessions[s.id]; !ok {
-		return
-	}
-	delete(b.sessions, s.id)
-	s.releaseNoLock()
-	if s.upstream != nil {
-		s.upstream.mu.Lock()
-		defer s.upstream.mu.Unlock()
-		s.upstream.addrStreams[s.addr]--
-	}
-}
-
 // RecordAddressFailure counts a request that an upstream failed on an address (connection error,
 // timeout), and skips that address for new attempts for a while, longer with each failure in a row, since
 // the health check only probes an upstream's first address
@@ -362,86 +285,11 @@ func (u *Upstream) updateNoLock(pool *config.Upstream, uc *config.Server, probed
 	u.health = pool.HealthCheck
 }
 
-// DrainUpstream takes an upstream ("site/name", or the name if only one site has it) out of
-// rotation and closes its streams over d
-func (b *Balancer) DrainUpstream(name string, d time.Duration) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	u, err := b.findNoLock(name)
-	if err != nil {
-		return err
-	}
-	slog.Info("Draining upstream", "site", u.site, "upstream", u.name, "duration", d)
-	u.drain = newDrainState(time.Now(), d, false)
-	return nil
-}
-
-// UndrainUpstream puts a drained (or draining) upstream back into rotation
-func (b *Balancer) UndrainUpstream(name string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	u, err := b.findNoLock(name)
-	if err != nil {
-		return err
-	}
-	slog.Info("Undraining upstream", "site", u.site, "upstream", u.name)
-	u.drain = nil
-	return nil
-}
-
-// Drain makes the load balancer unready and closes all its streams over d. Once drained, the
-// server turns new requests away (see Drained).
-func (b *Balancer) Drain(d time.Duration) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	slog.Info("Draining load balancer", "duration", d)
-	b.drain = newDrainState(time.Now(), d, false)
-}
-
-// Undrain ends a drain of the load balancer
-func (b *Balancer) Undrain() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	slog.Info("Undraining load balancer")
-	b.drain = nil
-}
-
-// Draining returns true if the load balancer is draining (or drained)
-func (b *Balancer) Draining() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.drain != nil
-}
-
-// Drained returns true if the load balancer drained and closed its last stream at the deadline
-func (b *Balancer) Drained() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.drain != nil && b.drain.finished
-}
-
 // Healthy returns true if at least one upstream in rotation is healthy
 func (b *Balancer) Healthy() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.healthyNoLock()
-}
-
-// WaitIdle blocks until no session is open, or ctx is done
-func (b *Balancer) WaitIdle(ctx context.Context) error {
-	for {
-		b.mu.RLock()
-		n := len(b.sessions)
-		b.mu.RUnlock()
-		if n == 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(waitIdleInterval):
-		}
-	}
 }
 
 // Status returns a snapshot of the load balancer and its upstreams
@@ -666,16 +514,4 @@ func (u *Upstream) streamCountNoLock() int {
 		n += c
 	}
 	return n
-}
-
-// releaseNoLock gives back the session's reserved attempt, if any. The caller must hold
-// Balancer.mu.
-func (s *Session) releaseNoLock() {
-	if s.reserved == nil {
-		return
-	}
-	s.reserved.mu.Lock()
-	defer s.reserved.mu.Unlock()
-	s.reserved.addrPending[s.reservedAddr]--
-	s.reserved, s.reservedAddr = nil, ""
 }

@@ -2,11 +2,87 @@ package balancer
 
 import (
 	"cmp"
+	"context"
 	"log/slog"
 	"math"
 	"slices"
 	"time"
 )
+
+// DrainUpstream takes an upstream ("site/name", or the name if only one site has it) out of
+// rotation and closes its streams over d
+func (b *Balancer) DrainUpstream(name string, d time.Duration) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	u, err := b.findNoLock(name)
+	if err != nil {
+		return err
+	}
+	slog.Info("Draining upstream", "site", u.site, "upstream", u.name, "duration", d)
+	u.drain = newDrainState(time.Now(), d, false)
+	return nil
+}
+
+// UndrainUpstream puts a drained (or draining) upstream back into rotation
+func (b *Balancer) UndrainUpstream(name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	u, err := b.findNoLock(name)
+	if err != nil {
+		return err
+	}
+	slog.Info("Undraining upstream", "site", u.site, "upstream", u.name)
+	u.drain = nil
+	return nil
+}
+
+// Drain makes the load balancer unready and closes all its streams over d. Once drained, the
+// server turns new requests away (see Drained).
+func (b *Balancer) Drain(d time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	slog.Info("Draining load balancer", "duration", d)
+	b.drain = newDrainState(time.Now(), d, false)
+}
+
+// Undrain ends a drain of the load balancer
+func (b *Balancer) Undrain() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	slog.Info("Undraining load balancer")
+	b.drain = nil
+}
+
+// Draining returns true if the load balancer is draining (or drained)
+func (b *Balancer) Draining() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.drain != nil
+}
+
+// Drained returns true if the load balancer drained and closed its last stream at the deadline
+func (b *Balancer) Drained() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.drain != nil && b.drain.finished
+}
+
+// WaitIdle blocks until no session is open, or ctx is done
+func (b *Balancer) WaitIdle(ctx context.Context) error {
+	for {
+		b.mu.RLock()
+		n := len(b.sessions)
+		b.mu.RUnlock()
+		if n == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(waitIdleInterval):
+		}
+	}
+}
 
 func newDrainState(now time.Time, d time.Duration, removal bool) *drainState {
 	return &drainState{

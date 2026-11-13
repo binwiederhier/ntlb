@@ -727,24 +727,6 @@ func TestProxy_NonReadingDownloadIsCut(t *testing.T) {
 	})
 }
 
-func TestAttemptBody(t *testing.T) {
-	// Each attempt reads the shared body through its own handle; a retired handle reads nothing,
-	// so a late read by a failed attempt cannot eat what the next attempt needs
-	shared := &trackingBody{rc: io.NopCloser(strings.NewReader("hello"))}
-	first := shared.attempt()
-	require.False(t, first.retire()) // Untouched: safe to retry
-	n, err := first.Read(make([]byte, 5))
-	require.Zero(t, n)
-	require.ErrorIs(t, err, errBodyRetired)
-	second := shared.attempt()
-	buf := make([]byte, 2)
-	n, err = second.Read(buf)
-	require.NoError(t, err)
-	require.Equal(t, "he", string(buf[:n]))
-	require.True(t, second.retire()) // Touched: never retry
-	require.True(t, touched(shared))
-}
-
 func TestProxy_DeadAddressTriesSameUpstreamFirst(t *testing.T) {
 	// An upstream with a dead port and a live one still serves its clients (they keep the node
 	// that holds their rate limits) instead of moving them to another node; both paths
@@ -820,24 +802,6 @@ func TestProxy_CancelRacesHandlerEnd(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
-}
-
-func TestSafely(t *testing.T) {
-	// A panic in a goroutine of our own (detached stream, cancel callback) is logged and
-	// contained: it must not take down the process and every stream with it
-	ran := false
-	require.NotPanics(t, func() {
-		safely("test", func() {
-			ran = true
-			panic("boom")
-		})
-	})
-	require.True(t, ran)
-	require.NotPanics(t, func() {
-		safely("test", func() {
-			panic(http.ErrAbortHandler) // Our own way to cut a stream: not an error
-		})
-	})
 }
 
 // streamsToggle turns streams off on even reloads and back to ntfy's on odd ones

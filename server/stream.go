@@ -133,41 +133,22 @@ type upstreamStream struct {
 // the proxy's RoundTrip (no body, so any error before the response is safe to retry), trying the
 // other addresses of an upstream first if one does not accept the connection
 func (p *proxy) connectStream(r *http.Request, pr *proxyRequest) (*upstreamStream, error) {
-	candidates := p.balancer.Pick(pr.site, pr.pool, pr.key)
-	if len(candidates) == 0 || pr.conns == nil {
-		return nil, errNoUpstream
-	}
-	for i, u := range candidates {
-		last := i == len(candidates)-1
-		for try := 0; ; try++ {
-			addr := p.balancer.Reserve(pr.session, u)
-			us, err := p.roundTripStream(r, addr)
-			if err != nil {
-				if r.Context().Err() != nil {
-					return nil, err
-				}
-				p.balancer.RecordAddressFailure(u, addr)
-				if isDialError(err) && try+1 < u.AddressCount() {
-					p.metrics.retries.WithLabelValues(retryConnect).Inc()
-					continue
-				}
-				if !last {
-					p.metrics.retries.WithLabelValues(retryReason(err)).Inc()
-					break
-				}
-				return nil, err
-			}
-			if us.resp.StatusCode == http.StatusServiceUnavailable && !last {
-				us.conn.Close()
-				p.metrics.retries.WithLabelValues(retry503).Inc()
-				break
-			}
-			p.balancer.Attach(pr.session, u, addr)
-			pr.upstream, pr.upstreamStatus = u.Name(), us.resp.StatusCode
-			return us, nil
+	send := func(_ *http.Transport, addr string) (*upstreamStream, int, func() bool, error) {
+		us, err := p.roundTripStream(r, addr)
+		if err != nil {
+			return nil, 0, noBodySent, err
 		}
+		return us, us.resp.StatusCode, noBodySent, nil
 	}
-	return nil, errNoUpstream // Not reached: the last candidate always returns
+	drop := func(us *upstreamStream) {
+		us.conn.Close()
+	}
+	return tryUpstreams(p, r.Context(), pr, r.Method, send, drop)
+}
+
+// noBodySent is a stream's answer to "was any of the request body sent": it has none
+func noBodySent() bool {
+	return true
 }
 
 // roundTripStream dials addr, writes the request as HTTP/1.0 and reads the response headers,
