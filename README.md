@@ -25,7 +25,8 @@ It replaces the nginx + lbagent pair on the ntfy.sh load balancers (ansible: `pl
 `roles/ntlb` in `ntfy/ansible`). What it took over from that setup is listed under
 [nginx parity](#nginx-parity). Every setting, the expression language and
 recipes: [docs/configuration.md](docs/configuration.md); diagrams of the components and flows:
-[docs/architecture.md](docs/architecture.md); internals and lab results: [docs/design.md](docs/design.md).
+[docs/architecture.md](docs/architecture.md); the code, package by package:
+[docs/code.md](docs/code.md); internals and lab results: [docs/design.md](docs/design.md).
 
 ## Overview
 

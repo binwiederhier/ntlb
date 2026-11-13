@@ -1,12 +1,14 @@
 # ntlb design
 
-How ntlb works inside, the invariants the code relies on, and how it was tested. User-facing
-docs are in the [README](../README.md).
+How ntlb works inside, the invariants the code relies on, and how it was tested. A walkthrough of
+the code itself is in [code.md](code.md). User-facing docs are in the [README](../README.md).
 
 ## Packages
 
 | Package | Role |
 |---|---|
+| `rules` | The rule engine: request rules, the token buckets of limits, strikes and bans. |
+| `match` | The expression language (expr): compiles and evaluates `match:` and `location:`. |
 | `config` | YAML config and the site files it includes: parse, default, validate, find the site for a host. `Parse` is all-or-nothing (unknown keys, null entries and non-positive durations are errors), so a reload with a broken file changes nothing. |
 | `balancer` | The state: upstreams, their health, the open sessions (streams), drains. No HTTP serving. |
 | `server` | Listeners (HTTP, HTTPS, admin), the proxy (`proxy.go`), the admin API, the access log, cert reloads. |

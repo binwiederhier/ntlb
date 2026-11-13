@@ -3,7 +3,8 @@
 How ntlb is put together, in diagrams: where it runs, its components, what a request goes
 through, and the flows that matter for long-lived streams (subscriptions, drains, reloads,
 health, bans). The diagrams are [Mermaid](https://mermaid.js.org), which GitHub renders. The
-details behind each part (invariants, numbers, lab results) are in [design.md](design.md).
+details behind each part (invariants, numbers, lab results) are in [design.md](design.md); the
+code itself, package by package and function by function, in [code.md](code.md).
 
 ## Deployment
 
@@ -64,7 +65,7 @@ flowchart TB
         certs["certStore<br/>certificate by SNI"]
         observe["observe<br/>site, validation, rules,<br/>access log, metrics"]
         gzip["gzipWriter"]
-        answer["answer<br/>block, limit, redirect, static"]
+        answer["answer<br/>block, limit, redirect, static,<br/>error pages"]
         proxy["proxy<br/>httputil.ReverseProxy, RoundTrip, retries"]
         stream["stream path<br/>raw upstream connection,<br/>hijacked client"]
         accesslog["accessLog, logFiles"]
@@ -132,7 +133,7 @@ flowchart TD
     valid -- yes --> rules{"Request rules<br/>global, then the site's"}
     rules -- "block / limit" --> deny["403 / 429<br/>+ strikes"]
     rules -- "redirect / static" --> serve["Answer from ntlb"]
-    rules -- "allow / none" --> kind{"Subscription?<br/>streams.match"}
+    rules -- "proxy: its upstream<br/>allow / none: default" --> kind{"Subscription?<br/>streams.match"}
     kind -- "no: request" --> rp["ReverseProxy<br/>RoundTrip with retries"]
     kind -- "yes, Upgrade" --> ws["ReverseProxy<br/>WebSocket upgrade"]
     kind -- "yes, bodyless" --> sp["Stream path<br/>raw upstream connection"]
@@ -152,20 +153,21 @@ response are compressed alike; the stream path unwraps it, as subscriptions are 
 
 ## Balancing
 
-`Pick(site, key)` returns the upstreams to try, best first; the first is the choice, the rest are
+`Pick(site, pool, key)` returns the servers of one of the site's upstream blocks (`default`, or
+the one a `proxy` rule named) to try, best first; the first is the choice, the rest are
 the retries. Draining upstreams are never picked; unhealthy ones only if no upstream is healthy
 (fail open).
 
 ```mermaid
 flowchart LR
-    all["The site's upstreams<br/>in config order"] --> draining{"Draining<br/>or removed?"}
+    all["The pool's servers<br/>in config order"] --> draining{"Draining<br/>or removed?"}
     draining -- yes --> skip["Skipped"]
     draining -- no --> healthy{"Any healthy?"}
     healthy -- yes --> h["The healthy ones"]
     healthy -- "no: fail open" --> u["All of them"]
     h --> order{"balance"}
     u --> order
-    order -- "round-robin" --> rr["Rotated by the site's turn"]
+    order -- "round-robin" --> rr["Rotated by the pool's turn"]
     order -- "least-conn" --> lc["Rotated, then by load<br/>(attached + reserved)"]
     order -- "random-two-least-conn" --> r2["Less loaded of two random,<br/>then the rest by load"]
     order -- "hash" --> hash["Rendezvous hash of the<br/>client key over the names"]
@@ -196,7 +198,7 @@ sequenceDiagram
     S->>R: Check(request)
     R-->>S: no rule decides
     S->>P: ServeHTTP
-    P->>B: NewSession, Pick(site, key)
+    P->>B: NewSession, Pick(site, pool, key)
     B-->>P: [app-1, app-2]
     P->>B: Reserve(app-1)
     P->>U1: connect
@@ -401,7 +403,7 @@ sequenceDiagram
     participant N as app3
 
     C->>P: POST /mytopic
-    P->>B: Pick(site, key)
+    P->>B: Pick(site, pool, key)
     B-->>P: [app1, app3] (app1 still healthy)
     P->>A1: dial
     A1--xP: connection refused
@@ -467,7 +469,7 @@ order, so a shared problem (the database) degrades instead of turning everyone a
 
 ```mermaid
 flowchart LR
-    pick["Pick(site, key)"] --> d{"upstreams<br>not draining"}
+    pick["Pick(site, pool, key)"] --> d{"upstreams<br>not draining"}
     d -- none --> s503["503 (all draining)"]
     d -- some --> h{"any of them<br>healthy?"}
     h -- yes --> hl["the healthy ones,<br>by balance"]
@@ -497,7 +499,7 @@ sequenceDiagram
     loop Over the limit
         C->>S: request
         S->>E: Check: limit exceeded
-        E->>E: 503, strikes += 20
+        E->>E: 429, strikes += 20
     end
     E->>F: strikes > threshold: one line per window<br/>"time ip prefix ntfy/limit"
     F->>CS: tailed (ntlb-ban parser and scenario)
