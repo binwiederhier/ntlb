@@ -525,6 +525,30 @@ third of it the hybrid post-quantum key exchange), GC ~8%, expressions ~5.5%. Ex
 per request (-27% per ntfy match), and the proxy no longer clones a request's headers per attempt;
 together ~1% (run 4: 0.69 cores). The rest is Go's net/http and crypto/tls.
 
+## Lab rerun (2026-11-13)
+
+`122b83e` (streams free the upstream response and the client request; WebSockets on the stream
+path), same lab, load and 35 minutes as above, with the lab config re-rendered from the ansible
+templates (`roles/ntlb`). nginx not rerun: its numbers are from 2026-11-10, same VMs and load.
+
+| | Run 3 (2026-11-10) | 2026-11-13 | nginx |
+|---|---|---|---|
+| CPU | 0.70 cores | 0.68 cores | 0.37 cores |
+| Memory (PSS, avg) | 1.99 GB | 1.79 GB | 2.10 GB |
+| Delivery p50 / max p99 | 1.1 / 4.7 ms | 1.1 / 4.1 ms | 1.2 / 5.4 ms |
+| Published / lost | 292,685 / 0 | 292,556 / 0 | 292,402 / 0 |
+| Publish, poll, subscribe errors | 0 | 0 | 0 |
+| RSS 3 minutes after the load | 294 MB | 246 MB | |
+
+About 5 KB less per stream. The replay: 61 of 67 shapes the same (the WebSocket ones included),
+the 6 differences as listed above.
+
+Sizing against production (Prometheus, 2026-11-13): lb-1 has 8 vCPUs and 16 GB, ~191k
+established TCP connections (clients and upstreams), and is busy 1.1 cores on average (p95 1.5,
+p99 2.0 over 7 days; 0.58 user, 0.21 system, 0.27 softirq). The one spike (7 cores, 2026-11-09)
+was mostly iowait, not proxying. ntlb's extra CPU over nginx is in the process (user and system
+time); the kernel's network work (softirq) stays the same.
+
 ## Faults under load (2026-11-11)
 
 The same 40k-stream load, with one fault every few minutes (lab ntfy nodes, not clustered).
