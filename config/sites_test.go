@@ -451,6 +451,7 @@ sites:
     rules:
       - {name: to-app1, match: 'path startsWith "/app1/"', action: proxy, upstream: app1}
       - {name: to-default, match: 'path == "/x"', action: proxy, upstream: default}
+      - {name: to-default-implied, match: 'path == "/y"', action: proxy}
 `))
 	require.NoError(t, err)
 	site := c.Sites[0]
@@ -468,6 +469,9 @@ sites:
 	require.Equal(t, 5*time.Minute, app2.Timeouts.Read)
 	require.Equal(t, DefaultUpstreamConnectTimeout, app2.Timeouts.Connect)
 	require.Equal(t, 4, c.UpstreamCount())
+
+	// A proxy rule without an upstream goes to the default
+	require.Equal(t, UpstreamDefault, site.Rules[2].Upstream)
 
 	// Lookup by name, "" being the default
 	require.Same(t, app1, site.UpstreamNamed("app1"))
@@ -498,7 +502,6 @@ func TestParse_NamedUpstreamsInvalid(t *testing.T) {
 
 		// A proxy rule names an upstream of its site
 		"upstreams: {" + web + "}, rules: [{name: r, action: proxy, upstream: nope}]":                 `site s: rule s/r: unknown upstream "nope"`,
-		"upstreams: {" + web + "}, rules: [{name: r, action: proxy}]":                                 "site s: rule s/r: proxy needs an upstream",
 		"upstreams: {" + web + "}, rules: [{name: r, action: proxy, upstream: default, status: 404}]": "site s: rule s/r: proxy takes upstream only",
 		"upstreams: {" + web + "}, rules: [{name: r, action: block, upstream: default}]":              "site s: rule s/r: block takes status and strike only",
 	} {

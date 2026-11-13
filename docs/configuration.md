@@ -344,8 +344,8 @@ flowchart LR
 
 - A `proxy` rule decides like `allow`: the first one whose `match` is true sends the request to
   its `upstream`, and the rules after it are not checked. Put limits and blocks before the routes.
-- No rule has to name `default`: what no `proxy` rule matches goes there. `upstream: default` in a
-  `proxy` rule sends a path there before a broader route catches it.
+- No rule has to name `default`: what no `proxy` rule matches goes there. A `proxy` rule without
+  `upstream` (or with `upstream: default`) sends a path there before a broader route catches it.
 - The path is sent as it is (`/app1/x` reaches the server as `/app1/x`).
 - `proxy` rules go in a site's `rules` only; global rules cannot name a site's upstreams.
 - Server names are per site over all its upstream blocks: a server is `site/name` in
@@ -554,7 +554,7 @@ request.
 | `block` | `status` (default 403), `strike` | Answers `status` with a short text body. |
 | `limit` | `rate` (required), `burst` (default 0), `status` (default 429), `strike` | A token bucket per client key and rule: `rate` requests per `s`, `m` or `h`, plus `burst` at once (nginx's `limit_req burst=N nodelay`). Over it, answers `status`; `strike` counts per limited request. |
 | `allow` | none | Stops checking and proxies. For exemptions: put it before the rules it exempts from. |
-| `proxy` | `upstream` (required: a name in the site's `upstreams`) | Stops checking and proxies to that upstream. Site rules only. See [Routing by path](#routing-by-path). |
+| `proxy` | `upstream` (a name in the site's `upstreams`; default: `default`) | Stops checking and proxies to that upstream. Site rules only. See [Routing by path](#routing-by-path). |
 | `redirect` | `location` (required, a string expression), `status` (default 302; 300-399) | Answers a redirect. |
 | `static` | `root` (required), `fallback` | Serves the file at the request path under `root`, else `fallback` (a path under `root`, like nginx's `try_files $uri /index.html`), else 404. Directories serve the fallback. Paths with `.`, `..` or empty segments, dotfiles (so also `/.well-known/`) and symlinks out of `root` are refused. |
 

@@ -69,6 +69,9 @@ func applyRuleDefaults(rules []*Rule) {
 		if r.On == "" {
 			r.On = OnRequest
 		}
+		if r.Action == ActionProxy && r.Upstream == "" {
+			r.Upstream = UpstreamDefault
+		}
 		if r.Status == 0 {
 			switch r.Action {
 			case ActionBlock:
@@ -192,8 +195,6 @@ func (r *Rule) compileAction() error {
 	case ActionProxy:
 		if r.Status != 0 || hasRate || r.Location != "" || hasStatic || r.Strike != 0 {
 			return errors.New("proxy takes upstream only")
-		} else if r.Upstream == "" {
-			return errors.New("proxy needs an upstream")
 		}
 	case "":
 		return errors.New("action is required (block, limit, allow, redirect, static or proxy)")
