@@ -549,6 +549,43 @@ p99 2.0 over 7 days; 0.58 user, 0.21 system, 0.27 softirq). The one spike (7 cor
 was mostly iowait, not proxying. ntlb's extra CPU over nginx is in the process (user and system
 time); the kernel's network work (softirq) stays the same.
 
+## Leaving behind DNS failover (2026-11-14)
+
+`86375e2`: SIGTERM withdraws for `shutdown-drain-delay` (not ready, still serving everything),
+then drains over `shutdown-drain-duration`, then exits. The lab ran a second ntlb on the same VM
+and a generator that models Route53 failover: it checks both load balancers' `listen-health`
+`/v1/ready` every 10s, flips its answer after 3 results in a row (the secondary while the
+primary fails and the secondary passes), and each client caches the answer for a 60s TTL (cache
+ages spread evenly) and connects only to the load balancer it resolved, with no fallback, like a
+failover record. Same load as above (40k streams, 150 publishes/s, 430 polls/s), all on the
+primary; `systemctl stop` of the primary with a 2m delay and a 2m drain, restarted after 60s.
+
+| Phase | Streams on primary / secondary | Errors (subscribe, publish, poll), lost |
+|---|---|---|
+| Steady (2m) | 39,953 / 0 | 0, 0, 0, 0 |
+| Withdrawing (2m): ready 503 at once, DNS flipped after 30s | 39,960 -> 38,530 / 0 -> 1,426 (lifetime reconnects after their TTL) | 0, 0, 0, 0 |
+| Draining (2m): streams closed evenly | 38,530 -> 0 / 1,426 -> 39,791 | 1, 0, 0, 0 |
+| Primary down (60s) | 0 / 39,957 | 0, 0, 0, 0 |
+| Primary back (5m): DNS back after 25s | 0 -> 5,264 / 39,957 -> 34,697 (only as clients reconnect) | 0, 0, 0, 0 |
+
+One subscribe error and no lost message for the whole maintenance. Delivery and publish p99 rose
+to ~7s during the drain: 37k TLS reconnects in 2 minutes to the secondary on the same 6-core VM
+as the primary and the generator (whose reports stalled once for 30s); on separate machines the
+secondary takes them alone. Clients come back to the primary only as they reconnect, so there
+is no storm in either direction.
+
+The same shutdown with one load balancer (2026-11-13; nowhere else to go): withdrawing served
+everything with no errors (2,681 new subscriptions, 16,266 publishes, 40,318 polls), then the
+drain closed streams in a straight line (40.8k -> 277 upstream connections in 120s, ~340/s), and
+ntlb answered publishes and polls throughout (3 publish 503s in its access log); the clients'
+errors there came from 25k drained subscribers retrying the same load balancer every 0.5-3.5s.
+
+Reconnect storms (2026-11-14): with every client connection reset at once (`ss -K` on the load
+balancer's ports, ~19.2k connections for 40k streams), three times per run, ntlb and nginx cost
+about the same: peaks of 3.0-3.3 vs 3.1-3.6 cores, 73-101 vs 74-95 extra CPU-seconds per storm,
+whole runs with 12 vs 14 lost messages. The generator (same VM, ~3.4 cores) set the reconnect
+pace, so these are not the true peaks; that needs the generator on its own machine.
+
 ## Faults under load (2026-11-11)
 
 The same 40k-stream load, with one fault every few minutes (lab ntfy nodes, not clustered).
