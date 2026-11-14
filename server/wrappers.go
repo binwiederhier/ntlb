@@ -78,7 +78,8 @@ type clientBody struct {
 }
 
 func (b *clientBody) Read(p []byte) (int, error) {
-	b.conn.setReadDeadline(time.Now().Add(b.timeout))
+	b.conn.startRead(b.timeout)
+	defer b.conn.stopRead()
 	return b.rc.Read(p)
 }
 
@@ -86,32 +87,61 @@ func (b *clientBody) Close() error {
 	return b.rc.Close()
 }
 
-// clientConn sets deadlines on the client connection for as long as the handler runs. A drain
-// cancels requests from other goroutines, and the transport may read a request body after the
-// handler returned; after that, the ResponseWriter must not be touched (an HTTP/2 one panics),
-// so the handler's end and every deadline change are serialized.
+// clientConn bounds reads from and writes to the client connection for as long as the handler
+// runs. A drain cancels requests from other goroutines, and the transport may read a request body
+// after the handler returned; after that, the ResponseWriter must not be touched (an HTTP/2 one
+// panics), so the handler's end and every deadline change are serialized.
+//
+// A read or a write that takes longer than its timeout interrupts the connection, by a timer of
+// its own, instead of a deadline set before each one: on HTTP/2, a deadline change is a round trip
+// to the connection's goroutine, for every message of tens of thousands of streams.
 type clientConn struct {
 	ctrl        *http.ResponseController
-	upgraded    net.Conn // The hijacked connection of an upgrade (WebSocket), once there is one
-	interrupted bool     // Deadlines are not extended any more
+	upgraded    net.Conn    // The hijacked connection of an upgrade (WebSocket), once there is one
+	readTimer   *time.Timer // Interrupts a read that takes too long, see startRead
+	writeTimer  *time.Timer // Interrupts a write that takes too long, see startWrite
+	interrupted bool        // Deadlines are not extended any more
 	done        bool
-	mu          sync.Mutex // Protects upgraded, interrupted and done, and serializes ctrl calls with the handler's end
+	mu          sync.Mutex // Protects all fields but ctrl, and serializes ctrl calls with the handler's end
 }
 
-func (c *clientConn) setReadDeadline(t time.Time) {
+// startRead bounds the read that follows (until stopRead) by timeout
+func (c *clientConn) startRead(timeout time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.done && !c.interrupted {
-		c.ctrl.SetReadDeadline(t)
-	}
+	c.readTimer = c.startNoLock(c.readTimer, timeout)
 }
 
-func (c *clientConn) setWriteDeadline(t time.Time) {
+func (c *clientConn) stopRead() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.done && !c.interrupted {
-		c.ctrl.SetWriteDeadline(t)
+	stopTimer(c.readTimer)
+}
+
+// startWrite bounds the write that follows (until stopWrite), flushes included, by timeout
+func (c *clientConn) startWrite(timeout time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writeTimer = c.startNoLock(c.writeTimer, timeout)
+}
+
+func (c *clientConn) stopWrite() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stopTimer(c.writeTimer)
+}
+
+// startNoLock arms timer (made on first use) to interrupt the connection after timeout
+func (c *clientConn) startNoLock(timer *time.Timer, timeout time.Duration) *time.Timer {
+	if c.done || c.interrupted {
+		return timer
+	} else if timer == nil {
+		return time.AfterFunc(timeout, func() {
+			safely("client timeout", c.interrupt)
+		})
 	}
+	timer.Reset(timeout)
+	return timer
 }
 
 // interrupt makes blocked reads and writes on the client connection fail right away, also on a
@@ -144,6 +174,8 @@ func (c *clientConn) end() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.done = true
+	stopTimer(c.readTimer)
+	stopTimer(c.writeTimer)
 }
 
 // deadlineWriter bounds every write to the client by the timeout, so a client that stops reading
@@ -156,8 +188,16 @@ type deadlineWriter struct {
 }
 
 func (w *deadlineWriter) Write(p []byte) (int, error) {
-	w.conn.setWriteDeadline(time.Now().Add(w.timeout))
+	w.conn.startWrite(w.timeout)
+	defer w.conn.stopWrite()
 	return w.ResponseWriter.Write(p)
+}
+
+// FlushError bounds a flush like a write: an HTTP/2 flush blocks on the client's window
+func (w *deadlineWriter) FlushError() error {
+	w.conn.startWrite(w.timeout)
+	defer w.conn.stopWrite()
+	return http.NewResponseController(w.ResponseWriter).Flush()
 }
 
 func (w *deadlineWriter) Unwrap() http.ResponseWriter {
@@ -236,6 +276,13 @@ func (b *upgradedBody) WriteTo(w io.Writer) (int64, error) {
 // (pings, pongs; ntfy reads at most 64 bytes per message)
 func (b *upgradedBody) ReadFrom(r io.Reader) (int64, error) {
 	return copySmall(b, r, upgradedUpBufferSize)
+}
+
+// stopTimer stops a timer, if there is one
+func stopTimer(timer *time.Timer) {
+	if timer != nil {
+		timer.Stop()
+	}
 }
 
 // bufferPool hands out the reverse proxy's copy buffers

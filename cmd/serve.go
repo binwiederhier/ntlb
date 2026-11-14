@@ -11,6 +11,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/procs"
 	"heckel.io/ntlb/server"
 )
 
@@ -53,6 +54,7 @@ func execServe(ctx context.Context, cmd *cli.Command) error {
 	go handleSignals(s, cmd.String(flagConfig), signals, func() {
 		osExit(1)
 	})
+	go procs.Run(ctx)
 	return s.Serve(ctx)
 }
 

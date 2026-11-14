@@ -761,6 +761,36 @@ func TestStream_HTTP2DrainInterruptsBlockedWrite(t *testing.T) {
 	})
 }
 
+func TestStream_HTTP2SlowClientIsCut(t *testing.T) {
+	// An HTTP/2 client that stops reading fills its flow-control window; the blocked write is cut
+	// after upstream.timeouts.read, which ends the stream
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/flood/json", func(w http.ResponseWriter, r *http.Request) {
+		chunk := strings.Repeat("x", 64*1024)
+		for r.Context().Err() == nil {
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+	})
+	s := newTLSTestServer(t, "timeouts: {read: 500ms}", app1)
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		ForceAttemptHTTP2: true,
+	}
+	defer transport.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: transport}).Get("https://" + s.HTTPSAddr() + "/flood/json")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, 2, resp.ProtoMajor)
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 0
+	})
+}
+
 func BenchmarkStream_Subscribe(b *testing.B) {
 	// Opening and closing a subscription on the stream path: picking, the raw upstream
 	// connection, the hijack and the copy goroutine

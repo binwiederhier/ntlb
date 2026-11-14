@@ -48,6 +48,7 @@ About 7,300 lines of Go without tests. In this order, each step builds on the on
 | `rules` | `service.go`, `bans.go` | The rule engine: checks a request against the rules, keeps the token buckets of `limit` rules and the strikes towards bans. |
 | `match` | `match.go` | The expression language (on [expr](https://expr-lang.org)): compiles `match:` and `location:` strings, evaluates them against a request (`Env`) or an outcome (`ResponseEnv`). |
 | `config` | `config.go`, `sites.go`, `upstreams.go`, `rules.go`, `errorpages.go` | Parses the YAML (and included files), applies defaults, validates, compiles the expressions, indexes the sites by listener and host. A `*config.Config` is immutable once loaded. |
+| `procs` | `service.go` | Adapts GOMAXPROCS to the CPU use (`Run`, started by `serve`): fewer Ps when the load is low, since every idle P costs scheduler wakeups. Off when `GOMAXPROCS` is set. |
 | `lab/replay` | `main.go` | Not part of the binary: sends the same requests to ntlb and nginx and compares the answers. |
 
 How they import each other (arrows point at the imported package). `config` and `match` are
@@ -362,8 +363,8 @@ sequenceDiagram
         P->>G: go copyStreamHTTP1, pr.detached = true
         Note over P: the handler returns: Go frees the request, its buffers, the server-side conn state
         loop until upstream EOF, client gone, read timeout or drain
-            G->>U: waitReadable (netpoller, no buffer held)
-            G->>G: read into a pooled buffer
+            G->>U: readReady (netpoller, no buffer held while waiting)
+            G->>G: read into a pooled buffer, in the poller's callback
             G->>C: write with a deadline
         end
         G->>G: pr.finish()
@@ -556,6 +557,8 @@ type-checks the result (bool, or string for `location`). The functions:
 | stream copy | `serveStream` | one per detached HTTP/1.1 stream, and the downstream copy of a WebSocket |
 | websocket copy | `copyUpgraded` | the upstream copy (client to upstream) of a WebSocket |
 | `handleSignals` | `execServe` | reload, shutdown |
+| `procs.Run` | `execServe` | every 250ms samples the CPU time and adapts GOMAXPROCS |
+| client timeout | `clientConn.startRead`/`startWrite` | a `time.AfterFunc` per direction and request, which interrupts a read or write that took too long |
 
 Go's `http.Server` adds a goroutine per connection (and per HTTP/2 stream), until a stream or a
 WebSocket hijacks it.

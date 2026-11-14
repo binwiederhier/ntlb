@@ -25,7 +25,7 @@ import (
 //
 //   - Upstream: a raw TCP connection per stream and an HTTP/1.0 request, so ntfy answers with a
 //     plain body until it closes the connection (no chunking), which is copied as is.
-//   - Waiting: the netpoller waits for upstream data (waitReadable) without a buffer; only then is
+//   - Waiting: the netpoller waits for upstream data (readReady) without a buffer; only then is
 //     a pooled buffer taken for the read and the write.
 //   - HTTP/1.1 clients: the connection is hijacked and the response written by hand, with
 //     "Connection: close". The client is never read again (a subscription sends nothing more), so
@@ -289,7 +289,8 @@ func copyStreamHTTP2(w http.ResponseWriter, us *upstreamStream, cc *clientConn, 
 		return err
 	}
 	write := func(b []byte) error {
-		cc.setWriteDeadline(time.Now().Add(pr.readTimeout))
+		cc.startWrite(pr.readTimeout)
+		defer cc.stopWrite()
 		n, err := w.Write(b)
 		pr.bytes += int64(n)
 		if err != nil {
@@ -334,9 +335,10 @@ func copyBody(us *upstreamStream, timeout time.Duration, write func([]byte) erro
 
 // copyStream copies src to write until either fails. It waits for data without a buffer and
 // takes one from the pool only to read and write. A wait ends once nothing moved for act's
-// timeout (in either direction, if act is shared), like nginx's proxy_read_timeout. It returns
-// nil if src closed cleanly (EOF). A src without a file descriptor to wait on (a TLS client,
-// whose records crypto/tls buffers) is copied with a small buffer of its own instead.
+// timeout (in either direction, if act is shared), like nginx's proxy_read_timeout: the read
+// deadline is only moved on when it passes, not for every read. It returns nil if src closed
+// cleanly (EOF). A src without a file descriptor to wait on (a TLS client, whose records
+// crypto/tls buffers) is copied with a small buffer of its own instead.
 func copyStream(src net.Conn, act *activity, write func([]byte) error) error {
 	sc, ok := src.(syscall.Conn)
 	if !ok {
@@ -346,30 +348,65 @@ func copyStream(src net.Conn, act *activity, write func([]byte) error) error {
 	if err != nil {
 		return err
 	}
+	src.SetReadDeadline(act.deadline())
 	for {
-		src.SetReadDeadline(act.deadline())
-		if err := waitReadable(raw); err != nil {
-			if act.movedSince(err) {
-				continue
-			}
-			return err
-		}
-		buf := streamBufferPool.Get()
-		n, err := src.Read(buf)
+		buf, n, err := readReady(raw)
 		if n > 0 {
 			act.touch()
-			if werr := write(buf[:n]); werr != nil {
-				streamBufferPool.Put(buf)
+			werr := write(buf[:n])
+			streamBufferPool.Put(buf)
+			if werr != nil {
 				return werr
 			}
+			continue
 		}
-		streamBufferPool.Put(buf)
-		if errors.Is(err, io.EOF) {
-			return nil
-		} else if err != nil {
-			return err
+		if err == nil {
+			return nil // EOF
+		} else if act.movedSince(err) {
+			src.SetReadDeadline(act.deadline())
+			continue
 		}
+		return err
 	}
+}
+
+// readReady waits until the connection has data, EOF or an error, honoring its read deadline,
+// and reads into a pooled buffer, which it returns with what it read (n > 0), or nil and an
+// error, or n == 0 and no error for EOF. A buffer is only taken while a read is tried: the
+// netpoller is edge-triggered, so a wait must follow a read that found nothing (EAGAIN); after
+// a wakeup, the read is the one that takes the data. A socket error (e.g. a reset) is returned
+// as such.
+func readReady(raw syscall.RawConn) ([]byte, int, error) {
+	var buf []byte
+	var n int
+	var sockErr error
+	if err := raw.Read(func(fd uintptr) bool {
+		buf = streamBufferPool.Get()
+		var err error
+		for {
+			n, err = syscall.Read(int(fd), buf)
+			if !errors.Is(err, syscall.EINTR) {
+				break
+			}
+		}
+		if errors.Is(err, syscall.EAGAIN) {
+			streamBufferPool.Put(buf)
+			buf = nil
+			return false
+		}
+		sockErr = err
+		return true
+	}); err != nil {
+		return nil, 0, err
+	}
+	if sockErr != nil {
+		streamBufferPool.Put(buf)
+		return nil, 0, os.NewSyscallError("read", sockErr)
+	} else if n <= 0 {
+		streamBufferPool.Put(buf)
+		return nil, 0, nil
+	}
+	return buf, n, nil
 }
 
 // copyBuffered is copyStream for a src it cannot wait on, with a small buffer held while waiting
@@ -410,29 +447,6 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	n, err := l.r.Read(p)
 	l.n -= int64(n)
 	return n, err
-}
-
-// waitReadable blocks until the connection has data, EOF or an error, honoring its read
-// deadline. It peeks one byte: the netpoller is edge-triggered, so it may only wait after the
-// socket reported EAGAIN, or it could sleep on data that is already there. A socket error (e.g.
-// a reset) is returned here: the peek consumes it, so the next read would only see EOF.
-func waitReadable(raw syscall.RawConn) error {
-	var peek [1]byte
-	var sockErr error
-	if err := raw.Read(func(fd uintptr) bool {
-		_, _, err := syscall.Recvfrom(int(fd), peek[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
-		if errors.Is(err, syscall.EAGAIN) {
-			return false
-		}
-		sockErr = err
-		return true
-	}); err != nil {
-		return err
-	}
-	if sockErr != nil {
-		return os.NewSyscallError("recvfrom", sockErr)
-	}
-	return nil
 }
 
 func removeHopHeaders(h http.Header) {

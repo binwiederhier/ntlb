@@ -13,6 +13,7 @@ the code itself is in [code.md](code.md). User-facing docs are in the [README](.
 | `balancer` | The state: upstreams, their health, the open sessions (streams), drains. No HTTP serving. |
 | `server` | Listeners (HTTP, HTTPS, admin), the proxy (`proxy.go`), the admin API, the access log, cert reloads. |
 | `client` | Admin API client used by the CLI. |
+| `procs` | Adapts GOMAXPROCS to the load (see [CPU and the scheduler](#cpu-and-the-scheduler-2026-11-14)). |
 | `cmd` | urfave/cli v3 commands. v3 because it parses flags after positional args (`upstream drain app2 -d 5m`) and root flags are persistent. |
 
 ## Routing (`balancer/strategy.go`, `balancer/hash.go`)
@@ -138,10 +139,13 @@ keeps a site's conns, and so its idle connections, unless those settings changed
 - the response body is wrapped in `idleTimeoutBody` (cancel after `upstreams.<name>.timeouts.read` without
   a byte); not for 101 responses, whose body must stay an `io.ReadWriteCloser`
 
-`FlushInterval: -1` flushes every write. Reads from the client body and writes to the client have
-an inactivity deadline of `upstreams.<name>.timeouts.read` (`clientBody`, `deadlineWriter`), and canceling
-the request (drain) sets both deadlines to now, so a stalled upload or a client that stops reading
-neither holds a handler forever nor survives a drain. `BufferPool` hands out 4 KiB copy buffers: a stream holds
+`FlushInterval: -1` flushes every write. A read from the client body or a write to the client
+that takes longer than `upstreams.<name>.timeouts.read` is interrupted (`clientBody`,
+`deadlineWriter`), and canceling the request (drain) sets both deadlines to now, so a stalled upload
+or a client that stops reading neither holds a handler forever nor survives a drain. The timeout
+is a timer per direction, started and stopped around each call, which sets the deadline to now
+when it fires; a deadline set before every call costs HTTP/2 a round trip to the connection's
+goroutine per write, for every message of every stream. `BufferPool` hands out 4 KiB copy buffers: a stream holds
 its buffer while it waits, and the default 32 KiB was half of a stream's heap. The transport is
 swapped on reload (new dial timeout/keepalives), the old one only loses its idle connections.
 
@@ -180,13 +184,14 @@ not WebSocket upgrades) bypass
   `Rewrite` does. Response headers are limited to 64 KiB, 1xx responses are skipped, and a
   response that is not close-delimited (chunked, Content-Length, 204/304) is decoded by its
   framing instead of copied raw.
-- **Waiting**: `waitReadable` parks in the netpoller via `RawConn.Read` holding no buffer, then a
-  pooled 4 KiB buffer is used for one read+write. It peeks a byte with `MSG_PEEK|MSG_DONTWAIT`
-  first: the netpoller is edge-triggered, so it may only wait after seeing `EAGAIN`, or it could
-  sleep on data that is already buffered. The read deadline (`upstreams.<name>.timeouts.read`) bounds the
-  wait. A socket error seen by the peek (e.g. a reset) is returned there, since the peek consumes
-  it and the next read would only see EOF; that made a reset look like a clean end until the tests
-  caught it.
+- **Waiting**: `readReady` parks in the netpoller via `RawConn.Read` holding no buffer. Inside the
+  callback it takes a pooled 4 KiB buffer and reads; on `EAGAIN` it puts the buffer back and
+  waits (the netpoller is edge-triggered, so it may only wait after seeing `EAGAIN`, or it could
+  sleep on data that is already buffered). One `read` per message, where a peek and then a read
+  was two. A socket error (e.g. a reset) is returned as one, not as EOF; a reset looking like a
+  clean end was caught by the tests with the earlier peek. The read deadline
+  (`upstreams.<name>.timeouts.read`) bounds the wait; it is set once and moved only when it
+  expired while the stream was active, not before every read.
 - **HTTP/1.1 clients**: the connection is hijacked, the response head written by hand with
   `Connection: close` (close-delimited body), and the copy runs in a new goroutine while the
   handler returns, so the server's per-connection state (bufio buffers, parsed request) is freed.
@@ -516,7 +521,8 @@ Go runtime settings, 15-minute runs (5 minutes of steady state, so rougher):
 | `GOGC=200` | 0.65 cores | 2.77 GB | 4.8 ms |
 
 Neither is worth it as a default: fewer threads trade CPU for tail latency, a laxer GC trades
-CPU for 40% more memory.
+CPU for 40% more memory. A number of threads that follows the load did turn out to be worth it,
+see [CPU and the scheduler](#cpu-and-the-scheduler-2026-11-14).
 
 Where the CPU goes at 40k streams: syscalls ~20% (a read and a write per message per stream),
 the scheduler ~22% (goroutine hand-offs, mostly HTTP/2's frame writer), TLS handshakes ~6.5% (a
@@ -585,6 +591,37 @@ balancer's ports, ~19.2k connections for 40k streams), three times per run, ntlb
 about the same: peaks of 3.0-3.3 vs 3.1-3.6 cores, 73-101 vs 74-95 extra CPU-seconds per storm,
 whole runs with 12 vs 14 lost messages. The generator (same VM, ~3.4 cores) set the reconnect
 pace, so these are not the true peaks; that needs the generator on its own machine.
+
+## CPU and the scheduler (2026-11-14)
+
+The same 40k-stream load (25-minute runs, profile at 15 minutes), with the medians the same as
+nginx's but the CPU almost twice; the profile put 18% of it into Go's scheduler: an idle P woken
+for every goroutine that becomes runnable (`wakep`, `futexwakeup`), spinning in `findRunnable`
+and going back to sleep. Locally, 5,000 streams at one message a second took 0.30 cores
+(HTTP/1) and 0.42 (HTTP/2) at 12 Ps, 0.18 and 0.21 at one.
+
+| Run | CPU | Memory (PSS) | Delivery p50 / p99 | Poll p99 | max p99 |
+|---|---|---|---|---|---|
+| nginx | 0.37 cores | 2.10 GB | 1.2 / 3.80 ms | 3.00 ms | 4.6 ms |
+| ntlb `324f2e6` | 0.69 cores | 1.79 GB | 1.1 / 3.65 ms | 3.00 ms | 4.3 ms |
+| + timers, one read per message | 0.67 cores | 1.79 GB | 1.1 / 3.50 ms | 2.80 ms | 4.4 ms |
+| the same, `GOMAXPROCS=3` | 0.63 cores | 1.78 GB | 1.0 / 3.60 ms | 2.80 ms | 5.1 ms |
+| + `procs`, at least 2 Ps | 0.59 cores | 1.79 GB | 1.0 / 3.60 ms | 2.95 ms | 4.3 ms |
+| + `procs`, at least 3 Ps | 0.64 cores | 1.78 GB | 1.0 / 3.50 ms | 2.80 ms | 4.1 ms |
+
+All runs: 0 lost, 0 errors. The timers (see [Proxy](#proxy-serverproxygo)) and one read per
+message (see [Stream path](#stream-path-serverstreamgo)) save 3%. `procs` samples the process's
+CPU time every 250ms and sets GOMAXPROCS to keep each P at 40% busy: raised at once when a P is
+above 60%, lowered once every P stayed below 25% for 2s, between a minimum and all CPUs. An
+operator's `GOMAXPROCS` disables it. The scheduler's share fell from 18% to 15% (12% at a minimum of 2); most of what is
+left above nginx is HTTP/2's frame writer, a goroutine and a TLS write per flush, inside
+net/http.
+
+The minimum is 3, not 2: locally, a message to 5,000 HTTP/2 streams at the same instant (a
+popular topic) took twice as long to reach them all at 2 Ps (median under 32 ms vs under 8 ms at
+3, 4 and 12 Ps). That costs 0.05 cores at this load, since `procs` sits at the minimum here. A reconnect storm with `procs` (minimum 2) looked
+like the one without it: peaks of 3.2-3.4 cores, 79-103 extra CPU-seconds per storm, 95% of the
+clients back after 72-85s, 9 lost messages in the run (12 without).
 
 ## Faults under load (2026-11-11)
 
