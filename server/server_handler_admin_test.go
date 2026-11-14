@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -200,4 +201,39 @@ func TestAdmin_NoLoadBalancerDrain(t *testing.T) {
 		require.Equal(t, http.StatusNotFound, status, method)
 	}
 	require.True(t, s.balancer.Status().Ready)
+}
+
+func TestAdmin_RejectsBrowserRequests(t *testing.T) {
+	// A web page must not reach the admin API: not cross-origin (CSRF, which browsers mark with an
+	// Origin header) and not by DNS rebinding (its own hostname resolving to 127.0.0.1)
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "listen-profiler: '127.0.0.1:0'", app1)
+	do := func(method, addr, path, host, origin string) int {
+		req, err := http.NewRequest(method, "http://"+addr+path, strings.NewReader(""))
+		require.NoError(t, err)
+		if host != "" {
+			req.Host = host
+		}
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	_, port, err := net.SplitHostPort(s.AdminAddr())
+	require.NoError(t, err)
+
+	// Cross-origin POST and rebound hostnames are refused
+	require.Equal(t, http.StatusForbidden, do(http.MethodPost, s.AdminAddr(), "/v1/upstreams/app1/drain", "", "https://evil.example"))
+	require.Equal(t, balancer.StateHealthy, adminStatus(t, s).Upstreams[0].State)
+	require.Equal(t, http.StatusForbidden, do(http.MethodGet, s.AdminAddr(), "/v1/status", "evil.example:"+port, ""))
+	require.Equal(t, http.StatusForbidden, do(http.MethodGet, s.ProfilerAddr(), "/debug/pprof/", "evil.example", ""))
+
+	// IP literals and localhost, as curl and Prometheus send them, are fine
+	for _, host := range []string{"", "localhost:" + port, "localhost", "[::1]:" + port} {
+		require.Equal(t, http.StatusOK, do(http.MethodGet, s.AdminAddr(), "/v1/status", host, ""), host)
+	}
+	require.Equal(t, http.StatusOK, do(http.MethodGet, s.ProfilerAddr(), "/debug/pprof/", "", ""))
 }

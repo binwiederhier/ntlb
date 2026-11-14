@@ -10,7 +10,7 @@ import (
 func profilerHandler() http.Handler {
 	mux := http.NewServeMux()
 	handlePprof(mux)
-	return mux
+	return localOnly(mux)
 }
 
 // handlePprof registers the profiles, for the profiler and the admin listener

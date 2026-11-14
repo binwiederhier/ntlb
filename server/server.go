@@ -305,6 +305,8 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		markHandled(r.Context())
+		boundWrites := boundFinalWrites(w, r)
+		defer boundWrites()
 		conf := s.config.Load()
 		if conf.Listener(listen) == nil {
 			// A connection to a listener a reload removed: send the client to reconnect (HTTP/2:
@@ -371,7 +373,8 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 		}
 		w = newGzipWriter(out, r, conf.GzipFor(site), pr)
 		if gw, ok := w.(*gzipWriter); ok {
-			defer gw.close() // Runs before the deferred finish above, which reads sw
+			defer gw.close()    // Runs before the deferred finish above, which reads sw
+			defer boundWrites() // Before close: the trailer is a final write too
 		}
 		if rule != nil {
 			s.answer(w, r, env, rule, pr.errorPages)
@@ -379,6 +382,21 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(withProxyRequest(r.Context(), pr)))
 	})
+}
+
+// boundFinalWrites clears the write deadline an HTTP/1 keep-alive connection kept from its last
+// response, and returns a func that sets one for what is still written after the handler: Go
+// flushes its buffers and the chunked end there, outside the write timers, so a client that stops
+// reading right at the end would hold the connection forever. HTTP/2 has WriteByteTimeout.
+func boundFinalWrites(w http.ResponseWriter, r *http.Request) func() {
+	if r.ProtoMajor != 1 {
+		return func() {} // Bounded by WriteByteTimeout
+	}
+	ctrl := http.NewResponseController(w)
+	ctrl.SetWriteDeadline(time.Time{})
+	return func() {
+		ctrl.SetWriteDeadline(time.Now().Add(clientSendTimeout)) // Fails once hijacked, which is fine: the stream owns it
+	}
 }
 
 // boundAnswer prepares the answer of a rule like a proxied response: every write to the client is

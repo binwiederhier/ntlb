@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -13,7 +14,9 @@ import (
 	"heckel.io/ntlb/balancer"
 )
 
-// Admin API, served on the admin listener only (keep it on localhost or a private address):
+// Admin API, served on the admin listener only (keep it on localhost or a private address). It
+// refuses requests with an Origin header or a Host other than an IP address or localhost, so a web
+// page cannot reach it (see localOnly):
 //
 //	GET    /v1/health                    200 if at least one upstream is healthy, else 503
 //	GET    /v1/ready                     200 if healthy and neither withdrawing nor draining, else 503
@@ -89,7 +92,29 @@ func (s *Server) adminHandler() http.Handler {
 	mux.HandleFunc("DELETE "+apiUpstreamDrainPath, s.handleAdmin(s.handleUpstreamUndrain))
 	mux.Handle("GET "+apiMetricsPath, promhttp.HandlerFor(s.metrics.registry, promhttp.HandlerOpts{}))
 	handlePprof(mux)
-	return mux
+	return localOnly(mux)
+}
+
+// localOnly refuses requests from web pages: cross-origin ones (CSRF), which browsers mark with
+// an Origin header, and DNS rebinding, where a page's own hostname resolves to this listener
+func localOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(headerOrigin) != "" || !localHost(r.Host) {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// localHost reports whether a Host header names an IP address or localhost, as tools do, rather
+// than a domain a browser could have resolved here
+func localHost(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	return host == "localhost" || net.ParseIP(host) != nil
 }
 
 // handleAdmin turns a handler's error into a JSON error response

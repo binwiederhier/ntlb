@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	// http2WriteByteTimeout closes an HTTP/2 connection whose writes made no progress for this long
-	// (like nginx's send_timeout default), a var for the tests
-	http2WriteByteTimeout = time.Minute
+	// clientSendTimeout closes an HTTP/2 connection whose writes made no progress for this long,
+	// and bounds the end of an HTTP/1 response (like nginx's send_timeout default), a var for the tests
+	clientSendTimeout = time.Minute
 )
 
 // publicServer is the proxying server of one listen address
@@ -251,7 +251,7 @@ func newHTTPServer(name string, handler http.Handler) *http.Server {
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 		HTTP2: &http.HTTP2Config{
-			WriteByteTimeout: http2WriteByteTimeout, // Deadlines on its streams cannot reach a writer stuck in the kernel
+			WriteByteTimeout: clientSendTimeout, // Deadlines on its streams cannot reach a writer stuck in the kernel
 		},
 		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelDebug), // TLS handshake errors and the like
 	}

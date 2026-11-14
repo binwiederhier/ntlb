@@ -880,3 +880,49 @@ func readHeadBytewise(conn net.Conn) string {
 		}
 	}
 }
+
+func TestStream_HTTP2HostHeaderSentOnce(t *testing.T) {
+	// An HTTP/2 client may send a host field besides :authority (curl --http2 -H "Host: ..."
+	// does); the upstream must still get one Host, or ntfy answers 400
+	heads := make(chan string, 1)
+	app1 := newRawUpstream(t, "app1", func(conn net.Conn) {
+		head, _ := readRequestHead(conn)
+		if answerReady(conn, head) {
+			return
+		}
+		heads <- head
+		io.WriteString(conn, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nstart\n")
+	})
+	s := newTLSTestServer(t, "", app1)
+	conn, err := tls.Dial("tcp", s.HTTPSAddr(), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2"},
+	})
+	require.NoError(t, err)
+	defer conn.Close()
+	require.Equal(t, "h2", conn.ConnectionState().NegotiatedProtocol)
+
+	// Preface, empty SETTINGS, and one HEADERS frame (END_STREAM|END_HEADERS) of literal fields
+	var block []byte
+	for _, f := range [][2]string{{":method", "GET"}, {":scheme", "https"}, {":path", "/mytopic/json"}, {":authority", "ntfy.example.com"}, {"host", "ntfy.example.com"}} {
+		block = append(block, 0x00, byte(len(f[0])))
+		block = append(block, f[0]...)
+		block = append(block, byte(len(f[1])))
+		block = append(block, f[1]...)
+	}
+	frame := func(typ, flags byte, stream uint32, payload []byte) []byte {
+		n := len(payload)
+		b := []byte{byte(n >> 16), byte(n >> 8), byte(n), typ, flags, byte(stream >> 24), byte(stream >> 16), byte(stream >> 8), byte(stream)}
+		return append(b, payload...)
+	}
+	_, err = io.WriteString(conn, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+	require.NoError(t, err)
+	_, err = conn.Write(append(frame(0x4, 0, 0, nil), frame(0x1, 0x5, 1, block)...))
+	require.NoError(t, err)
+	select {
+	case head := <-heads:
+		require.Equal(t, 1, strings.Count(head, "\r\nHost: "), head)
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not reach the upstream")
+	}
+}

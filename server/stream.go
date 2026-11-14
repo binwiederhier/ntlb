@@ -184,6 +184,7 @@ func (p *proxy) roundTripStream(r *http.Request, addr string) (*upstreamStream, 
 	conn.SetDeadline(time.Now().Add(pr.readTimeout)) // Like the transport's ResponseHeaderTimeout
 	upgrade := upgradeType(r.Header)
 	header := r.Header.Clone()
+	header.Del(headerHost) // An HTTP/2 client's host field, besides :authority; written as r.Host below
 	removeHopHeaders(header)
 	for _, name := range forwardedHeaders {
 		header.Del(name)

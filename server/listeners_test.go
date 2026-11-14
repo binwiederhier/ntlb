@@ -19,8 +19,8 @@ func TestListeners_HTTP2StalledConnectionIsClosed(t *testing.T) {
 	// enough that the server never waits on them, blocks the connection's frame writer in the
 	// kernel. Deadlines on its streams only queue resets behind that writer, so neither the read
 	// timeout nor a drain ends the request; the connection's write timeout must
-	defer func(timeout time.Duration) { http2WriteByteTimeout = timeout }(http2WriteByteTimeout)
-	http2WriteByteTimeout = 500 * time.Millisecond
+	defer func(timeout time.Duration) { clientSendTimeout = timeout }(clientSendTimeout)
+	clientSendTimeout = 500 * time.Millisecond
 	app1 := newTestUpstream(t, "app1")
 	app1.on("/flood", func(w http.ResponseWriter, r *http.Request) {
 		chunk := strings.Repeat("x", 64*1024)

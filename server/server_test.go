@@ -1994,3 +1994,49 @@ func skipUnderRace(t *testing.T) {
 		}
 	}
 }
+
+// deadlineLog records the write deadlines set on it, and how much of the body was written
+// by then
+type deadlineLog struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+	written   []int
+}
+
+func (d *deadlineLog) SetWriteDeadline(t time.Time) error {
+	d.deadlines = append(d.deadlines, t)
+	d.written = append(d.written, d.Body.Len())
+	return nil
+}
+
+func TestServer_HTTP1FinalWritesHaveDeadline(t *testing.T) {
+	// Go writes the end of an HTTP/1 response (its buffers, the chunked end, the gzip trailer)
+	// after the handler, outside the write timers: a client that stops reading right there must
+	// still be cut. The deadline a keep-alive connection keeps from it is cleared for the next one.
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, testGzip, app1)
+	listen := s.config.Load().Listeners[0].Addr
+	h := s.observe(listen, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyRequestFromContext(r.Context()).kind = kindRequest // As the proxy marks it
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, gzipBody)
+	}))
+	for _, acceptEncoding := range []string{"", "gzip"} {
+		w := &deadlineLog{
+			ResponseRecorder: httptest.NewRecorder(),
+		}
+		r := httptest.NewRequest(http.MethodGet, "http://"+s.HTTPAddr()+"/mytopic/json", nil)
+		r.Header.Set("Accept-Encoding", acceptEncoding)
+		start := time.Now()
+		h.ServeHTTP(w, r)
+		require.NotEmpty(t, w.deadlines, acceptEncoding)
+		require.True(t, w.deadlines[0].IsZero(), acceptEncoding)
+		last := w.deadlines[len(w.deadlines)-1]
+		require.WithinDuration(t, start.Add(clientSendTimeout), last, 5*time.Second, acceptEncoding)
+		if acceptEncoding == "gzip" {
+			require.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
+			require.Len(t, w.deadlines, 3)
+			require.Less(t, w.written[1], w.Body.Len(), "the trailer comes after a deadline")
+		}
+	}
+}

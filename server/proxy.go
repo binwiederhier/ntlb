@@ -47,6 +47,8 @@ const (
 	headerContentLength   = "Content-Length"
 	headerContentType     = "Content-Type"
 	headerETag            = "ETag"
+	headerHost            = "Host"
+	headerOrigin          = "Origin"
 	headerVary            = "Vary"
 	encodingGzip          = "gzip"
 	connectionClose       = "close"
