@@ -15,6 +15,12 @@ const (
 	// gzipLevel and gzipMinLength are nginx's gzip_comp_level and gzip_min_length on ntfy.sh
 	gzipLevel     = 6
 	gzipMinLength = 1100
+
+	// gzipMaxWriters caps the compressors in use at once; past it, responses go out uncompressed.
+	// A compressor is ~1 MiB and lives until its response ends, which a client that stops reading
+	// can delay for as long as it trickles bytes: 500 such requests for a large static file took
+	// 537 MiB before the cap.
+	gzipMaxWriters = 256
 )
 
 var (
@@ -24,6 +30,7 @@ var (
 			return zw
 		},
 	}
+	gzipSlots = make(chan struct{}, gzipMaxWriters) // One per compressor in use
 )
 
 // gzipWriter compresses a response if it qualifies, like nginx's gzip with gzip_proxied any: a
@@ -132,6 +139,7 @@ func (w *gzipWriter) close() {
 		w.zw.Reset(nil)
 		gzipWriters.Put(w.zw)
 		w.zw = nil
+		<-gzipSlots
 	}
 }
 
@@ -156,9 +164,17 @@ func (w *gzipWriter) contentLength() int64 {
 	return length
 }
 
-// decide writes the header, compressed or not, and what was held back
+// decide writes the header, compressed or not (also not if gzipMaxWriters are in use), and what
+// was held back
 func (w *gzipWriter) decide(compress bool) error {
 	w.decided = true
+	if compress {
+		select {
+		case gzipSlots <- struct{}{}:
+		default:
+			compress = false
+		}
+	}
 	if compress {
 		h := w.Header()
 		h.Del(headerContentLength)

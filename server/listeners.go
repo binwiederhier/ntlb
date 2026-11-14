@@ -9,8 +9,15 @@ import (
 	"net/http"
 	"slices"
 	"sync/atomic"
+	"time"
 
 	"heckel.io/ntlb/config"
+)
+
+var (
+	// http2WriteByteTimeout closes an HTTP/2 connection whose writes made no progress for this long
+	// (like nginx's send_timeout default), a var for the tests
+	http2WriteByteTimeout = time.Minute
 )
 
 // publicServer is the proxying server of one listen address
@@ -233,8 +240,9 @@ func (s *Server) listenerAddr(name string) string {
 	return ""
 }
 
-// newHTTPServer creates a server without read or write timeouts beyond the request header: its
-// requests are long-lived streams in both directions
+// newHTTPServer creates a server without read or write timeouts beyond the request header (its
+// requests are long-lived streams in both directions), except for an HTTP/2 connection that
+// takes no more bytes at all
 func newHTTPServer(name string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              name,
@@ -242,6 +250,9 @@ func newHTTPServer(name string, handler http.Handler) *http.Server {
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
-		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelDebug), // TLS handshake errors and the like
+		HTTP2: &http.HTTP2Config{
+			WriteByteTimeout: http2WriteByteTimeout, // Deadlines on its streams cannot reach a writer stuck in the kernel
+		},
+		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelDebug), // TLS handshake errors and the like
 	}
 }

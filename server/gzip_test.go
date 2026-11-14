@@ -363,6 +363,39 @@ func TestGzip_WriterFlushErrorAndEarlyFlush(t *testing.T) {
 	require.Equal(t, rec.Header().Get("Content-Encoding") == "gzip", !strings.HasPrefix(rec.Body.String(), gzipBody))
 }
 
+func TestGzip_CompressorsCapped(t *testing.T) {
+	// Responses held open by clients that do not read keep their compressor: past the cap, new
+	// responses go out uncompressed instead of taking another one, and a finished one frees its own
+	gz := &config.Gzip{Types: []string{"text/plain"}}
+	respond := func() (*gzipWriter, *httptest.ResponseRecorder) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		w := newGzipWriter(rec, req, gz, &proxyRequest{kind: kindRequest}).(*gzipWriter)
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, gzipBody)
+		return w, rec
+	}
+	open := make([]*gzipWriter, 0, gzipMaxWriters)
+	for range gzipMaxWriters {
+		w, rec := respond()
+		require.Equal(t, "gzip", rec.Header().Get("Content-Encoding"))
+		open = append(open, w)
+	}
+	w, rec := respond()
+	w.close()
+	require.Empty(t, rec.Header().Get("Content-Encoding"))
+	require.Equal(t, gzipBody, rec.Body.String())
+
+	open[0].close()
+	w, rec = respond()
+	require.Equal(t, "gzip", rec.Header().Get("Content-Encoding"))
+	w.close()
+	for _, w := range open[1:] {
+		w.close()
+	}
+}
+
 func TestGzip_NotOnSubscriptions(t *testing.T) {
 	// A subscription never compresses, so it does not keep a wrapper for its whole life either
 	req := httptest.NewRequest(http.MethodGet, "/mytopic/json", nil)
