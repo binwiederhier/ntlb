@@ -1,0 +1,21 @@
+# ntlb config. Sites (the addresses to listen on, the hosts, certificates, upstreams and rules) go
+# in conf.d/*.yml, one file per site; ntlb needs at least one. Other settings (rules, access
+# logs, ...) can go there too. All settings, with examples:
+# docs/configuration.md, and examples/ntfy/ (a complete setup for ntfy) in the ntlb source.
+#
+# Check with "ntlb check-config", then apply with "systemctl reload ntlb" (SIGHUP) or
+# "ntlb reload": a config with an error is rejected as a whole, and the old one stays.
+
+# Admin API (reload, drain, status), /metrics and pprof. No auth: keep it on localhost.
+listen-admin: "127.0.0.1:2590"
+
+# Access logs, in nginx's "combined" format plus key=value fields. A request goes to the first
+# file whose match is true; one without match takes the rest.
+access-logs:
+  - file: /var/log/ntlb/access.log
+    match: status < 400
+  - file: /var/log/ntlb/access_error.log
+
+# Merged into this file: lists (sites, rules, access-logs) are appended, other settings may be set
+# once. Relative to this file's directory; a reload picks up added, changed or removed files.
+include: [conf.d/*.yml]

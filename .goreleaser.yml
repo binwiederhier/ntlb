@@ -22,29 +22,29 @@ nfpms:
       - deb
     bindir: /usr/bin
     contents:
-      - src: packaging/config.yml
+      - src: pkg/config.yml
         dst: /etc/ntlb/config.yml
         type: "config|noreplace"
         file_info:
           mode: 0644
-      - src: packaging/sites.d/ntfy.yml
-        dst: /etc/ntlb/sites.d/ntfy.yml
-        type: "config|noreplace"
+      - dst: /etc/ntlb/conf.d
+        type: dir
         file_info:
-          mode: 0644
-      - src: packaging/ntlb.service
+          mode: 0755
+      - src: pkg/ntlb.service
         dst: /lib/systemd/system/ntlb.service
         file_info:
           mode: 0644
     scripts:
-      postinstall: packaging/scripts/postinst.sh
-      preremove: packaging/scripts/prerm.sh
-      postremove: packaging/scripts/postrm.sh
+      postinstall: pkg/scripts/postinst.sh
+      preremove: pkg/scripts/prerm.sh
+      postremove: pkg/scripts/postrm.sh
 archives:
   - formats: [tar.gz]
     files:
       - README.md
-      - packaging/*
+      - pkg/config.yml
+      - pkg/ntlb.service
 checksum:
   name_template: checksums.txt
 snapshot:

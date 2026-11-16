@@ -288,7 +288,7 @@ func TestParse_Invalid(t *testing.T) {
 }
 
 func TestParse_NoStreamsByDefault(t *testing.T) {
-	// Which requests are long-lived streams is up to the site; the ntfy site's are in packaging
+	// Which requests are long-lived streams is up to the site; the ntfy site's are in the ntfy example
 	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]"))
 	require.NoError(t, err)
 	for _, target := range []string{"/mytopic/json", "/t/sse", "/events"} {
@@ -415,9 +415,25 @@ func TestLoad_Invalid(t *testing.T) {
 	require.ErrorContains(t, err, "invalid config: at least one site")
 }
 
-func TestLoad_PackagingExample(t *testing.T) {
-	// The shipped example must always parse, also with unknown fields rejected
-	c, err := Load("../packaging/config.yml")
+func TestLoad_PackagedConfig(t *testing.T) {
+	// The package's config.yml sets no site: it loads once a file in conf.d/ adds one
+	dir := t.TempDir()
+	b, err := os.ReadFile("../pkg/config.yml")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yml"), b, 0600))
+	_, err = Load(filepath.Join(dir, "config.yml"))
+	require.ErrorContains(t, err, "at least one site")
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "conf.d"), 0700))
+	site := "sites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['10.0.0.1:80']}]}}}]"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "conf.d", "s.yml"), []byte(site), 0600))
+	c, err := Load(filepath.Join(dir, "config.yml"))
+	require.NoError(t, err)
+	require.Len(t, c.Sites, 1)
+}
+
+func TestLoad_NtfyExample(t *testing.T) {
+	// The ntfy example must always parse, also with unknown fields rejected
+	c, err := Load("../examples/ntfy/config.yml")
 	require.NoError(t, err)
 	require.Equal(t, ListenAddrs{":80"}, c.Sites[0].ListenHTTP)
 	require.Equal(t, ListenAddrs{":443"}, c.Sites[0].ListenHTTPS)
@@ -578,7 +594,7 @@ func TestRestartRequired_Each(t *testing.T) {
 
 func FuzzParse(f *testing.F) {
 	// Any input either parses or is an error: never a panic (a reload must not take the server down)
-	for _, file := range []string{"../packaging/config.yml", "../packaging/sites.d/ntfy.yml"} {
+	for _, file := range []string{"../examples/ntfy/config.yml", "../examples/ntfy/conf.d/ntfy.yml"} {
 		b, err := os.ReadFile(file)
 		require.NoError(f, err)
 		f.Add(b)

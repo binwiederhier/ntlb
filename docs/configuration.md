@@ -1,8 +1,8 @@
 # Configuration
 
 Every setting of ntlb, the expression language, and recipes. The [README](../README.md#configuration)
-has the short version; [packaging/config.yml](../packaging/config.yml) and
-[packaging/sites.d/ntfy.yml](../packaging/sites.d/ntfy.yml) are a complete, commented example (the
+has the short version; [examples/ntfy/config.yml](../examples/ntfy/config.yml) and
+[examples/ntfy/conf.d/ntfy.yml](../examples/ntfy/conf.d/ntfy.yml) are a complete, commented example (the
 ntfy.sh setup). How it works inside is in [architecture.md](architecture.md) and
 [design.md](design.md).
 
@@ -30,15 +30,15 @@ files, which are merged into it as if they were one big file:
 ```yaml
 # /etc/ntlb/config.yml
 listen-admin: "127.0.0.1:2590"
-include: [sites.d/*.yml, rules.d/*.yml]   # relative to this file's directory
+include: [conf.d/*.yml, rules/*.yml]   # relative to this file's directory
 ```
 
 ```mermaid
 flowchart LR
     main["config.yml<br>(global settings)"] --> merged["one merged config"]
-    s1["sites.d/api.yml"] --> merged
-    s2["sites.d/www.yml"] --> merged
-    r1["rules.d/abuse.yml"] --> merged
+    s1["conf.d/api.yml"] --> merged
+    s2["conf.d/www.yml"] --> merged
+    r1["rules/abuse.yml"] --> merged
     merged --> check{"valid?"}
     check -- yes --> live["applied (reload) or served (start)"]
     check -- no --> old["rejected as a whole,<br>the old config stays"]
@@ -886,7 +886,7 @@ rules:
 **A maintenance page**, switched on and off with a file and a reload:
 
 ```yaml
-# /etc/ntlb/rules.d/maintenance.yml: "include: [sites.d/*.yml, rules.d/*.yml]" picks it up;
+# /etc/ntlb/conf.d/maintenance.yml: "include: [conf.d/*.yml]" picks it up;
 # remove the file and reload to end the maintenance
 rules:
   - name: maintenance
@@ -1032,7 +1032,7 @@ sites:
 
 ntlb does not need root. It needs to bind ports 80 and 443 (`CAP_NET_BIND_SERVICE`, which the
 systemd unit grants), write its logs, and read its certificate. The packaged
-[ntlb.service](../packaging/ntlb.service) runs it as a `DynamicUser` with only that capability.
+[ntlb.service](../pkg/ntlb.service) runs it as a `DynamicUser` with only that capability.
 
 Certbot writes certificates as root into `/etc/letsencrypt`, which other users cannot read. Two
 ways to give ntlb the renewed files:

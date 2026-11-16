@@ -226,7 +226,7 @@ still run first, so abuse is still blocked and struck).
 that are merged into the main file as if it were one: slices (sites, rules, access logs,
 include) are appended, any other field may be set in one file only (`mergeFile`, by reflection
 over `Config`). So a deploy can drop a file with a `sites:` list (or global rules) into
-`sites.d/` and reload.
+`conf.d/` and reload.
 
 The server runs one `http.Server` per listen address, its handler bound to that address
 (`observe(listen, ...)`). A reload binds the addresses the new config adds before anything else

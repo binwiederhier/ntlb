@@ -49,7 +49,7 @@ const (
 	maxWeight                      = 1000              // A server's weight: plenty for shares, and bounds a round-robin round
 
 	// DefaultStreamsMatch is no request: which ones are long-lived streams depends on the app (see
-	// packaging/sites.d/ntfy.yml for ntfy's subscriptions)
+	// examples/ntfy/conf.d/ntfy.yml for ntfy's subscriptions)
 	DefaultStreamsMatch = "false"
 
 	// UpstreamDefault is the upstream of a site that takes every request no proxy rule routes

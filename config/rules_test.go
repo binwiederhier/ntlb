@@ -145,9 +145,9 @@ func TestParse_RuleErrorNamesTheRule(t *testing.T) {
 	require.ErrorContains(t, err, "rule spy")
 }
 
-func TestLoad_PackagingExampleRules(t *testing.T) {
-	// The shipped example's rules do what their comments say
-	c, err := Load("../packaging/config.yml")
+func TestLoad_NtfyExampleRules(t *testing.T) {
+	// The ntfy example's rules do what their comments say
+	c, err := Load("../examples/ntfy/config.yml")
 	require.NoError(t, err)
 	byName := make(map[string]*Rule)
 	for _, r := range append(c.Rules, c.Sites[0].Rules...) {

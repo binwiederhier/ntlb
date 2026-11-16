@@ -1,3 +1,6 @@
+# The ntfy example: every global setting, commented, as for ntfy.sh (the site is in
+# conf.d/ntfy.yml). Not installed by the package, which has the short pkg/config.yml.
+#
 # ntlb config. Reload with "systemctl reload ntlb" (SIGHUP) or "ntlb reload": everything but
 # listen-admin, listen-metrics, listen-profiler and client-keepalive applies without cutting a
 # stream, the sites' listen addresses too (a reload says which changed settings need a restart).
@@ -127,7 +130,7 @@ rules:
 # access-logs) are appended in order (this file first, then each glob's files by name), and any
 # other setting may be set in only one file. Globs are relative to this file's directory; only
 # this file may include. Adding, changing or removing a file applies on reload.
-include: [sites.d/*.yml]
+include: [conf.d/*.yml]
 
 # Sites: each has the addresses it listens on (listen-http, listen-https: one or a list; sites can
 # share them), the hosts it serves there, its certificate, streams, its upstream (the servers and
@@ -136,4 +139,4 @@ include: [sites.d/*.yml]
 # site there without hosts; with none, it gets a 404. HTTPS serves HTTP/2 and HTTP/1.1, with the
 # certificate of the listener's site that matches the client's SNI (else its first site's).
 # A reload binds new listen addresses and closes removed ones (their open streams run on); only an
-# address that switches between listen-http and listen-https needs a restart. See sites.d/ntfy.yml.
+# address that switches between listen-http and listen-https needs a restart. See conf.d/ntfy.yml.

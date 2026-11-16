@@ -587,18 +587,18 @@ Colocated (`foo.go` and `foo_test.go`), `make` runs fmt-check, vet, the tests an
 - **server**: end-to-end over real sockets. `newTestServer(t, extra, upstreams...)` writes a
   config (`writeConfig`: lines of `extra` go to the site or the global section by key) and starts
   a `Server`; `newTestUpstream` is an `httptest`-style ntfy stand-in with handlers per path,
-  `newRawUpstream` a TCP server for malformed answers. `TestServer_NtfyPackagedConfig` runs the
-  packaged ntfy site (`packaging/sites.d/ntfy.yml`) against fake app nodes.
+  `newRawUpstream` a TCP server for malformed answers. `TestServer_NtfyExampleConfig` runs the
+  ntfy example site (`examples/ntfy/conf.d/ntfy.yml`) against fake app nodes.
 - **balancer**: `Pick`, strategies, hashing (including how few clients move when a server
   leaves), health hysteresis, drain pacing (the tick functions take `now`, so tests pass the
   times they need).
-- **config**: parsing, defaults, every validation error, the packaged configs.
+- **config**: parsing, defaults, every validation error, the packaged config and the ntfy example.
 - **Fuzz targets**: `FuzzParse` (config), `FuzzCompile` (expressions), `FuzzAccessLog_Escape`,
   `FuzzAccessLog_RedactAuth`, `FuzzRankWeighted`. Run one with
   `go test ./config -run '^$' -fuzz FuzzParse -fuzztime 5m`.
 - **Benchmarks** (`make bench`, compare runs with `benchstat`): each step of the request path has
   one, next to its code: `BenchmarkConfig_SiteFor`, `BenchmarkNewEnv`, `BenchmarkMatch*`,
-  `BenchmarkEngine_Check*` (the packaged ntfy rules included), `BenchmarkBalancer_Pick` (every
+  `BenchmarkEngine_Check*` (the ntfy example's rules included), `BenchmarkBalancer_Pick` (every
   balance, 3 and 10 servers), `BenchmarkBalancer_SessionLifecycle*` (also with 100k open streams
   and in parallel), `BenchmarkBalancer_DrainTick*` (100k streams), `BenchmarkBalancer_Status`,
   `BenchmarkAccessLog_Write`, `BenchmarkWriteError`, `BenchmarkValidRequest`, and end to end
@@ -608,8 +608,8 @@ Colocated (`foo.go` and `foo_test.go`), `make` runs fmt-check, vet, the tests an
   (`testing.AllocsPerRun`), so a change that adds allocations to the hot path fails `make`:
   `SiteFor` and `validRequest` none, `Pick` one (the slice it returns), a session's lifecycle two,
   an access log line four, an error page none (rendered once per format, code and status), the
-  packaged rules about fifteen (mostly expr, which boxes every field an expression reads), a whole
-  publish through the packaged config 260 (client and test upstream included). Raise a budget
+  ntfy example's rules about fifteen (mostly expr, which boxes every field an expression reads), a whole
+  publish through the ntfy example config 260 (client and test upstream included). Raise a budget
   only on purpose, and say why in the commit.
 - **Memory budgets**: `TestStream_MemoryPerStream` holds 1000 open HTTP/1.1 streams and pins the
   live heap (5 KiB, test side included; about 3.5 KiB measured) and goroutines (the copy and the

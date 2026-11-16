@@ -1358,7 +1358,7 @@ func TestProxy_UpdateKeepsUnchangedConns(t *testing.T) {
 	require.Same(t, before["b/default"], changed["b/default"])
 }
 
-// ntfyBench is the shipped ntfy config in front of one app node that answers publishes and polls,
+// ntfyBench is the ntfy example config in front of one app node that answers publishes and polls,
 // and a keep-alive client from an IP exempt from the limit
 func ntfyBench(tb testing.TB) (*Server, *http.Client) {
 	app1 := newTestUpstream(tb, "app1")
@@ -1366,7 +1366,7 @@ func ntfyBench(tb testing.TB) (*Server, *http.Client) {
 		io.Copy(io.Discard, r.Body)
 		io.WriteString(w, `{"id":"abc","event":"message"}`)
 	})
-	s, _ := newNtfyPackagedServer(tb, app1)
+	s, _ := newNtfyExampleServer(tb, app1)
 	dialer := &net.Dialer{
 		LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.41")}, // Exempt from the limit
 	}
@@ -1396,7 +1396,7 @@ func ntfyDo(tb testing.TB, client *http.Client, method, url, body string) {
 }
 
 func BenchmarkProxy_NtfyPublish(b *testing.B) {
-	// A publish through the shipped ntfy config (all its rules, access logs, gzip), with keep-alive
+	// A publish through the ntfy example config (all its rules, access logs, gzip), with keep-alive
 	s, client := ntfyBench(b)
 	url := "http://" + s.HTTPAddr() + "/mytopic"
 	b.ReportAllocs()

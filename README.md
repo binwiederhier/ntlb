@@ -16,10 +16,10 @@ It is built for ntfy, but nothing in it is ntfy-only, and its defaults are those
 balancer (nginx's where it has one): which requests are long-lived streams (`streams`; default:
 none), the balancing (`upstreams.<name>.balance`; default: round-robin), the health check path (default `/`) and
 the client key (`client-key`) are configurable, so it fits any HTTP backend, also with long-lived
-streams (SSE, long polling, WebSockets). The ntfy site in
-[packaging/sites.d/ntfy.yml](packaging/sites.d/ntfy.yml) sets ntfy's. One instance can serve several **sites** (virtual hosts), each with its own
+streams (SSE, long polling, WebSockets). The ntfy example in
+[examples/ntfy/](examples/ntfy/) sets ntfy's. One instance can serve several **sites** (virtual hosts), each with its own
 listen addresses, hosts, certificate, upstreams, health checks, rules and access logs, in the main
-file or in included files (`include: [sites.d/*.yml]`, merged like `sshd_config.d`).
+file or in included files (`include: [conf.d/*.yml]`, merged like `sshd_config.d`).
 
 It replaces the nginx + lbagent pair on the ntfy.sh load balancers (ansible: `playbooks/lb.yml`,
 `roles/ntlb` in `ntfy/ansible`). What it took over from that setup is listed under
@@ -254,12 +254,14 @@ cannot be hijacked.
 
 ## Quick start
 
-From a release (the .deb on the GitHub release; it installs the binary, the unit and the sample
-config, and never restarts a running ntlb, since a restart reconnects all of its clients):
+From a release (the .deb on the GitHub release; it installs the binary, the unit and a short
+config without sites, and never restarts a running ntlb, since a restart reconnects all of its
+clients):
 
 ```bash
 curl -LO https://github.com/binwiederhier/ntlb/releases/download/v0.1.0/ntlb_0.1.0_linux_amd64.deb
-sudo apt install ./ntlb_0.1.0_linux_amd64.deb   # then edit /etc/ntlb/config.yml and sites.d/
+sudo apt install ./ntlb_0.1.0_linux_amd64.deb   # then add a site in /etc/ntlb/conf.d/
+ntlb check-config
 sudo systemctl enable --now ntlb
 ```
 
@@ -268,9 +270,9 @@ From source:
 ```bash
 make                                   # fmt-check, vet, tests, build/ntlb
 sudo install -m 755 build/ntlb /usr/bin/ntlb
-sudo install -D -m 644 packaging/config.yml /etc/ntlb/config.yml   # then edit them
-sudo install -D -m 644 packaging/sites.d/ntfy.yml /etc/ntlb/sites.d/ntfy.yml
-sudo install -m 644 packaging/ntlb.service /etc/systemd/system/
+sudo install -D -m 644 pkg/config.yml /etc/ntlb/config.yml
+sudo install -d /etc/ntlb/conf.d      # then add a site there, e.g. from examples/ntfy/conf.d/
+sudo install -m 644 pkg/ntlb.service /etc/systemd/system/
 ntlb check-config
 sudo systemctl enable --now ntlb
 ntlb status
@@ -297,8 +299,8 @@ documents everything**:
 - [Recipes](docs/configuration.md#recipes)
 - [Running as a regular user, and certificates](docs/configuration.md#running-as-a-regular-user-and-certificates)
 
-The ntfy.sh setup, shortened ([packaging/config.yml](packaging/config.yml) and
-[packaging/sites.d/ntfy.yml](packaging/sites.d/ntfy.yml) are the complete, commented version):
+The ntfy.sh setup, shortened ([examples/ntfy/config.yml](examples/ntfy/config.yml) and
+[examples/ntfy/conf.d/ntfy.yml](examples/ntfy/conf.d/ntfy.yml) are the complete, commented version):
 
 ```yaml
 # /etc/ntlb/config.yml
@@ -319,11 +321,11 @@ rules:                                # global: checked first, for every site
     on: response                      # sees status, upstream_status and rule; only strikes
     match: status == 400 && upstream_status == 0
     strike: 1
-include: [sites.d/*.yml]              # merged into this file: lists appended, the rest set once
+include: [conf.d/*.yml]              # merged into this file: lists appended, the rest set once
 ```
 
 ```yaml
-# /etc/ntlb/sites.d/ntfy.yml
+# /etc/ntlb/conf.d/ntfy.yml
 sites:
   - name: ntfy
     listen-http: ":80"                # one address or a list; other sites can share them

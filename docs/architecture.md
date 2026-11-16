@@ -347,7 +347,7 @@ sequenceDiagram
     participant B as Balancer
     participant R as rules Engine
     O->>S: SIGHUP
-    S->>S: load and validate config.yml + sites.d/*.yml
+    S->>S: load and validate config.yml + conf.d/*.yml
     S->>S: load certificates, bind added addresses, open log files
     alt anything failed
         S-->>O: error, the running config stays

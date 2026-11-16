@@ -230,7 +230,7 @@ func (u *testUpstream) addr() string {
 	return strings.TrimPrefix(u.server.URL, "http://")
 }
 
-// A site set up like ntfy's (packaging/sites.d/ntfy.yml): its subscriptions as streams, its
+// A site set up like ntfy's (examples/ntfy/conf.d/ntfy.yml): its subscriptions as streams, its
 // readiness probe, hashing; the tests play ntfy
 const (
 	testStreamsMatch = `method == "GET" && path matches "^/[-_A-Za-z0-9]{1,64}(,[-_A-Za-z0-9]{1,64})*/(json|sse|raw|ws)$" && !flag("x-poll", "poll", "po")`
@@ -776,11 +776,11 @@ func TestServer_ReloadAddsSiteFile(t *testing.T) {
 	// A site file dropped into an include directory takes traffic after a reload
 	a1, b1 := newTestUpstream(t, "app1"), newTestUpstream(t, "app1")
 	dir := t.TempDir()
-	require.NoError(t, os.Mkdir(filepath.Join(dir, "sites.d"), 0700))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "conf.d"), 0700))
 	filename := filepath.Join(dir, "config.yml")
 	require.NoError(t, os.WriteFile(filename, []byte(fmt.Sprintf(`
 listen-admin: '127.0.0.1:0'
-include: [sites.d/*.yml]
+include: [conf.d/*.yml]
 sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: {default: {`+testNtfyUpstream+`, servers: [{name: app1, addresses: [%q]}]}}}]
 `, a1.addr())), 0600))
 	s := startTestServer(t, filename)
@@ -797,7 +797,7 @@ sites: [{name: a, listen-http: '127.0.0.1:0', `+testNtfySite+`, upstreams: {defa
 	getHost("b.com")
 	require.Equal(t, int64(1), a1.hits.Load())
 
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], "+testNtfySite+", upstreams: {default: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}}]\n", b1.addr())), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "conf.d", "b.yml"), []byte(fmt.Sprintf("sites: [{name: b, listen-http: '127.0.0.1:0', hosts: [b.com], "+testNtfySite+", upstreams: {default: {"+testNtfyUpstream+", servers: [{name: app1, addresses: [%q]}]}}}]\n", b1.addr())), 0600))
 	requireReload(t, s)
 	getHost("b.com")
 	require.Equal(t, int64(1), b1.hits.Load())
@@ -907,19 +907,19 @@ func (c *ntfyClient) do(method, scheme, target, body string, header ...string) (
 	return resp, string(b)
 }
 
-// newNtfyPackagedServer runs the shipped config (packaging/config.yml and sites.d/ntfy.yml) as is,
+// newNtfyExampleServer runs the ntfy example (examples/ntfy: config.yml and conf.d/ntfy.yml) as is,
 // but for what a test cannot have: addresses, files and certificates in a temporary directory,
 // the test upstreams, loopback IPs in the limit exemptions, and a small limit burst
-func newNtfyPackagedServer(t testing.TB, upstreams ...*testUpstream) (*Server, string) {
+func newNtfyExampleServer(t testing.TB, upstreams ...*testUpstream) (*Server, string) {
 	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "sites.d"), 0755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "conf.d"), 0755))
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "html", "_next"), 0755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "html", "index.html"), []byte("<html>the website</html>"), 0644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "html", "_next", "app.js"), []byte("console.log('app')"), 0644))
 	writeTestCert(t, filepath.Join(dir, "fullchain.pem"), filepath.Join(dir, "privkey.pem"), "ntfy.sh")
-	main, err := os.ReadFile("../packaging/config.yml")
+	main, err := os.ReadFile("../examples/ntfy/config.yml")
 	require.NoError(t, err)
-	site, err := os.ReadFile("../packaging/sites.d/ntfy.yml")
+	site, err := os.ReadFile("../examples/ntfy/conf.d/ntfy.yml")
 	require.NoError(t, err)
 	mainConf := strings.NewReplacer(
 		`listen-admin: "127.0.0.1:2590"`, `listen-admin: "127.0.0.1:0"`,
@@ -942,7 +942,7 @@ func newNtfyPackagedServer(t testing.TB, upstreams ...*testUpstream) (*Server, s
 	require.True(t, i > 0 && j > i, "servers section not found")
 	siteConf = siteConf[:i] + "        servers:\n" + servers.String() + siteConf[j+1:]
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yml"), []byte(mainConf), 0600))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "sites.d", "ntfy.yml"), []byte(siteConf), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "conf.d", "ntfy.yml"), []byte(siteConf), 0600))
 	return startTestServer(t, filepath.Join(dir, "config.yml")), dir
 }
 
@@ -966,8 +966,8 @@ func (c *ntfyClient) stream(scheme, target string) func() {
 	}
 }
 
-func TestServer_NtfyPackagedConfig(t *testing.T) {
-	// The ntfy.sh setup end to end, as shipped, with three fake ntfy nodes
+func TestServer_NtfyExampleConfig(t *testing.T) {
+	// The ntfy.sh setup end to end, as in the example, with three fake ntfy nodes
 	app1, app3, app5 := newTestUpstream(t, "app1"), newTestUpstream(t, "app3"), newTestUpstream(t, "app5")
 	for _, u := range []*testUpstream{app1, app3, app5} {
 		name := u.name
@@ -983,7 +983,7 @@ func TestServer_NtfyPackagedConfig(t *testing.T) {
 			io.WriteString(w, `{"messages":`+strings.Repeat("1", 2000)+`}`)
 		})
 	}
-	s, dir := newNtfyPackagedServer(t, app1, app3, app5)
+	s, dir := newNtfyExampleServer(t, app1, app3, app5)
 	metrics := func() string {
 		_, m := adminDo(t, s, http.MethodGet, "/metrics", "")
 		return m
