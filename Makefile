@@ -2,7 +2,7 @@
 
 BINARY  := ntlb
 
-.PHONY: all build test race vet fmt fmt-check lint bench clean
+.PHONY: all build test race vet fmt fmt-check lint bench clean release release-snapshot
 
 all: fmt-check vet test build
 
@@ -32,5 +32,13 @@ lint:
 bench:
 	go test -run '^$$' -bench . -benchmem -count 6 ./...
 
+# A release from the checked-out tag: the .deb and a tarball on the GitHub release (.goreleaser.yml)
+release: all
+	GITHUB_TOKEN=$$(gh auth token) goreleaser release --clean
+
+# The same packages in dist/, without a tag or a GitHub release
+release-snapshot:
+	goreleaser release --snapshot --clean
+
 clean:
-	rm -rf build
+	rm -rf build dist

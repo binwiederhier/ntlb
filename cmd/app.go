@@ -21,6 +21,12 @@ const (
 	flagLogLevel = "log-level"
 )
 
+var (
+	// version and commit are set by the release build (ldflags in .goreleaser.yml)
+	version = "dev"
+	commit  = "unknown"
+)
+
 // New returns the ntlb CLI app. Its flags work anywhere on the command line, also after a
 // subcommand and its arguments. Commands and flags are created fresh for every app, because
 // urfave/cli keeps parse state in them, e.g. a flag set once ignores its env var from then on.
@@ -28,6 +34,7 @@ func New() *cli.Command {
 	return &cli.Command{
 		Name:                   "ntlb",
 		Usage:                  "HTTP load balancer, built for ntfy",
+		Version:                version + " (" + commit + ")",
 		UseShortOptionHandling: true,
 		Reader:                 os.Stdin,
 		Writer:                 os.Stdout,

@@ -254,6 +254,17 @@ cannot be hijacked.
 
 ## Quick start
 
+From a release (the .deb on the GitHub release; it installs the binary, the unit and the sample
+config, and never restarts a running ntlb, since a restart reconnects all of its clients):
+
+```bash
+gh release download v0.1.0 -R binwiederhier/ntlb -p '*.deb'
+sudo apt install ./ntlb_0.1.0_linux_amd64.deb   # then edit /etc/ntlb/config.yml and sites.d/
+sudo systemctl enable --now ntlb
+```
+
+From source:
+
 ```bash
 make                                   # fmt-check, vet, tests, build/ntlb
 sudo install -m 755 build/ntlb /usr/bin/ntlb
@@ -450,7 +461,11 @@ with its exemptions, the HTTP -> HTTPS redirect, the static website and the `/do
 make           # fmt-check, vet, test, build
 make race      # tests with the race detector
 make lint      # golangci-lint
+make release-snapshot   # the release packages in dist/, without a tag
 ```
+
+Releases: tag, push the tag, then `make release` (tests, then goreleaser: the .deb and a tarball
+on the GitHub release, see `.goreleaser.yml`).
 
 Layout: `config/` (YAML config), `balancer/` (hashing, health, sessions, drains), `server/`
 (listeners, proxy, admin API, access log), `client/` (admin API client), `cmd/` (CLI).

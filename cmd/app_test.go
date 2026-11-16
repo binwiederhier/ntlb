@@ -211,3 +211,15 @@ func TestApp_UnknownCommand(t *testing.T) {
 	require.ErrorContains(t, err, "No help topic for 'frobnicate'")
 	require.Empty(t, out)
 }
+
+func TestVersion(t *testing.T) {
+	// The release sets the version and commit (ldflags in .goreleaser.yml)
+	oldVersion, oldCommit := version, commit
+	t.Cleanup(func() {
+		version, commit = oldVersion, oldCommit
+	})
+	version, commit = "1.2.3", "abc123"
+	out, err := runApp("--version")
+	require.NoError(t, err)
+	require.Equal(t, "ntlb version 1.2.3 (abc123)\n", out)
+}

@@ -1,0 +1,53 @@
+# Releases: "make release" on a tag (git tag v0.1.0 && git push origin v0.1.0). The .deb goes to
+# the GitHub release of this private repo; the ansible role (roles/ntlb in ntfy-ansible) downloads
+# it with gh on the machine that plays and installs it.
+version: 2
+builds:
+  - id: ntlb_linux_amd64
+    binary: ntlb
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - "-s -w -X heckel.io/ntlb/cmd.version={{.Version}} -X heckel.io/ntlb/cmd.commit={{.ShortCommit}}"
+    goos: [linux]
+    goarch: [amd64]
+nfpms:
+  - package_name: ntlb
+    homepage: https://github.com/binwiederhier/ntlb
+    maintainer: Philipp C. Heckel <philipp.heckel@gmail.com>
+    description: HTTP load balancer, built for ntfy
+    formats:
+      - deb
+    bindir: /usr/bin
+    contents:
+      - src: packaging/config.yml
+        dst: /etc/ntlb/config.yml
+        type: "config|noreplace"
+        file_info:
+          mode: 0644
+      - src: packaging/sites.d/ntfy.yml
+        dst: /etc/ntlb/sites.d/ntfy.yml
+        type: "config|noreplace"
+        file_info:
+          mode: 0644
+      - src: packaging/ntlb.service
+        dst: /lib/systemd/system/ntlb.service
+        file_info:
+          mode: 0644
+    scripts:
+      postinstall: packaging/scripts/postinst.sh
+      preremove: packaging/scripts/prerm.sh
+      postremove: packaging/scripts/postrm.sh
+archives:
+  - formats: [tar.gz]
+    files:
+      - README.md
+      - packaging/*
+checksum:
+  name_template: checksums.txt
+snapshot:
+  version_template: "{{ .Tag }}-next"
+changelog:
+  sort: asc
