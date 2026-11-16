@@ -258,7 +258,7 @@ From a release (the .deb on the GitHub release; it installs the binary, the unit
 config, and never restarts a running ntlb, since a restart reconnects all of its clients):
 
 ```bash
-gh release download v0.1.0 -R binwiederhier/ntlb -p '*.deb'
+curl -LO https://github.com/binwiederhier/ntlb/releases/download/v0.1.0/ntlb_0.1.0_linux_amd64.deb
 sudo apt install ./ntlb_0.1.0_linux_amd64.deb   # then edit /etc/ntlb/config.yml and sites.d/
 sudo systemctl enable --now ntlb
 ```

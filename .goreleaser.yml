@@ -1,6 +1,6 @@
 # Releases: "make release" on a tag (git tag v0.1.0 && git push origin v0.1.0). The .deb goes to
-# the GitHub release of this private repo; the ansible role (roles/ntlb in ntfy-ansible) downloads
-# it with gh on the machine that plays and installs it.
+# the GitHub release; the ansible role (roles/ntlb in ntfy-ansible) downloads it on each load
+# balancer, checked against checksums.txt.
 version: 2
 builds:
   - id: ntlb_linux_amd64
