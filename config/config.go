@@ -108,8 +108,8 @@ type Streams struct {
 	Program *match.Program `yaml:"-"`
 }
 
-// ClientKey is what identifies a client for sticky routing, rate limits and bans: its IP,
-// shortened to a prefix
+// ClientKey is what identifies a client for sticky routing, rate limits, bans and the cap on
+// pending connections: its IP, shortened to a prefix
 type ClientKey struct {
 	IPv4PrefixBits int `yaml:"ipv4-prefix-bits"`
 	IPv6PrefixBits int `yaml:"ipv6-prefix-bits"`

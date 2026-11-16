@@ -60,6 +60,7 @@ type metrics struct {
 	bans                prometheus.Counter
 	connections         prometheus.Gauge
 	connectionsAccepted prometheus.Counter
+	connectionsRefused  prometheus.Counter
 }
 
 // processCollector exports the process metrics of Prometheus' process collector, without the open
@@ -147,6 +148,11 @@ func newMetrics(b *balancer.Balancer) *metrics {
 			Name:      "connections_accepted_total",
 			Help:      "Client connections accepted on the public listeners",
 		}),
+		connectionsRefused: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "connections_refused_total",
+			Help:      "Client connections closed right away: the client already had too many without a request",
+		}),
 	}
 	for _, protocol := range []string{protocolHTTP1, protocolHTTP2, protocolWebSocket} {
 		m.streams.WithLabelValues(protocol)
@@ -169,6 +175,7 @@ func newMetrics(b *balancer.Balancer) *metrics {
 		m.bans,
 		m.connections,
 		m.connectionsAccepted,
+		m.connectionsRefused,
 		newStatusCollector(b),
 		collectors.NewGoCollector(),
 		newProcessCollector(),

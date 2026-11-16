@@ -25,6 +25,12 @@ const (
 	// a new client; in between, new clients go untracked. A sweep of 1M entries takes ~60 ms under
 	// the lock, which every new key of a spray would pay otherwise.
 	fullSweepInterval = 5 * time.Second
+
+	// overflowIPv4PrefixBits and overflowIPv6PrefixBits key the shared buckets of the clients a
+	// full limiter cannot track: coarse enough that a spray from one network shares one bucket,
+	// and only a full limiter (an attack) limits neighbors together
+	overflowIPv4PrefixBits = 16
+	overflowIPv6PrefixBits = 32
 )
 
 var (
@@ -60,8 +66,9 @@ type limiter struct {
 	perSecond float64
 	capacity  float64
 	buckets   map[string]*bucket
+	overflow  map[string]*bucket // By coarse prefix, for the clients over maxTracked
 	lastSweep time.Time
-	mu        sync.Mutex // Protects buckets and lastSweep
+	mu        sync.Mutex // Protects buckets, overflow and lastSweep
 }
 
 type bucket struct {
@@ -128,7 +135,7 @@ func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 			if key == "" {
 				key = string(balancer.ClientKey(remoteAddr(r), s.ipv4PrefixBits, s.ipv6PrefixBits))
 			}
-			if !rl.limiter.take(key, e.now()) {
+			if !rl.limiter.take(key, remoteAddr(r), e.now()) {
 				e.strike(s.bansFor(env.Site), remoteAddr(r), rl.conf)
 				return rl.conf
 			}
@@ -212,6 +219,7 @@ func (s *state) newRules(next *state, confs []*config.Rule) []*rule {
 					perSecond: c.RatePerSecond,
 					capacity:  float64(c.Burst + 1),
 					buckets:   make(map[string]*bucket),
+					overflow:  make(map[string]*bucket),
 				}
 			}
 		}
@@ -251,28 +259,32 @@ func (s *state) all() iter.Seq[*rule] {
 	}
 }
 
-// take takes a token from the client's bucket, and reports whether there was one
-func (l *limiter) take(key string, now time.Time) bool {
+// take takes a token from the client's bucket, and reports whether there was one. Over
+// maxTracked, a new client takes from the bucket of its coarse prefix instead.
+func (l *limiter) take(key string, addr netip.Addr, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if now.Sub(l.lastSweep) >= sweepInterval {
 		l.sweepNoLock(now)
 	}
-	b, ok := l.buckets[key]
-	if !ok && len(l.buckets) >= maxTracked {
+	buckets := l.buckets
+	if _, ok := buckets[key]; !ok && len(buckets) >= maxTracked {
 		if now.Sub(l.lastSweep) >= fullSweepInterval {
 			l.sweepNoLock(now)
 		}
-		if len(l.buckets) >= maxTracked {
-			return true // Untracked: a spray of keys must not grow the map without bound
+		if len(buckets) >= maxTracked {
+			buckets, key = l.overflow, string(balancer.ClientKey(addr, overflowIPv4PrefixBits, overflowIPv6PrefixBits))
 		}
 	}
-	if !ok {
+	b, ok := buckets[key]
+	if !ok && len(buckets) >= maxTracked {
+		return true // Untracked: more networks than maxTracked, which a spray from a few cannot reach
+	} else if !ok {
 		b = &bucket{
 			tokens: l.capacity,
 			last:   now,
 		}
-		l.buckets[key] = b
+		buckets[key] = b
 	}
 	b.refill(now, l.perSecond, l.capacity)
 	if b.tokens < 1 {
@@ -284,10 +296,12 @@ func (l *limiter) take(key string, now time.Time) bool {
 
 // sweepNoLock forgets the buckets that refilled: a new bucket is full anyway
 func (l *limiter) sweepNoLock(now time.Time) {
-	for key, b := range l.buckets {
-		b.refill(now, l.perSecond, l.capacity)
-		if b.tokens >= l.capacity {
-			delete(l.buckets, key)
+	for _, buckets := range []map[string]*bucket{l.buckets, l.overflow} {
+		for key, b := range buckets {
+			b.refill(now, l.perSecond, l.capacity)
+			if b.tokens >= l.capacity {
+				delete(buckets, key)
+			}
 		}
 	}
 	l.lastSweep = now

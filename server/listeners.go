@@ -133,7 +133,10 @@ func (s *Server) bindPublic(conf *config.Config, listeners []*config.Listener) (
 		}
 		srv := newHTTPServer(l.Addr, s.observe(l.Addr, s.proxy))
 		tracker := &connTracker{
-			onBad: s.badRequest,
+			config:  &s.config,
+			pending: s.pending,
+			refused: s.metrics.connectionsRefused,
+			onBad:   s.badRequest,
 		}
 		srv.ConnContext = tracker.connContext
 		srv.ConnState = tracker.connState

@@ -284,6 +284,14 @@ active and unhandled had its request rejected: `badRequest` writes an access log
 request is normal: browsers open them ahead of time). The status is always 400; Go may have sent
 431 or nothing (timeout).
 
+The trackers also cap each client's (by client key) pending connections, ones that have
+not sent a request yet, at `maxPendingConnsPerIP` (256) over all public listeners: such a
+connection costs memory until the header timeout (30s; HTTP/2: the idle timeout) and no rate
+limit sees it. Over the cap, `ConnContext` closes the new connection and counts
+`ntlb_connections_refused_total`. The first request releases a connection (from then on the limit
+rule counts its client), and so do a close and a hijack. Legitimate clients stay far below: a
+request follows the handshake right away, even through a carrier NAT.
+
 ## Rules and bans (`rules/`, `match/`, `config/rules.go`, `server/rules.go`)
 
 All expressions in the config (rule and stream `match`, access log `match`, redirect `location`)
@@ -322,9 +330,12 @@ line, `<RFC 3339 time> <ip> <prefix> <rule>`, at most once per window per client
 CrowdSec reads only that (a trigger scenario, like ntfy's ban feed) and does the banning, the
 sharing across load balancers and the escalation. Strikes are counted per load balancer.
 
-Limit buckets and strike buckets are capped at `maxTracked` (1M) clients each: over it, a sweep
-runs, and if that frees nothing a new client goes untracked (allowed, no strikes), so spraying keys
-(IPv6 /64s from a /48) costs no unbounded memory. Limit buckets and strike buckets are swept inline (at most once a minute, in the request that
+Limit buckets and strike buckets are capped at `maxTracked` (1M) clients each, so spraying keys
+(IPv6 /64s from a /48) costs no unbounded memory: over it, a sweep runs (at most every 5s), and if
+that frees nothing a new client takes from a shared bucket of its coarse prefix (IPv4 /16, IPv6
+/32, with the rule's rate and burst), so a spray cannot unlock the limit for new clients; only
+neighbors share during it. A new client goes untracked (allowed) only if those are full too, and
+a new striker goes uncounted. Limit buckets and strike buckets are swept inline (at most once a minute, in the request that
 notices), so there is no goroutine. On `Update`, a limit rule with the same ID, rate and burst
 keeps its buckets, and the strikes stay if the bans settings and the client key are unchanged, so
 a reload for an unrelated change resets nobody.
@@ -352,6 +363,7 @@ finisher as the access log (`Server.observe`), so detached streams are counted w
   none serves the host; upstream empty if none answered; code 499 if the client left before a
   response)
 - `ntlb_request_duration_seconds{kind="request"}`, `ntlb_stream_duration_seconds`
+- `ntlb_connections_refused_total`: connections closed by the pending cap (see "Requests Go rejects")
 - `ntlb_connections`, `ntlb_connections_accepted_total`: client connections on the public
   listeners, like nginx's `stub_status` active and accepted. Counted at the listener (accept to
   first `Close`), not in `ConnState`, so hijacked HTTP/1 streams and WebSockets stay counted.

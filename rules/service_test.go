@@ -411,7 +411,8 @@ sites:
 
 func TestEngine_TrackedClientsCapped(t *testing.T) {
 	// Spraying client keys (an IPv6 /48 has 65k /64s) must not grow the limit buckets without
-	// bound: over the cap, a new client goes untracked (and passes) until a sweep makes room
+	// bound: over the cap, a new client shares a bucket with its coarse prefix (IPv4 /16, IPv6
+	// /32) until a sweep makes room, so the spray cannot unlock the limit for new clients
 	defer func(old int) {
 		maxTracked = old
 	}(maxTracked)
@@ -422,9 +423,12 @@ func TestEngine_TrackedClientsCapped(t *testing.T) {
 	}
 	limiter := e.state.Load().rules[0].limiter
 	require.Len(t, limiter.buckets, 3)
-	for range 3 {
-		require.Equal(t, "", decided(e, request("GET", "/", "[2001:db8:0:99::1]:1"))) // Untracked: never limited
-	}
+	require.Equal(t, "", decided(e, request("GET", "/", "[2001:db8:0:99::1]:1")))
+	require.Equal(t, "limit", decided(e, request("GET", "/", "[2001:db8:0:99::1]:1")))
+	require.Equal(t, "limit", decided(e, request("GET", "/", "[2001:db8:ffff:97::1]:1"))) // Same /32
+	require.Equal(t, "", decided(e, request("GET", "/", "[2001:db9::1]:1")))              // Another /32
+	require.Equal(t, "", decided(e, request("GET", "/", "198.51.100.1:1")))
+	require.Equal(t, "limit", decided(e, request("GET", "/", "198.51.7.7:1"))) // Same /16
 	require.Len(t, limiter.buckets, 3)
 
 	// At the cap, a new key sweeps at most every fullSweepInterval: a full sweep of 1M buckets

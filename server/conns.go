@@ -11,7 +11,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/match"
+)
+
+var (
+	// maxPendingConnsPerIP caps a client's connections that have not sent a request yet (a
+	// variable for the tests)
+	maxPendingConnsPerIP = 256
 )
 
 // connInfoKey is the request context key for the connection's *connInfo
@@ -22,8 +31,21 @@ type connInfoKey struct{}
 // headers arrive (also by the header timeout). nginx logs those as 400s, and CrowdSec bans on
 // them; here they go to the access logs and the response rules as 400s without an upstream.
 type connTracker struct {
-	conns sync.Map // net.Conn -> *connInfo
-	onBad func(remoteAddr string)
+	conns   sync.Map                       // net.Conn -> *connInfo
+	config  *atomic.Pointer[config.Config] // The client key, as the limits and bans count a client
+	pending *pendingConns
+	refused prometheus.Counter // Connections closed right away by the pending cap
+	onBad   func(remoteAddr string)
+}
+
+// pendingConns counts each client's connections that have not sent a request yet, over all
+// public listeners: one costs memory until the header timeout (HTTP/2: the idle timeout), and no
+// rate limit sees it, so one client could hold any number. Once a request arrived, the limit rule
+// counts the client instead. Legitimate clients hold few: a request follows the handshake right
+// away, and browsers open only a handful of HTTP/2 connections ahead of time.
+type pendingConns struct {
+	counts map[string]int
+	mu     sync.Mutex // Protects counts
 }
 
 // countingListener counts a public listener's client connections from accept to close. At the
@@ -44,11 +66,25 @@ type countedConn struct {
 type connInfo struct {
 	active  atomic.Bool
 	handled atomic.Bool
+	pending *pendingConns
+	key     string      // The client, for pending
+	counted atomic.Bool // In pending, until the first request or the close
 }
 
 // connContext registers a new connection, as http.Server.ConnContext
 func (t *connTracker) connContext(ctx context.Context, c net.Conn) context.Context {
-	info := &connInfo{}
+	ap, _ := netip.ParseAddrPort(c.RemoteAddr().String()) // Always ip:port from a TCP listener
+	key := t.config.Load().ClientKey
+	info := &connInfo{
+		pending: t.pending,
+		key:     string(balancer.ClientKey(ap.Addr(), key.IPv4PrefixBits, key.IPv6PrefixBits)),
+	}
+	if t.pending.add(info.key) {
+		info.counted.Store(true)
+	} else {
+		t.refused.Inc()
+		c.Close() // Go then sees a closed connection, and drops it
+	}
 	t.conns.Store(c, info)
 	return context.WithValue(ctx, connInfoKey{}, info)
 }
@@ -70,8 +106,10 @@ func (t *connTracker) connState(c net.Conn, state http.ConnState) {
 		info.active.Store(false)
 	case http.StateHijacked:
 		t.conns.Delete(c)
+		info.release()
 	case http.StateClosed:
 		t.conns.Delete(c)
+		info.release()
 		if info.active.Load() && !info.handled.Load() && !isHTTP2(c) {
 			t.onBad(c.RemoteAddr().String())
 		}
@@ -125,6 +163,35 @@ func (c *countedConn) WriteTo(w io.Writer) (int64, error) {
 func markHandled(ctx context.Context) {
 	if info, ok := ctx.Value(connInfoKey{}).(*connInfo); ok {
 		info.handled.Store(true)
+		info.release()
+	}
+}
+
+// release takes the connection out of its client's pending count, once
+func (i *connInfo) release() {
+	if i.counted.CompareAndSwap(true, false) {
+		i.pending.remove(i.key)
+	}
+}
+
+// add counts a pending connection of a client, and reports whether it is within the cap
+func (p *pendingConns) add(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.counts[key] >= maxPendingConnsPerIP {
+		return false
+	}
+	p.counts[key]++
+	return true
+}
+
+func (p *pendingConns) remove(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.counts[key] <= 1 {
+		delete(p.counts, key)
+	} else {
+		p.counts[key]--
 	}
 }
 

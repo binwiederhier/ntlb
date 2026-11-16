@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -197,4 +198,77 @@ func TestConns_CountedConnKeepsTCPMethods(t *testing.T) {
 	_, ok = conn.(io.WriterTo)
 	require.True(t, ok, "WriterTo")
 	require.NoError(t, conn.(interface{ CloseWrite() error }).CloseWrite())
+}
+
+func TestConns_PendingPerIPCapped(t *testing.T) {
+	// A client may hold only so many connections that never sent a request (each costs memory
+	// until the header timeout, and no rate limit sees them); one that sent a request, or closed,
+	// makes room
+	old := maxPendingConnsPerIP
+	t.Cleanup(func() {
+		maxPendingConnsPerIP = old // After the server's cleanup, which runs first
+	})
+	maxPendingConnsPerIP = 2
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "", app1)
+	dial := func() net.Conn {
+		conn, err := net.Dial("tcp", s.HTTPAddr())
+		require.NoError(t, err)
+		t.Cleanup(func() { conn.Close() })
+		return conn
+	}
+	closedByServer := func(conn net.Conn) bool {
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_, err := conn.Read(make([]byte, 1))
+		var netErr net.Error
+		return !(errors.As(err, &netErr) && netErr.Timeout())
+	}
+	c1, c2 := dial(), dial()
+	require.True(t, closedByServer(dial()))
+	require.False(t, closedByServer(c2))
+
+	// A request on c1 makes room
+	io.WriteString(c1, "GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(c1), nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.False(t, closedByServer(dial()))
+	require.True(t, closedByServer(dial()))
+
+	// So does closing one
+	c2.Close()
+	waitFor(t, func() bool {
+		return !closedByServer(dial())
+	})
+}
+
+func TestConns_PendingCapUsesClientKey(t *testing.T) {
+	// The cap counts a client as the limits and bans do: with a /24 client key, two addresses of
+	// one /24 share it
+	old := maxPendingConnsPerIP
+	t.Cleanup(func() {
+		maxPendingConnsPerIP = old // After the server's cleanup, which runs first
+	})
+	maxPendingConnsPerIP = 1
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "client-key: {ipv4-prefix-bits: 24}", app1)
+	dialFrom := func(ip string) net.Conn {
+		dialer := &net.Dialer{
+			LocalAddr: &net.TCPAddr{IP: net.ParseIP(ip)},
+		}
+		conn, err := dialer.Dial("tcp", s.HTTPAddr())
+		require.NoError(t, err)
+		t.Cleanup(func() { conn.Close() })
+		return conn
+	}
+	closedByServer := func(conn net.Conn) bool {
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_, err := conn.Read(make([]byte, 1))
+		var netErr net.Error
+		return !(errors.As(err, &netErr) && netErr.Timeout())
+	}
+	c1 := dialFrom("127.0.0.1")
+	require.True(t, closedByServer(dialFrom("127.0.0.2")))
+	require.False(t, closedByServer(c1))
+	require.False(t, closedByServer(dialFrom("127.0.1.1"))) // Another /24
 }

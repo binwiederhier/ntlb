@@ -53,9 +53,9 @@ shutdown-drain-duration: 2m  # SIGTERM: not ready right away, streams closed ove
 #shutdown-drain-delay: 5m
 #listen-health: ":8081"
 
-# What identifies a client for sticky routing, rate limits and bans: its IP, shortened to a prefix
-# (like ntfy's visitor-prefix-bits-ipv4/-ipv6, so a client's limits stay on one node). Changing
-# this re-routes clients, so keep it equal on all load balancers.
+# What identifies a client for sticky routing, rate limits, bans and the cap on pending
+# connections: its IP, shortened to a prefix (like ntfy's visitor-prefix-bits-ipv4/-ipv6).
+# Changing this re-routes clients with balance: hash, so keep it equal on all load balancers.
 client-key:
   ipv4-prefix-bits: 32
   ipv6-prefix-bits: 64
