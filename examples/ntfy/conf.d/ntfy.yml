@@ -55,13 +55,6 @@ sites:
                       # keepalives every 45s); also bounds a client that stops reading; a stalled
                       # upload is cut after 60s (like nginx's client_body_timeout), or this if shorter
 
-        # TCP keepalive probes towards the servers; dead peers are detected after
-        # idle + interval*count. Set "disable: true" to turn them off.
-        keepalive:
-          idle: 1m
-          interval: 15s
-          count: 4
-
         # Every address of every server is probed; a server is healthy if any address is, and an
         # address that fails is skipped until it passes again
         healthcheck:

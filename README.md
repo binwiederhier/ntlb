@@ -104,7 +104,8 @@ sequenceDiagram
   ~11 KiB per stream over HTTP/1.1, ~32 KiB with TLS, ~37 KiB over HTTP/2.
 - **Streaming bodies** in both directions (`proxy_buffering off`, `proxy_request_buffering off`,
   `client_max_body_size 0`).
-- **TCP keepalives** towards clients and upstreams, configurable (idle, interval, count).
+- **TCP keepalives** towards clients and upstreams, and `TCP_USER_TIMEOUT`: a vanished peer is
+  noticed after 2m, also with unacked data in flight.
 - **Several addresses per upstream** (e.g. one node's ports), each good for ~63k connections from
   one source IP; new streams go to the address with the fewest.
 - **Sites**: each site lists its listen addresses (`listen-http`, `listen-https`; sites can share
@@ -118,7 +119,7 @@ sequenceDiagram
   their listen addresses (new ones are bound, removed ones stop accepting while their streams run
   on), upstreams, health checks, timeouts, drain durations, streams, the client key, rules, bans,
   the TLS certificates and the log files. Streams to upstreams that stay are untouched.
-  `listen-admin`, `listen-metrics`, `listen-profiler` and `client-keepalive` need a restart, and so does an address
+  `listen-admin`, `listen-metrics`, `listen-health` and `listen-profiler` need a restart, and so does an address
   that switches between HTTP and HTTPS; a reload says so. A broken config (or certificate, log
   path or listen address) is rejected as a whole.
 - **Rules, changed live** (global ones for every site, then the site's own): block, rate limit,

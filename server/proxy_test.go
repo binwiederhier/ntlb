@@ -1337,7 +1337,7 @@ func TestProxy_WebSocketSmallCopyBuffers(t *testing.T) {
 }
 
 func TestProxy_UpdateKeepsUnchangedConns(t *testing.T) {
-	// A reload keeps the connections of a site's upstream unless its timeouts or keepalive changed, so a
+	// A reload keeps the connections of a site's upstream unless its timeouts changed, so a
 	// reload (e.g. a certificate renewal) does not drop the idle connections to the servers
 	parse := func(read string) *config.Config {
 		conf, err := config.Parse([]byte("sites:\n  - {name: a, listen-http: ':0', upstreams: {default: {timeouts: {read: " + read + "}, servers: [{name: x, addresses: ['127.0.0.1:1']}]}}}\n  - {name: b, listen-http: ':1', upstreams: {default: {servers: [{name: x, addresses: ['127.0.0.1:1']}]}}}"))

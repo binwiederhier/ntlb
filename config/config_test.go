@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"io/fs"
-	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -31,8 +30,6 @@ sites:
 	require.Equal(t, DefaultHealthPath, up.HealthCheck.Path)
 	require.Equal(t, DefaultHealthFails, up.HealthCheck.Fails)
 	require.Equal(t, DefaultUpstreamReadTimeout, up.Timeouts.Read)
-	require.Equal(t, DefaultKeepaliveIdle, c.ClientKeepalive.Idle)
-	require.Equal(t, DefaultKeepaliveCount, up.Keepalive.Count)
 	require.Len(t, up.Servers, 1)
 	require.Equal(t, []string{"10.0.0.1:2586", "10.0.0.1:2587"}, up.Servers[0].Addresses)
 }
@@ -40,10 +37,6 @@ sites:
 func TestParse_Overrides(t *testing.T) {
 	c, err := Parse([]byte(`
 drain-duration: 10m
-client-keepalive:
-  idle: 3m
-  interval: 30s
-  count: 5
 sites:
   - name: s
     listen-https: ":443"
@@ -51,7 +44,6 @@ sites:
     key-file: /tmp/key.pem
     upstreams:
       default:
-        keepalive: {disable: true}
         healthcheck: {path: /v1/health, interval: 2s, timeout: 1s}
         servers:
         - name: app1
@@ -59,9 +51,6 @@ sites:
 `))
 	require.NoError(t, err)
 	require.Equal(t, 10*time.Minute, c.DrainDuration)
-	require.Equal(t, 3*time.Minute, c.ClientKeepalive.KeepAliveConfig().Idle)
-	require.Equal(t, 5, c.ClientKeepalive.KeepAliveConfig().Count)
-	require.False(t, c.Sites[0].DefaultUpstream().Keepalive.KeepAliveConfig().Enable)
 	require.Equal(t, "/v1/health", c.Sites[0].DefaultUpstream().HealthCheck.Path)
 	require.Equal(t, 2*time.Second, c.Sites[0].DefaultUpstream().HealthCheck.Interval)
 }
@@ -218,34 +207,16 @@ func TestParse_Invalid(t *testing.T) {
 			errMsg: "upstreams.default.healthcheck.passes must be positive",
 		},
 		{
-			name:   "negative client keepalive idle",
-			config: "client-keepalive: {idle: -1s}\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
-			errMsg: "client-keepalive.idle must be positive",
+			// TCP keepalives are fixed since 2026-11-17 (server/tcp.go); a config that still sets
+			// them fails, rather than silently losing its values
+			name:   "client keepalive",
+			config: "client-keepalive: {idle: 1m}\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
+			errMsg: "field client-keepalive not found",
 		},
 		{
-			name:   "negative client keepalive interval",
-			config: "client-keepalive: {interval: -1s}\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
-			errMsg: "client-keepalive.interval must be positive",
-		},
-		{
-			name:   "negative client keepalive count",
-			config: "client-keepalive: {count: -1}\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
-			errMsg: "client-keepalive.count must be positive",
-		},
-		{
-			name:   "negative upstream keepalive idle",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: {default: {keepalive: {idle: -1s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
-			errMsg: "upstreams.default.keepalive.idle must be positive",
-		},
-		{
-			name:   "negative upstream keepalive interval",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: {default: {keepalive: {interval: -1s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
-			errMsg: "upstreams.default.keepalive.interval must be positive",
-		},
-		{
-			name:   "negative upstream keepalive count",
-			config: "sites: [{name: s, listen-http: ':80', upstreams: {default: {keepalive: {count: -1}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
-			errMsg: "upstreams.default.keepalive.count must be positive",
+			name:   "upstream keepalive",
+			config: "sites: [{name: s, listen-http: ':80', upstreams: {default: {keepalive: {idle: 1m}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
+			errMsg: "field keepalive not found",
 		},
 		{
 			name:   "unknown field",
@@ -381,9 +352,9 @@ func TestRestartRequired(t *testing.T) {
 	require.Empty(t, a.RestartRequired(b))
 
 	// Listen addresses of the sites are not on the list: a reload binds and closes them
-	c, err := Parse([]byte("listen-admin: ':1'\nclient-keepalive: {idle: 2m}\n" + site("listen-http: ':81', listen-https: ':443'")))
+	c, err := Parse([]byte("listen-admin: ':1'\nlisten-health: ':2'\n" + site("listen-http: ':81', listen-https: ':443'")))
 	require.NoError(t, err)
-	require.Equal(t, []string{"listen-admin", "client-keepalive"}, a.RestartRequired(c))
+	require.Equal(t, []string{"listen-admin", "listen-health"}, a.RestartRequired(c))
 }
 
 // Loading files
@@ -461,13 +432,10 @@ func TestLoad_NtfyExample(t *testing.T) {
 
 func TestParse_NullSections(t *testing.T) {
 	c, err := Parse([]byte(`
-client-keepalive: ~
 client-key: ~
-sites: [{name: s, listen-http: ":80", streams: null, upstreams: {default: {timeouts: null, keepalive: null, healthcheck: null, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]
+sites: [{name: s, listen-http: ":80", streams: null, upstreams: {default: {timeouts: null, healthcheck: null, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]
 `))
 	require.NoError(t, err)
-	require.Equal(t, DefaultKeepaliveIdle, c.ClientKeepalive.Idle)
-	require.Equal(t, DefaultKeepaliveCount, c.Sites[0].DefaultUpstream().Keepalive.Count)
 	require.Equal(t, DefaultUpstreamReadTimeout, c.Sites[0].DefaultUpstream().Timeouts.Read)
 	require.Equal(t, DefaultHealthPath, c.Sites[0].DefaultUpstream().HealthCheck.Path)
 	require.Equal(t, DefaultStreamsMatch, c.Sites[0].Streams.Match)
@@ -493,43 +461,10 @@ func TestParse_AllDefaults(t *testing.T) {
 		Fails:    DefaultHealthFails,
 		Passes:   DefaultHealthPasses,
 	}, c.Sites[0].DefaultUpstream().HealthCheck)
-	defaultKeepalive := &Keepalive{
-		Idle:     DefaultKeepaliveIdle,
-		Interval: DefaultKeepaliveInterval,
-		Count:    DefaultKeepaliveCount,
-	}
-	require.Equal(t, defaultKeepalive, c.ClientKeepalive)
-	require.Equal(t, defaultKeepalive, c.Sites[0].DefaultUpstream().Keepalive)
 	require.Empty(t, c.AccessLogs)
 	require.Empty(t, c.ListenMetrics)
 	require.Nil(t, c.Bans)
 	require.Len(t, c.Listeners, 1)
-}
-
-// Keepalives
-
-func TestKeepAliveConfig(t *testing.T) {
-	c, err := Parse([]byte("sites: [{name: s, listen-http: ':80', upstreams: {default: {keepalive: {interval: 20s}, servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]"))
-	require.NoError(t, err)
-	require.Equal(t, net.KeepAliveConfig{
-		Enable:   true,
-		Idle:     DefaultKeepaliveIdle,
-		Interval: DefaultKeepaliveInterval,
-		Count:    DefaultKeepaliveCount,
-	}, c.ClientKeepalive.KeepAliveConfig())
-	require.Equal(t, net.KeepAliveConfig{
-		Enable:   true,
-		Idle:     DefaultKeepaliveIdle,
-		Interval: 20 * time.Second,
-		Count:    DefaultKeepaliveCount,
-	}, c.Sites[0].DefaultUpstream().Keepalive.KeepAliveConfig())
-}
-
-func TestKeepAliveConfig_Disable(t *testing.T) {
-	c, err := Parse([]byte("client-keepalive: {disable: true, idle: 2m}\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]"))
-	require.NoError(t, err)
-	require.Equal(t, net.KeepAliveConfig{Enable: false}, c.ClientKeepalive.KeepAliveConfig())
-	require.True(t, c.Sites[0].DefaultUpstream().Keepalive.KeepAliveConfig().Enable)
 }
 
 // Settings a reload cannot apply
@@ -564,22 +499,8 @@ func TestRestartRequired_Each(t *testing.T) {
 			settings: []string{"listen-admin"},
 		},
 		{
-			name:     "client-keepalive disable",
-			config:   "client-keepalive: {disable: true}\n",
-			settings: []string{"client-keepalive"},
-		},
-		{
-			name:     "client-keepalive count",
-			config:   "client-keepalive: {count: 9}\n",
-			settings: []string{"client-keepalive"},
-		},
-		{
 			name:   "reloadable settings only",
 			config: "client-key: {ipv4-prefix-bits: 24}\naccess-logs: [{file: /tmp/x}]\n",
-		},
-		{
-			name:   "same keepalive written out",
-			config: "client-keepalive: {idle: 1m, interval: 15s, count: 4}\n",
 		},
 	}
 	for _, tt := range tests {

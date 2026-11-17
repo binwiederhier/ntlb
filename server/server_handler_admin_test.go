@@ -126,10 +126,10 @@ func TestAdmin_Reload(t *testing.T) {
 	require.JSONEq(t, `{"success":true}`, body)
 	require.Len(t, adminStatus(t, s).Upstreams, 2)
 
-	writeConfig(t, filename, "client-keepalive: {count: 9}", app1, app2)
+	writeConfig(t, filename, "listen-health: '127.0.0.1:0'", app1, app2)
 	code, body = adminDo(t, s, http.MethodPost, "/v1/reload", "")
 	require.Equal(t, http.StatusOK, code)
-	require.JSONEq(t, `{"success":true,"restart_required":["client-keepalive"]}`, body)
+	require.JSONEq(t, `{"success":true,"restart_required":["listen-health"]}`, body)
 
 	writeConfig(t, filename, "listen-https: ':443'", app1)
 	code, body = adminDo(t, s, http.MethodPost, "/v1/reload", "")

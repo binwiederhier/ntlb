@@ -18,8 +18,8 @@ func TestParse_Balance(t *testing.T) {
 }
 
 func TestParse_Upstream(t *testing.T) {
-	// Everything about a site's servers is in its upstream block, also the timeouts and keepalive,
-	// so sites can differ (ntfy's 3m read timeout next to a site with the default)
+	// Everything about a site's servers is in its upstream block, also the timeouts, so sites can
+	// differ (ntfy's 3m read timeout next to a site with the default)
 	c, err := Parse([]byte(`
 sites:
   - name: a
@@ -28,7 +28,6 @@ sites:
       default:
         balance: least-conn
         timeouts: {connect: 2s, read: 3m}
-        keepalive: {idle: 30s}
         healthcheck: {path: /ready}
         servers:
           - name: app1
@@ -43,8 +42,6 @@ sites:
 	a, b := c.Sites[0].DefaultUpstream(), c.Sites[1].DefaultUpstream()
 	require.Equal(t, BalanceLeastConn, a.Balance)
 	require.Equal(t, &Timeouts{Connect: 2 * time.Second, Read: 3 * time.Minute}, a.Timeouts)
-	require.Equal(t, 30*time.Second, a.Keepalive.Idle)
-	require.Equal(t, DefaultKeepaliveInterval, a.Keepalive.Interval)
 	require.Equal(t, "/ready", a.HealthCheck.Path)
 	require.Equal(t, DefaultHealthInterval, a.HealthCheck.Interval)
 	require.Equal(t, []string{"10.0.0.1:1", "10.0.0.1:2"}, a.Servers[0].Addresses)
@@ -52,7 +49,6 @@ sites:
 	// Defaults
 	require.Equal(t, DefaultBalance, b.Balance)
 	require.Equal(t, &Timeouts{Connect: DefaultUpstreamConnectTimeout, Read: DefaultUpstreamReadTimeout}, b.Timeouts)
-	require.Equal(t, &Keepalive{Idle: DefaultKeepaliveIdle, Interval: DefaultKeepaliveInterval, Count: DefaultKeepaliveCount}, b.Keepalive)
 	require.Equal(t, DefaultHealthPath, b.HealthCheck.Path)
 }
 

@@ -27,7 +27,6 @@ type Upstream struct {
 	ID          string       `yaml:"-"`           // "<site>/<name>", which identifies it among all sites' upstreams
 	Balance     string       `yaml:"balance"`     // round-robin (default), least-conn, random-two or hash
 	Timeouts    *Timeouts    `yaml:"timeouts"`    //
-	Keepalive   *Keepalive   `yaml:"keepalive"`   // TCP keepalive towards the servers
 	HealthCheck *HealthCheck `yaml:"healthcheck"` // Active health checks against every server
 	Servers     []*Server    `yaml:"servers"`     // Server names are per site
 }
@@ -125,10 +124,6 @@ func (u *Upstream) applyDefaults() {
 	if u.Timeouts.Read == 0 {
 		u.Timeouts.Read = DefaultUpstreamReadTimeout
 	}
-	if u.Keepalive == nil {
-		u.Keepalive = &Keepalive{}
-	}
-	u.Keepalive.applyDefaults()
 	if u.HealthCheck == nil {
 		u.HealthCheck = &HealthCheck{}
 	}
@@ -143,8 +138,6 @@ func (u *Upstream) validate(section string) error {
 		return fmt.Errorf("%s.timeouts.connect must be positive", section)
 	} else if u.Timeouts.Read <= 0 {
 		return fmt.Errorf("%s.timeouts.read must be positive", section)
-	} else if err := u.Keepalive.validate(section + ".keepalive"); err != nil {
-		return err
 	} else if err := u.HealthCheck.validate(section + ".healthcheck"); err != nil {
 		return err
 	}

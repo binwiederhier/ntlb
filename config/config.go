@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,11 +35,8 @@ const (
 	DefaultHealthPath              = "/" // Any 2xx or 3xx answer is healthy
 	DefaultHealthInterval          = 5 * time.Second
 	DefaultHealthTimeout           = 3 * time.Second
-	DefaultHealthFails             = 3 // Failed probes in a row before an upstream leaves the rotation
-	DefaultHealthPasses            = 2 // Good probes in a row before it comes back
-	DefaultKeepaliveIdle           = time.Minute
-	DefaultKeepaliveInterval       = 15 * time.Second
-	DefaultKeepaliveCount          = 4
+	DefaultHealthFails             = 3  // Failed probes in a row before an upstream leaves the rotation
+	DefaultHealthPasses            = 2  // Good probes in a row before it comes back
 	DefaultClientKeyIPv4PrefixBits = 32 // Like ntfy's visitor-prefix-bits-ipv4
 	DefaultClientKeyIPv6PrefixBits = 64 // Like ntfy's visitor-prefix-bits-ipv6: privacy addresses of one client stay together
 	DefaultBansWindow              = 10 * time.Minute
@@ -69,7 +65,6 @@ type Config struct {
 	ListenHealth          string        `yaml:"listen-health"`   // Only /v1/ready, e.g. for Route53 health checks
 	ListenProfiler        string        `yaml:"listen-profiler"` // Only /debug/pprof/, e.g. on a private network
 	AccessLogs            []*AccessLog  `yaml:"access-logs"`     // For sites without their own, and requests no site serves
-	ClientKeepalive       *Keepalive    `yaml:"client-keepalive"`
 	DrainDuration         time.Duration `yaml:"drain-duration"`
 	ShutdownDrainDuration time.Duration `yaml:"shutdown-drain-duration"`
 	ShutdownDrainDelay    time.Duration `yaml:"shutdown-drain-delay"` // Withdrawing before the drain: not ready, still serving
@@ -90,14 +85,6 @@ type AccessLog struct {
 	File    string         `yaml:"file"`
 	Match   string         `yaml:"match"`
 	Program *match.Program `yaml:"-"`
-}
-
-// Keepalive configures TCP keepalive probes on a connection (see net.KeepAliveConfig)
-type Keepalive struct {
-	Disable  bool          `yaml:"disable"`
-	Idle     time.Duration `yaml:"idle"`
-	Interval time.Duration `yaml:"interval"`
-	Count    int           `yaml:"count"`
 }
 
 // Streams decides which requests are long-lived streams (a request expression; bodyless requests
@@ -145,8 +132,8 @@ func Parse(b []byte) (*Config, error) {
 }
 
 // RestartRequired returns the settings that differ between c and other but that a reload cannot
-// apply: the admin, metrics, health and profiler listeners, and the keepalives of the sites' listeners.
-// (A reload binds and closes the sites' listen addresses.)
+// apply: the admin, metrics, health and profiler listeners. (A reload binds and closes the sites'
+// listen addresses.)
 func (c *Config) RestartRequired(other *Config) []string {
 	var settings []string
 	if c.ListenAdmin != other.ListenAdmin {
@@ -161,23 +148,7 @@ func (c *Config) RestartRequired(other *Config) []string {
 	if c.ListenProfiler != other.ListenProfiler {
 		settings = append(settings, "listen-profiler")
 	}
-	if *c.ClientKeepalive != *other.ClientKeepalive {
-		settings = append(settings, "client-keepalive")
-	}
 	return settings
-}
-
-// KeepAliveConfig converts the keepalive settings to a net.KeepAliveConfig
-func (k *Keepalive) KeepAliveConfig() net.KeepAliveConfig {
-	if k.Disable {
-		return net.KeepAliveConfig{Enable: false}
-	}
-	return net.KeepAliveConfig{
-		Enable:   true,
-		Idle:     k.Idle,
-		Interval: k.Interval,
-		Count:    k.Count,
-	}
 }
 
 func parse(b []byte, dir string) (*Config, error) {
@@ -215,10 +186,6 @@ func (c *Config) applyDefaults() {
 	if c.ShutdownDrainDuration == 0 {
 		c.ShutdownDrainDuration = DefaultShutdownDrainDuration
 	}
-	if c.ClientKeepalive == nil {
-		c.ClientKeepalive = &Keepalive{}
-	}
-	c.ClientKeepalive.applyDefaults()
 	if c.ClientKey == nil {
 		c.ClientKey = &ClientKey{}
 	}
@@ -242,9 +209,6 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	if err := c.ClientKeepalive.validate("client-keepalive"); err != nil {
-		return err
-	}
 	if c.DrainDuration < 0 || c.ShutdownDrainDuration < 0 || c.ShutdownDrainDelay < 0 {
 		return errors.New("drain durations must not be negative")
 	}
@@ -333,30 +297,6 @@ func validateBans(b *Bans) error {
 		return errors.New("bans.threshold must be positive")
 	} else if b.Window <= 0 {
 		return errors.New("bans.window must be positive")
-	}
-	return nil
-}
-
-func (k *Keepalive) applyDefaults() {
-	if k.Idle == 0 {
-		k.Idle = DefaultKeepaliveIdle
-	}
-	if k.Interval == 0 {
-		k.Interval = DefaultKeepaliveInterval
-	}
-	if k.Count == 0 {
-		k.Count = DefaultKeepaliveCount
-	}
-}
-
-// validate checks the values after defaulting, so a zero here was written as a negative
-func (k *Keepalive) validate(section string) error {
-	if k.Idle <= 0 {
-		return fmt.Errorf("%s.idle must be positive", section)
-	} else if k.Interval <= 0 {
-		return fmt.Errorf("%s.interval must be positive", section)
-	} else if k.Count <= 0 {
-		return fmt.Errorf("%s.count must be positive", section)
 	}
 	return nil
 }

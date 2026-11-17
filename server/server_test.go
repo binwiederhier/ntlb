@@ -568,11 +568,11 @@ func requireReload(t testing.TB, s *Server) {
 func TestServer_ReloadReportsRestartRequired(t *testing.T) {
 	app1 := newTestUpstream(t, "app1")
 	s, filename := newTestServer(t, "", app1)
-	conf := "listen-admin: '127.0.0.1:0'\nclient-keepalive: {idle: 7m}\ndrain-duration: 9m\n" + upstreamsYAML(app1)
+	conf := "listen-admin: '127.0.0.1:0'\nlisten-health: '127.0.0.1:0'\ndrain-duration: 9m\n" + upstreamsYAML(app1)
 	require.NoError(t, os.WriteFile(filename, []byte(conf), 0600))
 	restart, err := s.Reload()
 	require.NoError(t, err)
-	require.Equal(t, []string{"client-keepalive"}, restart)
+	require.Equal(t, []string{"listen-health"}, restart)
 	require.Equal(t, 9*time.Minute, s.config.Load().DrainDuration) // The rest is applied
 	status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name")
 	require.Equal(t, http.StatusOK, status)

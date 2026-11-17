@@ -51,7 +51,7 @@ flowchart LR
   YAML line or the rule and the position in its expression. `ntlb check-config` checks a file without touching the running server.
 - **Reload**: `systemctl reload ntlb` (SIGHUP) or `ntlb reload` re-reads all files. Everything
   applies without cutting a stream (sites, servers, rules, certificates, logs, listen addresses)
-  except `listen-admin`, `listen-metrics`, `listen-profiler` and `client-keepalive`, and an address
+  except `listen-admin`, `listen-metrics`, `listen-health` and `listen-profiler`, and an address
   that switches between `listen-http` and `listen-https`: those need a restart, and `ntlb reload`
   lists them if they changed.
 - **Durations** are Go durations: `500ms`, `45s`, `5m`, `1h30m`. They must be positive.
@@ -66,7 +66,6 @@ flowchart LR
 | `listen-health` | off | Only `/v1/ready` (200 if ready, else 503), on a port of its own, for a health check in front of ntlb (Route53, a cloud load balancer) that must not reach the admin API. Unlike a path on the sites, it cannot shadow an upstream's. |
 | `listen-profiler` | off | Only `/debug/pprof/`, to profile under load without exposing the admin API. |
 | `access-logs` | none | Access logs for sites without their own, and for requests no site serves. See [Access logs](#access-logs). |
-| `client-keepalive` | `{idle: 1m, interval: 15s, count: 4}` | TCP keepalive towards clients; a dead peer is noticed after `idle + interval * count`. `{disable: true}` turns it off. |
 | `drain-duration` | `5m` | Default for `upstream drain`, and for servers removed from the config. |
 | `shutdown-drain-delay` | `0` | On SIGTERM, before the drain: withdrawing, i.e. not ready but still serving everything (new streams too), so the health check in front takes ntlb out before streams close. Set it to that check's detection time plus the DNS TTL. Like ntfy's `cluster-drain-delay`. |
 | `shutdown-drain-duration` | `2m` | On SIGTERM (after `shutdown-drain-delay`): not ready, streams closed over this long, then exit. |
@@ -108,7 +107,7 @@ balancing, timeouts, health checks), streams, rules and (optionally) logs, bans 
 | `listen-https` | | The same, for TLS (HTTP/2 and HTTP/1.1). Needs `cert-file` and `key-file`. |
 | `hosts` | all | Host names this site serves: exact (`example.com`) or wildcard (`"*.example.com"`: any subdomain). Leave out to take every host no other site on these addresses serves. |
 | `cert-file`, `key-file` | | PEM certificate (full chain) and key, re-read on every reload. |
-| `upstreams` | required | The servers and how requests reach them, by name; `default` is required and takes every request no `proxy` rule routes. Each has `balance`, `timeouts`, `keepalive`, `healthcheck`, `servers`. See [Upstreams](#upstreams-servers-balancing-and-timeouts) and [Routing by path](#routing-by-path). |
+| `upstreams` | required | The servers and how requests reach them, by name; `default` is required and takes every request no `proxy` rule routes. Each has `balance`, `timeouts`, `healthcheck`, `servers`. See [Upstreams](#upstreams-servers-balancing-and-timeouts) and [Routing by path](#routing-by-path). |
 | `streams` | none | Which requests are long-lived streams. See [Streams](#streams). |
 | `rules` | none | Checked after the global rules; named `<site>/<name>` in logs and metrics. |
 | `access-logs`, `bans`, `gzip`, `errors` | the global ones | Replace the global setting for this site's requests. |
@@ -181,7 +180,6 @@ upstreams:
     timeouts:
       connect: 5s                 # default 5s
       read: 3m                    # default 60s
-    keepalive: {idle: 1m, interval: 15s, count: 4}
     healthcheck: {path: /healthz}
     servers:
       - name: app1
@@ -197,13 +195,12 @@ upstreams:
 | `balance` | `round-robin` | Which server a request goes to, see below. |
 | `timeouts.connect` | `5s` | A server address that does not accept within this is down for the request; the next one is tried. |
 | `timeouts.read` | `60s` | Cut a response (or a WebSocket) after this long without a byte. Streams need their server to send keepalives within it. Also bounds a client that stops reading, also one of the site's own answers (static files, blocks, redirects); a stalled upload is cut after 60s, or this if shorter. |
-| `keepalive` | `{idle: 1m, interval: 15s, count: 4}` | TCP keepalive towards the servers; a dead peer is noticed after `idle + interval * count`. `{disable: true}` turns it off. |
 | `healthcheck` | `{path: /, interval: 5s, timeout: 3s, fails: 3, passes: 2}` | See [Health checks](#health-checks-and-what-happens-when-one-goes-bad). |
 | `servers` | required | The backend nodes: a `name`, one or more `addresses`, and optionally a `weight` (1 to 1000, default 1) and `backup: true`. Names are per site. At least one server must not be a backup. |
 
 Each upstream block has its own connections to its servers, so they can differ: ntfy's 3m read
 timeout next to a site with the default. A reload keeps a block's idle connections unless its
-`timeouts` or `keepalive` changed.
+`timeouts` changed.
 
 An address may be a port range, `"10.0.0.11:25010-25017"`, which is one address per port (each
 address holds ~63k connections from one source IP, so a node with many long-lived clients listens
@@ -300,7 +297,7 @@ server is draining.
 
 A site can have more upstream blocks next to `default`, and send requests to them with `proxy`
 rules: `/app1/` to one set of servers, `/app2/` to another, the rest to `default`. Each block has
-its own `balance`, `timeouts`, `keepalive`, `healthcheck` and `servers`, and is balanced, health
+its own `balance`, `timeouts`, `healthcheck` and `servers`, and is balanced, health
 checked and connected to on its own.
 
 ```yaml
@@ -436,7 +433,7 @@ In detail:
 |---|---|---|
 | New requests | Tried on it first; a connect error moves the request to its other addresses, then to the next server, so clients rarely notice. Each failed address backs off (1s, doubling to 30s). | Not sent to it. `hash` clients go to their second choice, `round-robin` and the others spread over the rest. |
 | A node that accepts but hangs | Requests wait for `timeouts.read`, then `504`. | Not sent to it. |
-| Open streams and WebSockets on it | Stay open as long as their connection does. | Stay open: health never moves an open connection, only drains do. A dead node's connections end with a reset, or after the keepalive (`idle + interval * count`, 2m by default); the clients reconnect and land on a healthy node. |
+| Open streams and WebSockets on it | Stay open as long as their connection does. | Stay open: health never moves an open connection, only drains do. A dead node's connections end with a reset, or after 2m (TCP keepalive and `TCP_USER_TIMEOUT`, fixed); the clients reconnect and land on a healthy node. |
 | `ntlb status` | `healthy`, the last error in `NOTE` | `unhealthy`, with the probe error |
 | Metrics, logs | `ntlb_retries_total` goes up | `ntlb_upstream_healthy` = 0, a warning log line |
 

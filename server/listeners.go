@@ -118,16 +118,10 @@ func (s *Server) listen(conf *config.Config) error {
 	return nil
 }
 
-// bindPublic binds the proxying servers of listeners, with the configured TCP keepalives towards
-// the clients; on an error it closes the ones it bound
+// bindPublic binds the proxying servers of listeners (TCP keepalives towards the clients, see
+// newListenConfig); on an error it closes the ones it bound
 func (s *Server) bindPublic(conf *config.Config, listeners []*config.Listener) (map[string]*publicServer, error) {
-	ka := conf.ClientKeepalive.KeepAliveConfig()
-	lc := &net.ListenConfig{
-		KeepAliveConfig: ka,
-	}
-	if !ka.Enable {
-		lc.KeepAlive = -1
-	}
+	lc := newListenConfig()
 	public := make(map[string]*publicServer)
 	for _, l := range listeners {
 		ln, err := lc.Listen(context.Background(), "tcp", l.Addr)

@@ -2,7 +2,7 @@
 # conf.d/ntfy.yml). Not installed by the package, which has the short pkg/config.yml.
 #
 # ntlb config. Reload with "systemctl reload ntlb" (SIGHUP) or "ntlb reload": everything but
-# listen-admin, listen-metrics, listen-profiler and client-keepalive applies without cutting a
+# listen-admin, listen-metrics, listen-health and listen-profiler applies without cutting a
 # stream, the sites' listen addresses too (a reload says which changed settings need a restart).
 # A config with an error is rejected as a whole, and the old one stays. Unknown keys are an error. Check a file with "ntlb check-config".
 #
@@ -39,13 +39,6 @@ access-logs:
   - file: /var/log/ntlb/access.log
     match: status < 400
   - file: /var/log/ntlb/access_error.log
-
-# TCP keepalive probes towards the clients. Dead peers are detected after idle + interval*count.
-# Set "disable: true" to turn them off. (Towards the servers: each upstream's keepalive.)
-client-keepalive:
-  idle: 1m
-  interval: 15s
-  count: 4
 
 drain-duration: 5m           # Default for "upstream drain" and for servers removed from this file
 shutdown-drain-duration: 2m  # SIGTERM: not ready right away, streams closed over this long

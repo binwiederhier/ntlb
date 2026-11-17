@@ -83,12 +83,11 @@ type proxy struct {
 }
 
 // upstreamConns are a pool's (a site's upstream or one of its named upstreams) connections to its
-// servers, set up by its timeouts and keepalive
+// servers, set up by its timeouts
 type upstreamConns struct {
 	transport *http.Transport
 	dialer    *net.Dialer
 	timeouts  config.Timeouts
-	keepalive config.Keepalive
 }
 
 // proxyRequest is the per-request state shared between ServeHTTP, the transport, the stream path
@@ -388,8 +387,8 @@ func (p *proxy) closeAll(ctx context.Context) error {
 	}
 }
 
-// update applies a (re)loaded config to the upstream connections: a pool whose timeouts and
-// keepalive did not change keeps its connections; otherwise open connections keep running on the
+// update applies a (re)loaded config to the upstream connections: a pool whose timeouts did not
+// change keeps its connections; otherwise open connections keep running on the
 // old transport, and its idle ones are closed.
 func (p *proxy) update(conf *config.Config) {
 	var old map[string]*upstreamConns
@@ -400,7 +399,7 @@ func (p *proxy) update(conf *config.Config) {
 	for _, site := range conf.Sites {
 		for _, pool := range site.AllUpstreams() {
 			key := pool.ID
-			if c, ok := old[key]; ok && c.timeouts == *pool.Timeouts && c.keepalive == *pool.Keepalive {
+			if c, ok := old[key]; ok && c.timeouts == *pool.Timeouts {
 				conns[key] = c
 			} else {
 				conns[key] = newUpstreamConns(pool)
@@ -417,14 +416,7 @@ func (p *proxy) update(conf *config.Config) {
 }
 
 func newUpstreamConns(u *config.Upstream) *upstreamConns {
-	ka := u.Keepalive.KeepAliveConfig()
-	dialer := &net.Dialer{
-		Timeout:         u.Timeouts.Connect,
-		KeepAliveConfig: ka,
-	}
-	if !ka.Enable {
-		dialer.KeepAlive = -1
-	}
+	dialer := newDialer(u.Timeouts.Connect)
 	return &upstreamConns{
 		transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -439,9 +431,8 @@ func newUpstreamConns(u *config.Upstream) *upstreamConns {
 			ResponseHeaderTimeout: u.Timeouts.Read,
 			DisableCompression:    true, // Pass encodings through as they are
 		},
-		dialer:    dialer,
-		timeouts:  *u.Timeouts,
-		keepalive: *u.Keepalive,
+		dialer:   dialer,
+		timeouts: *u.Timeouts,
 	}
 }
 
