@@ -112,6 +112,7 @@ type proxyRequest struct {
 	readTimeout    time.Duration
 	detached       bool // The stream path took over, and runs the finishers itself
 	finishers      []func()
+	untrack        func() // Set by track, run after the finishers
 	finishOnce     sync.Once
 }
 
@@ -352,16 +353,18 @@ func tryUpstreams[T any](p *proxy, ctx context.Context, pr *proxyRequest, method
 	return zero, errNoUpstream // Not reached: the last candidate always returns
 }
 
-// track registers an open request, so Shutdown can end what the drain did not
+// track registers an open request, so Shutdown can end what the drain did not, and wait for it.
+// It is untracked after all its finishers ran (see finish): Shutdown closes the logs once nothing
+// is tracked, and observe's finisher, registered first and so run last, writes the log line.
 func (p *proxy) track(pr *proxyRequest) {
 	p.mu.Lock()
 	p.active[pr] = struct{}{}
 	p.mu.Unlock()
-	pr.onFinish(func() {
+	pr.untrack = func() {
 		p.mu.Lock()
 		delete(p.active, pr)
 		p.mu.Unlock()
-	})
+	}
 }
 
 // closeAll cancels every open request (as drained) and waits until all of them finished, their
@@ -472,6 +475,9 @@ func (pr *proxyRequest) finish() {
 	pr.finishOnce.Do(func() {
 		for i := len(pr.finishers) - 1; i >= 0; i-- {
 			pr.finishers[i]()
+		}
+		if pr.untrack != nil {
+			pr.untrack()
 		}
 	})
 }

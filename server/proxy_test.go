@@ -1567,3 +1567,21 @@ func TestProxy_NamedUpstreamHealthIsItsOwn(t *testing.T) {
 	_, body := adminDo(t, s, http.MethodGet, "/v1/status", "")
 	require.Contains(t, body, `"name":"a1","pool":"app1","state":"unhealthy"`)
 }
+
+func TestProxy_TrackedUntilEveryFinisherRan(t *testing.T) {
+	// Shutdown waits for the tracked requests (closeAll), then closes the logs: a request must
+	// stay tracked until its last finisher ran, also the access log line that observe registered
+	// first, or that line is lost
+	p := newProxy(balancer.New(&config.Config{}), newMetrics(nil), &config.Config{})
+	pr := &proxyRequest{}
+	var trackedWhileLogging bool
+	pr.onFinish(func() { // Like observe's, which registers before the proxy tracks the request
+		p.mu.Lock()
+		_, trackedWhileLogging = p.active[pr]
+		p.mu.Unlock()
+	})
+	p.track(pr)
+	pr.finish()
+	require.True(t, trackedWhileLogging)
+	require.Empty(t, p.active)
+}

@@ -405,9 +405,12 @@ Cleanup is a list of finishers (`onFinish`), run once, in reverse order, by `fin
 |---|---|
 | `observe` | the access log line, `rules.CheckResponse` (strikes), `metrics.observe` |
 | `proxy.ServeHTTP` | `balancer.Close(session)`, cancel the request context |
-| `proxy.ServeHTTP`, subscriptions | the streams gauge, and why the stream closed (drained, read timeout) |
-| `proxy.track` | remove from `proxy.active` (what `Shutdown` waits for) |
+| `proxy.ServeHTTP`, subscriptions and upgrades | the streams gauge, and why the stream closed (drained, read timeout) |
 | `serveStream` | close the upstream connection |
+
+`proxy.track` is not a finisher: `finish` removes the request from `proxy.active` (what
+`Shutdown` waits for before it closes the logs) after all of them ran, so the access log line,
+written by `observe`'s finisher last, is never lost to a shutdown.
 
 Who calls `finish`: `observe`'s deferred function, unless the stream path detached the request
 (`pr.detached`); then the stream goroutine does, when the stream ends, possibly hours after the
