@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -236,4 +237,27 @@ func TestAdmin_RejectsBrowserRequests(t *testing.T) {
 		require.Equal(t, http.StatusOK, do(http.MethodGet, s.AdminAddr(), "/v1/status", host, ""), host)
 	}
 	require.Equal(t, http.StatusOK, do(http.MethodGet, s.ProfilerAddr(), "/debug/pprof/", "", ""))
+}
+
+func TestAdmin_RejectsPublicClients(t *testing.T) {
+	// The admin API has no authentication: if listen-admin (or listen-profiler) is bound to a
+	// public address by mistake, clients from the internet still get nothing, only loopback and
+	// private networks (where Prometheus or an operator sits) do
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	for remote, want := range map[string]int{
+		"127.0.0.1:1234":      http.StatusOK,
+		"[::1]:1234":          http.StatusOK,
+		"10.1.2.3:1234":       http.StatusOK,
+		"192.168.1.5:1234":    http.StatusOK,
+		"[fd00::5]:1234":      http.StatusOK,
+		"203.0.113.5:1234":    http.StatusForbidden,
+		"[2001:db8::5]:1234":  http.StatusForbidden,
+		"[::ffff:8.8.8.8]:53": http.StatusForbidden,
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+		r.Host, r.RemoteAddr = "127.0.0.1:2590", remote
+		w := httptest.NewRecorder()
+		localOnly(ok).ServeHTTP(w, r)
+		require.Equal(t, want, w.Code, remote)
+	}
 }

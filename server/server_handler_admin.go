@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -36,6 +37,10 @@ const (
 	apiMetricsPath         = "/metrics"
 	apiPprofPath           = "/debug/pprof/"
 	apiMaxRequestBodyBytes = 4096
+)
+
+var (
+	sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10") // RFC 6598, not routed on the internet
 )
 
 // HealthResponse is the response to /v1/health
@@ -96,10 +101,12 @@ func (s *Server) adminHandler() http.Handler {
 }
 
 // localOnly refuses requests from web pages: cross-origin ones (CSRF), which browsers mark with
-// an Origin header, and DNS rebinding, where a page's own hostname resolves to this listener
+// an Origin header, and DNS rebinding, where a page's own hostname resolves to this listener. It
+// also refuses clients outside loopback and private networks: nothing here authenticates, so a
+// listener bound to a public address by mistake must not hand out reloads, drains and pprof.
 func localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(headerOrigin) != "" || !localHost(r.Host) {
+		if r.Header.Get(headerOrigin) != "" || !localHost(r.Host) || !privateClient(r.RemoteAddr) {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}
@@ -115,6 +122,17 @@ func localHost(host string) bool {
 	}
 	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	return host == "localhost" || net.ParseIP(host) != nil
+}
+
+// privateClient reports whether a remote address is on loopback or a private network (RFC 1918,
+// IPv6 ULA, and the shared address space 100.64.0.0/10 of Tailscale and carriers' inner side)
+func privateClient(remoteAddr string) bool {
+	ap, err := netip.ParseAddrPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	addr := ap.Addr().Unmap()
+	return addr.IsLoopback() || addr.IsPrivate() || sharedAddressSpace.Contains(addr)
 }
 
 // handleAdmin turns a handler's error into a JSON error response

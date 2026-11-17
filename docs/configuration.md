@@ -61,7 +61,7 @@ flowchart LR
 
 | Setting | Default | |
 |---|---|---|
-| `listen-admin` | `127.0.0.1:2590` | Admin API, `/metrics`, `/debug/pprof/`. **No auth**: keep it local. |
+| `listen-admin` | `127.0.0.1:2590` | Admin API, `/metrics`, `/debug/pprof/`. **No auth**: keep it local. Clients outside loopback and private networks get 403. |
 | `listen-metrics` | off | Only `/metrics`, e.g. on a private network for Prometheus. |
 | `listen-health` | off | Only `/v1/ready` (200 if ready, else 503), on a port of its own, for a health check in front of ntlb (Route53, a cloud load balancer) that must not reach the admin API. Unlike a path on the sites, it cannot shadow an upstream's. |
 | `listen-profiler` | off | Only `/debug/pprof/`, to profile under load without exposing the admin API. |
