@@ -127,6 +127,7 @@ func (b *Balancer) Pick(site, pool string, key []byte) []*Upstream {
 
 	// Count the pool's servers by kind, then take the best kind that has any: one allocation
 	var counts [pickKinds]int
+	matched := make([]*Upstream, 0, scratchSize)
 	kinds := make([]pickKind, 0, scratchSize)
 	live := false
 	for _, id := range b.order {
@@ -137,6 +138,7 @@ func (b *Balancer) Pick(site, pool string, key []byte) []*Upstream {
 		kind := u.pickKindNoLock()
 		live = live || kind != pickRemoved
 		counts[kind]++
+		matched = append(matched, u)
 		kinds = append(kinds, kind)
 	}
 	var first, second pickKind // The kinds to return, second after first (the backups)
@@ -150,30 +152,18 @@ func (b *Balancer) Pick(site, pool string, key []byte) []*Upstream {
 	default:
 		first, second = pickUnhealthy, pickUnhealthyBackup // Fail open
 	}
-	candidates := make([]*Upstream, 0, counts[first]+counts[second])
-	i := 0
-	for _, id := range b.order {
-		u := b.upstreams[id]
-		if u.site != site || u.pool != poolName {
-			continue
-		}
-		if kinds[i] == first {
-			candidates = append(candidates, u)
-		}
-		i++
-	}
-	n := len(candidates)
-	if second != pickNone {
-		i = 0
-		for _, id := range b.order {
-			u := b.upstreams[id]
-			if u.site != site || u.pool != poolName {
-				continue
-			}
-			if kinds[i] == second {
-				candidates = append(candidates, u)
-			}
-			i++
+	// The first kind, then the second (no server is of kind pickNone), each in config order
+	n := counts[first]
+	candidates := make([]*Upstream, n+counts[second])
+	nextFirst, nextSecond := 0, n
+	for i, u := range matched {
+		switch kinds[i] {
+		case first:
+			candidates[nextFirst] = u
+			nextFirst++
+		case second:
+			candidates[nextSecond] = u
+			nextSecond++
 		}
 	}
 	if first == pickRemoved {
