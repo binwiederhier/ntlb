@@ -349,6 +349,9 @@ func TestAccessLog_EscapeAndRedact(t *testing.T) {
 	require.Equal(t, "/a?Auth=REDACTED&AUTH=REDACTED&auth", redactAuth("/a?Auth=x&AUTH=y&auth"))
 	require.Equal(t, "/a?x=1&y=2", redactAuth("/a?x=1&y=2"))
 	require.Equal(t, "/auth", redactAuth("/auth"))
+	require.Equal(t, "/a?%61uth=REDACTED&x=1", redactAuth("/a?%61uth=secret&x=1")) // ntfy decodes the name
+	require.Equal(t, "/a?%41UT%48=REDACTED", redactAuth("/a?%41UT%48=secret"))
+	require.Equal(t, "/a?%zzauth=x", redactAuth("/a?%zzauth=x")) // Not a valid escape: not auth either
 }
 
 // flakyWriter fails its first fails writes, then takes everything

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -223,7 +224,7 @@ func redactAuth(uri string) string {
 	}
 	params := strings.Split(query, "&")
 	for i, p := range params {
-		if key, _, ok := strings.Cut(p, "="); ok && strings.EqualFold(key, "auth") {
+		if key, _, ok := strings.Cut(p, "="); ok && isAuthKey(key) {
 			params[i] = key + "=REDACTED"
 		}
 	}
@@ -235,11 +236,22 @@ func hasAuthParam(query string) bool {
 	for query != "" {
 		var p string
 		p, query, _ = strings.Cut(query, "&")
-		if key, _, ok := strings.Cut(p, "="); ok && strings.EqualFold(key, "auth") {
+		if key, _, ok := strings.Cut(p, "="); ok && isAuthKey(key) {
 			return true
 		}
 	}
 	return false
+}
+
+// isAuthKey reports whether a raw query parameter name is auth, in any case, also percent-encoded
+// (%61uth): ntfy decodes the name before it looks for auth
+func isAuthKey(key string) bool {
+	if strings.IndexByte(key, '%') >= 0 {
+		if decoded, err := url.QueryUnescape(key); err == nil {
+			key = decoded
+		}
+	}
+	return strings.EqualFold(key, "auth")
 }
 
 func orDash(s string) string {
