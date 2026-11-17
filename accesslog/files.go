@@ -1,4 +1,4 @@
-package server
+package accesslog
 
 import (
 	"fmt"
@@ -8,19 +8,19 @@ import (
 	"heckel.io/ntlb/config"
 )
 
-// logFiles are the open log files (access logs, the ban file) by path; uses of one path share it
-type logFiles struct {
-	logs atomic.Pointer[map[string]*accessLog]
+// Files are the open log files (access logs, the ban file) by path; uses of one path share it
+type Files struct {
+	logs atomic.Pointer[map[string]*Log]
 }
 
-func newLogFiles() *logFiles {
-	l := &logFiles{}
-	l.logs.Store(&map[string]*accessLog{})
+func NewFiles() *Files {
+	l := &Files{}
+	l.logs.Store(&map[string]*Log{})
 	return l
 }
 
-// logPaths are the files a config writes to
-func logPaths(conf *config.Config) []string {
+// Paths are the files a config writes to
+func Paths(conf *config.Config) []string {
 	var paths []string
 	for _, l := range conf.AccessLogs {
 		paths = append(paths, l.File)
@@ -39,8 +39,8 @@ func logPaths(conf *config.Config) []string {
 	return paths
 }
 
-// openLogFiles opens every path once, so that New and Reload can fail before they change anything
-func openLogFiles(paths []string) (map[string]*os.File, error) {
+// Open opens every path once, so that New and Reload can fail before they change anything
+func Open(paths []string) (map[string]*os.File, error) {
 	files := make(map[string]*os.File)
 	for _, path := range paths {
 		if files[path] != nil {
@@ -62,15 +62,15 @@ func openLogFiles(paths []string) (map[string]*os.File, error) {
 
 // swap makes files the log files. A path that stays keeps its log, reopened (for logrotate); the
 // logs of paths that are gone are closed.
-func (l *logFiles) swap(files map[string]*os.File) {
+func (l *Files) Swap(files map[string]*os.File) {
 	old := *l.logs.Load()
-	next := make(map[string]*accessLog, len(files))
+	next := make(map[string]*Log, len(files))
 	for path, file := range files {
 		if log, ok := old[path]; ok {
 			log.swap(file)
 			next[path] = log
 		} else {
-			next[path] = newAccessLogFile(file)
+			next[path] = newLog(file)
 		}
 	}
 	for path, log := range old {
@@ -82,10 +82,10 @@ func (l *logFiles) swap(files map[string]*os.File) {
 }
 
 // get returns the log of a path, or nil if a reload just closed it
-func (l *logFiles) get(path string) *accessLog {
+func (l *Files) Get(path string) *Log {
 	return (*l.logs.Load())[path]
 }
 
-func (l *logFiles) close() {
-	l.swap(nil)
+func (l *Files) Close() {
+	l.Swap(nil)
 }

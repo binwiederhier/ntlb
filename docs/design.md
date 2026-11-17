@@ -210,7 +210,7 @@ cancel, the access log line) is registered as `proxyRequest` finishers and run b
 request: the outermost handler (`observe`, unless the request was detached), or the stream
 goroutine. Finishers must
 not reference the `ResponseWriter` or the request (the access log copies what it needs into an
-`accessLogEntry` upfront), or they pin the very server state the detach frees.
+`accesslog.Entry` upfront), or they pin the very server state the detach frees.
 
 ## Sites (`config/sites.go`, `server/certs.go`, `server/server.go`)
 
@@ -348,7 +348,7 @@ notices), so there is no goroutine. On `Update`, a limit rule with the same ID, 
 keeps its buckets, and the strikes stay if the bans settings and the client key are unchanged, so
 a reload for an unrelated change resets nobody.
 
-Log files (`server/logfiles.go`): every access log and the ban file is an `accessLog` (a buffered
+Log files (`accesslog/`): every access log and the ban file is an `accesslog.Log` (a buffered
 file, flushed every second) by path. A reload opens every path first (so an unopenable one
 rejects the reload), reopens paths that stay (logrotate), and closes paths that are gone. A request
 goes to the first access log whose response expression matches.

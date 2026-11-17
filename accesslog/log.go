@@ -1,4 +1,6 @@
-package server
+// Package accesslog writes the access logs and the ban file: buffered files that a reload swaps
+// for reopened ones (logrotate), lines in nginx's format, with fields escaped and auth redacted.
+package accesslog
 
 import (
 	"bufio"
@@ -16,21 +18,21 @@ import (
 )
 
 var (
-	// accessLogFlushInterval is how long a log line may wait in the buffer (a variable for the
+	// FlushInterval is how long a log line may wait in the buffer (a variable for the
 	// tests, which wait for lines)
-	accessLogFlushInterval = time.Second
+	FlushInterval = time.Second
 )
 
 const (
-	accessLogLineSize   = 320                          // Room for a typical line, built in one allocation
-	accessLogTimeFormat = "02/Jan/2006:15:04:05 -0700" // nginx's $time_local
-	maxLogField         = 4096                         // Bytes per escaped field, so one request cannot write a huge line
+	lineSize    = 320                          // Room for a typical line, built in one allocation
+	timeFormat  = "02/Jan/2006:15:04:05 -0700" // nginx's $time_local
+	maxLogField = 4096                         // Bytes per escaped field, so one request cannot write a huge line
 )
 
-// accessLog is a buffered log file that a reload can swap for a reopened one (for logrotate). As
+// Log is a buffered log file that a reload can swap for a reopened one (for logrotate). As
 // an access log it writes one line per request in the format of the nginx log_format
 // "combined_ssl" on ntfy.sh (combined, then key=value fields), so the existing parsers keep working.
-type accessLog struct {
+type Log struct {
 	file *os.File
 	out  io.Writer // What w writes to: file, or a test's writer
 	w    *bufio.Writer
@@ -38,20 +40,30 @@ type accessLog struct {
 	mu   sync.Mutex // Protects file, out and w
 }
 
-// accessLogEntry holds what a log line needs from the request, taken upfront so that a stream
+// Entry holds what a log line needs from the request, taken upfront so that a stream
 // that outlives its handler does not keep the whole request alive
-type accessLogEntry struct {
-	start      time.Time
-	remoteAddr string
-	request    string // "GET /path HTTP/1.1", unquoted
-	referer    string
-	userAgent  string
-	host       string
+type Entry struct {
+	Start      time.Time
+	RemoteAddr string
+	Request    string // "GET /path HTTP/1.1", unquoted
+	Referer    string
+	UserAgent  string
+	Host       string
 }
 
-// newAccessLogFile creates a log that writes to an opened file (nil: off)
-func newAccessLogFile(file *os.File) *accessLog {
-	l := &accessLog{
+// Outcome is what a line says about how a request ended
+type Outcome struct {
+	Status         int // Sent to the client
+	Bytes          int64
+	Site           string // "" if no site served it
+	Upstream       string // The upstream that answered, "" if none did
+	UpstreamStatus int
+	Rule           string // The rule that decided the request, "" if none did
+}
+
+// newLog creates a log that writes to an opened file (nil: off)
+func newLog(file *os.File) *Log {
+	l := &Log{
 		done: make(chan struct{}),
 	}
 	l.swap(file)
@@ -59,62 +71,63 @@ func newAccessLogFile(file *os.File) *accessLog {
 	return l
 }
 
-// newAccessLogEntry takes what a log line needs from the request
-func newAccessLogEntry(r *http.Request, start time.Time) *accessLogEntry {
+// NewEntry takes what a log line needs from the request
+func NewEntry(r *http.Request, start time.Time) *Entry {
 	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		remoteAddr = r.RemoteAddr
 	}
-	return &accessLogEntry{
-		start:      start,
-		remoteAddr: remoteAddr,
-		request:    escapeUnquoted(r.Method) + " " + escapeUnquoted(redactAuth(r.RequestURI)) + " " + escapeUnquoted(r.Proto),
-		referer:    escape(r.Referer()),
-		userAgent:  escape(r.UserAgent()),
-		host:       escapeUnquoted(r.Host),
+	return &Entry{
+		Start:      start,
+		RemoteAddr: remoteAddr,
+		Request:    escapeUnquoted(r.Method) + " " + escapeUnquoted(redactAuth(r.RequestURI)) + " " + escapeUnquoted(r.Proto),
+		Referer:    escape(r.Referer()),
+		UserAgent:  escape(r.UserAgent()),
+		Host:       escapeUnquoted(r.Host),
 	}
 }
 
-func (l *accessLog) write(e *accessLogEntry, pr *proxyRequest, status int) {
+// Write writes the line of a request that ended
+func (l *Log) Write(e *Entry, o Outcome) {
 	// Appended field by field, like fmt's "%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s
 	// site=%s request_time=%.3f upstream=%s upstream_status=%s", without boxing every argument
-	line := make([]byte, 0, accessLogLineSize)
-	line = append(line, e.remoteAddr...)
+	line := make([]byte, 0, lineSize)
+	line = append(line, e.RemoteAddr...)
 	line = append(line, " - - ["...)
-	line = e.start.AppendFormat(line, accessLogTimeFormat)
+	line = e.Start.AppendFormat(line, timeFormat)
 	line = append(line, "] \""...)
-	line = append(line, e.request...)
+	line = append(line, e.Request...)
 	line = append(line, "\" "...)
-	line = strconv.AppendInt(line, int64(status), 10)
+	line = strconv.AppendInt(line, int64(o.Status), 10)
 	line = append(line, ' ')
-	line = strconv.AppendInt(line, pr.bytes, 10)
+	line = strconv.AppendInt(line, o.Bytes, 10)
 	line = append(line, " \""...)
-	line = append(line, orDash(e.referer)...)
+	line = append(line, orDash(e.Referer)...)
 	line = append(line, "\" \""...)
-	line = append(line, orDash(e.userAgent)...)
+	line = append(line, orDash(e.UserAgent)...)
 	line = append(line, "\" http_host="...)
-	line = append(line, orDash(e.host)...)
+	line = append(line, orDash(e.Host)...)
 	line = append(line, " site="...)
-	line = append(line, orDash(pr.site)...)
+	line = append(line, orDash(o.Site)...)
 	line = append(line, " request_time="...)
-	line = strconv.AppendFloat(line, time.Since(e.start).Seconds(), 'f', 3, 64)
+	line = strconv.AppendFloat(line, time.Since(e.Start).Seconds(), 'f', 3, 64)
 	line = append(line, " upstream="...)
-	if pr.upstream != "" {
-		line = append(line, pr.upstream...)
+	if o.Upstream != "" {
+		line = append(line, o.Upstream...)
 		line = append(line, " upstream_status="...)
-		line = strconv.AppendInt(line, int64(pr.upstreamStatus), 10)
+		line = strconv.AppendInt(line, int64(o.UpstreamStatus), 10)
 	} else {
 		line = append(line, "- upstream_status=-"...)
 	}
-	if pr.rule != "" {
+	if o.Rule != "" {
 		line = append(line, " rule="...)
-		line = append(line, pr.rule...)
+		line = append(line, o.Rule...)
 	}
-	l.writeLine(append(line, '\n'))
+	l.WriteLine(append(line, '\n'))
 }
 
-// writeLine writes a line that ends in a newline
-func (l *accessLog) writeLine(line []byte) {
+// WriteLine writes a line that ends in a newline (a ban line, say)
+func (l *Log) WriteLine(line []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.w != nil { // Closed while the request ran
@@ -126,7 +139,7 @@ func (l *accessLog) writeLine(line []byte) {
 
 // swap makes file the log file (nil turns logging off), flushing and closing the old one. It
 // takes an opened file, so a reload can fail before it changes anything.
-func (l *accessLog) swap(file *os.File) {
+func (l *Log) swap(file *os.File) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.file != nil {
@@ -139,13 +152,13 @@ func (l *accessLog) swap(file *os.File) {
 	}
 }
 
-func (l *accessLog) close() {
+func (l *Log) close() {
 	close(l.done)
 	l.swap(nil)
 }
 
-func (l *accessLog) flushLoop() {
-	ticker := time.NewTicker(accessLogFlushInterval)
+func (l *Log) flushLoop() {
+	ticker := time.NewTicker(FlushInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -157,7 +170,7 @@ func (l *accessLog) flushLoop() {
 	}
 }
 
-func (l *accessLog) flush() {
+func (l *Log) flush() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.w != nil {
@@ -170,7 +183,7 @@ func (l *accessLog) flush() {
 // failedNoLock drops what is buffered after a failed write (say, a full disk). bufio keeps its
 // first error and fails every write after it, which would silence the log, and with the ban file
 // the bans, until the next reload. The caller must hold l.mu.
-func (l *accessLog) failedNoLock(err error) {
+func (l *Log) failedNoLock(err error) {
 	slog.Warn("Cannot write log file, dropping its buffered lines", "error", err)
 	l.w.Reset(l.out)
 }

@@ -44,8 +44,9 @@ About 7,300 lines of Go without tests. In this order, each step builds on the on
 | `cmd` | `app.go`, `serve.go`, `status.go`, `drain.go` | The CLI (urfave/cli v3): `serve` runs a `server.Server` and handles signals; `check-config` loads a config; `status`, `reload`, `drain`, `undrain`, `upstream drain/undrain` talk to the admin API through `client`. |
 | `client` | `client.go` | HTTP client for the admin API, used by the CLI. Imports only `api`. |
 | `api` | `api.go` | The admin API's wire format: paths, `Status`, `UpstreamStatus`, `State`, and the request and response bodies. No logic; `server`, `balancer` and `client` share it. |
+| `accesslog` | `log.go`, `files.go` | The access logs and the ban file: buffered files a reload swaps for reopened ones, lines in nginx's format (`Entry`, taken when a request starts; `Outcome`, when it ends), escaping and `auth` redaction. |
 | `clientkey` | `clientkey.go` | What identifies a client: `Of` (its address shortened to a prefix) and `Parse` (an `ip:port` remote address). Sticky routing, the limits and bans, and the pending caps all count a client by it. |
-| `server` | `server.go` and 16 more | Everything HTTP: `observe` (site, validation, rules, logs, metrics), the listeners (`listeners.go`), the reverse proxy and its retries (`proxy.go`), the stream path (`stream.go`), the body and connection wrappers that bound reads and writes (`wrappers.go`), answers by rules (`rules.go`), error pages, gzip, access logs, certificates, metrics, the admin API. |
+| `server` | `server.go` and 16 more | Everything HTTP: `observe` (site, validation, rules, logs, metrics), the listeners (`listeners.go`), the reverse proxy and its retries (`proxy.go`), the stream path (`stream.go`), the body and connection wrappers that bound reads and writes (`wrappers.go`), answers by rules (`rules.go`), error pages, gzip, certificates, metrics, the admin API. |
 | `balancer` | `service.go`, `session.go`, `strategy.go`, `hash.go`, `health.go`, `drain.go`, `types.go` | The state of the upstreams: which are healthy, which are draining, the open sessions, and the order to try them in. No HTTP serving, only the health probes. |
 | `rules` | `service.go`, `bans.go` | The rule engine: checks a request against the rules, keeps the token buckets of `limit` rules and the strikes towards bans. |
 | `match` | `match.go` | The expression language (on [expr](https://expr-lang.org)): compiles `match:` and `location:` strings, evaluates them against a request (`Env`) or an outcome (`ResponseEnv`). |
@@ -54,7 +55,7 @@ About 7,300 lines of Go without tests. In this order, each step builds on the on
 | `lab/replay` | `main.go` | Not part of the binary: sends the same requests to ntlb and nginx and compares the answers. |
 
 How they import each other (arrows point at the imported package). `api`, `clientkey` and
-`match` are the leaves; `server` is the only package that knows about all the others.
+`match` are the leaves (and `accesslog`, but for the config it reads paths from); `server` is the only package that knows about all the others.
 
 ```mermaid
 flowchart TB
@@ -70,6 +71,8 @@ flowchart TB
     server --> match
     server --> config
     server --> api
+    server --> accesslog
+    accesslog --> config
     rules --> clientkey
     rules --> match
     rules --> config
@@ -97,7 +100,7 @@ classDiagram
         proxy *proxy
         rules *Engine
         certs *certStore
-        files *logFiles
+        files *accesslog.Files
         metrics *metrics
         public publicServer per address
         retired []*publicServer
@@ -560,7 +563,7 @@ type-checks the result (bool, or string for `location`). The functions:
 |---|---|---|
 | `healthLoop` | `Balancer.Start` | wakes at the shortest health interval, `go probe(due servers)`: one goroutine per server, one per address, `applyProbes` with hysteresis |
 | `drainLoop` | `Balancer.Start` | every second `drainTick`: picks this tick's sessions (oldest first, spread evenly to the deadline) under the lock, cancels them outside it, forgets drained removed servers |
-| `accessLog.flushLoop` | per log file | flushes the buffered writer every second |
+| `accesslog.Log.flushLoop` | per log file | flushes the buffered writer every second |
 | `serve` | `Server.Serve`, `swapPublic` | one `http.Server` per listen address, plus admin, metrics, profiler |
 | stream copy | `serveStream` | one per detached HTTP/1.1 stream, and the downstream copy of a WebSocket |
 | websocket copy | `copyUpgraded` | the upstream copy (client to upstream) of a WebSocket |

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"heckel.io/ntlb/accesslog"
 	"heckel.io/ntlb/balancer"
 	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/match"
@@ -60,7 +61,7 @@ type Server struct {
 	proxy       *proxy
 	rules       *rules.Engine
 	certs       *certStore
-	files       *logFiles // Access logs and the ban file
+	files       *accesslog.Files // Access logs and the ban file
 	metrics     *metrics
 	pending     *pendingConns            // Of all public listeners
 	clientConns atomic.Int64             // Open connections of all public listeners
@@ -94,7 +95,7 @@ func New(configFile string) (*Server, error) {
 	s := &Server{
 		configFile: configFile,
 		balancer:   balancer.New(conf),
-		files:      newLogFiles(),
+		files:      accesslog.NewFiles(),
 		public:     make(map[string]*publicServer),
 		errChan:    make(chan error, 1),
 		stopped:    make(chan struct{}),
@@ -113,14 +114,14 @@ func New(configFile string) (*Server, error) {
 	}
 	s.certs = &certStore{}
 	s.certs.store(certs)
-	files, err := openLogFiles(logPaths(conf))
+	files, err := accesslog.Open(accesslog.Paths(conf))
 	if err != nil {
 		return nil, err
 	}
-	s.files.swap(files)
+	s.files.Swap(files)
 	if err := s.listen(conf); err != nil {
 		s.closeListeners()
-		s.files.close()
+		s.files.Close()
 		return nil, err
 	}
 	return s, nil
@@ -179,13 +180,13 @@ func (s *Server) Reload() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	files, err := openLogFiles(logPaths(conf))
+	files, err := accesslog.Open(accesslog.Paths(conf))
 	if err != nil {
 		closePublic(added)
 		return nil, err
 	}
 	s.certs.store(certs)
-	s.files.swap(files)
+	s.files.Swap(files)
 	// The balancer first: it probes new upstreams before they take traffic, which takes up to a
 	// health check timeout. Only then the rules and the sites, back to back, so that a request
 	// sees the new rules with the new sites (a proxy rule to a new upstream finds it).
@@ -250,7 +251,7 @@ func (s *Server) Shutdown(delay, d time.Duration) {
 			}()
 		}
 		wg.Wait()
-		s.files.close()
+		s.files.Close()
 		close(s.stopped)
 	})
 }
@@ -316,9 +317,9 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			env.Site = site.Name
 		}
 		respEnv := match.NewResponseEnv(env) // Strings only, so the request can be let go
-		var entry *accessLogEntry
+		var entry *accesslog.Entry
 		if len(conf.AccessLogsFor(site)) > 0 {
-			entry = newAccessLogEntry(r, start)
+			entry = accesslog.NewEntry(r, start)
 		}
 		pr := &proxyRequest{
 			env:        env,
@@ -426,12 +427,19 @@ func boundAnswer(sw *statusWriter, r *http.Request, site *config.Site) http.Resp
 // writeAccessLog writes the request to the first access log of its site whose match is true. The
 // logs come from the current config, not the request's: a stream can outlive reloads that move
 // its log, whose old file is closed then.
-func (s *Server) writeAccessLog(entry *accessLogEntry, pr *proxyRequest, env *match.ResponseEnv) {
+func (s *Server) writeAccessLog(entry *accesslog.Entry, pr *proxyRequest, env *match.ResponseEnv) {
 	conf := s.config.Load()
 	for _, l := range conf.AccessLogsFor(conf.Site(pr.site)) {
 		if l.Program == nil || l.Program.Match(env) {
-			if log := s.files.get(l.File); log != nil {
-				log.write(entry, pr, env.Status)
+			if log := s.files.Get(l.File); log != nil {
+				log.Write(entry, accesslog.Outcome{
+					Status:         env.Status,
+					Bytes:          pr.bytes,
+					Site:           pr.site,
+					Upstream:       pr.upstream,
+					UpstreamStatus: pr.upstreamStatus,
+					Rule:           pr.rule,
+				})
 			}
 			return
 		}
@@ -441,8 +449,8 @@ func (s *Server) writeAccessLog(entry *accessLogEntry, pr *proxyRequest, env *ma
 // writeBan writes a ban line to a ban file (the global one, or a site's)
 func (s *Server) writeBan(file, line string) {
 	s.metrics.bans.Inc()
-	if log := s.files.get(file); log != nil {
-		log.writeLine([]byte(line + "\n"))
+	if log := s.files.Get(file); log != nil {
+		log.WriteLine([]byte(line + "\n"))
 	}
 }
 

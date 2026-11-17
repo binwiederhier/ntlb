@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"heckel.io/ntlb/accesslog"
 	"heckel.io/ntlb/clientkey"
 	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/match"
@@ -260,10 +261,10 @@ func (s *Server) badRequest(remoteAddr string) {
 		IP:     ip,
 		Status: http.StatusBadRequest,
 	}
-	entry := &accessLogEntry{
-		start:      time.Now(),
-		remoteAddr: ip,
-		request:    "-",
+	entry := &accesslog.Entry{
+		Start:      time.Now(),
+		RemoteAddr: ip,
+		Request:    "-",
 	}
 	s.writeAccessLog(entry, pr, env)
 	s.rules.CheckResponse(env)

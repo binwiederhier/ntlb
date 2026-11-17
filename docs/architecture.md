@@ -68,7 +68,7 @@ flowchart TB
         answer["answer<br/>block, limit, redirect, static,<br/>error pages"]
         proxy["proxy<br/>httputil.ReverseProxy, RoundTrip, retries"]
         stream["stream path<br/>raw upstream connection,<br/>hijacked client"]
-        accesslog["accessLog, logFiles"]
+        accesslog["accesslog.Log, accesslog.Files"]
         metrics["metrics, collectors"]
         admin["admin, metrics and<br/>profiler handlers"]
     end
