@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"heckel.io/ntlb/api"
 )
 
 // drainUpstreamSecondByCloseOrder drains app1 with n streams over d seconds, ticking once a
@@ -34,7 +35,7 @@ func drainUpstreamSecondByCloseOrder(t *testing.T, n, d int) (closedAt []int, fi
 				b.Close(s.Session) // Like the proxy does when the canceled stream ends
 			}
 		}
-		if finishedAt == 0 && b.Status().Upstreams[0].State == StateDrained {
+		if finishedAt == 0 && b.Status().Upstreams[0].State == api.StateDrained {
 			finishedAt = sec
 		}
 	}
@@ -181,11 +182,11 @@ func TestBalancer_DrainUpstreamZeroClosesAllOnNextTick(t *testing.T) {
 	require.Equal(t, 0, countCanceled(sessions2))
 
 	// Drained only once the closed streams are gone too
-	require.Equal(t, StateDraining, b.Status().Upstreams[0].State)
+	require.Equal(t, api.StateDraining, b.Status().Upstreams[0].State)
 	for _, s := range sessions1 {
 		b.Close(s.Session)
 	}
-	require.Equal(t, StateDrained, b.Status().Upstreams[0].State)
+	require.Equal(t, api.StateDrained, b.Status().Upstreams[0].State)
 }
 
 func TestBalancer_UndrainUpstreamMidDrainKeepsRemainingStreams(t *testing.T) {
@@ -206,7 +207,7 @@ func TestBalancer_UndrainUpstreamMidDrainKeepsRemainingStreams(t *testing.T) {
 	}
 	require.Equal(t, closed, countCanceled(sessions))
 	status := b.Status().Upstreams[0]
-	require.Equal(t, StateHealthy, status.State)
+	require.Equal(t, api.StateHealthy, status.State)
 	require.Nil(t, status.DrainDeadline)
 }
 
@@ -270,7 +271,7 @@ func TestBalancer_UpstreamDrainWaitsForLoadBalancerDrain(t *testing.T) {
 	// 20 streams over 100s: 4 by 20s, oldest first across both upstreams
 	require.Equal(t, 2, countCanceled(sessions1))
 	require.Equal(t, 2, countCanceled(sessions2))
-	require.Equal(t, StateDraining, b.Status().Upstreams[0].State)
+	require.Equal(t, api.StateDraining, b.Status().Upstreams[0].State)
 
 }
 
@@ -415,7 +416,7 @@ func TestBalancer_RemovedUpstreamForgottenOnlyAfterDeadline(t *testing.T) {
 	start := b.Status().Upstreams[1].DrainDeadline.Add(-10 * time.Second)
 	b.drainTick(start.Add(5 * time.Second))
 	require.Len(t, b.Status().Upstreams, 2)
-	require.Equal(t, StateDraining, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateDraining, b.Status().Upstreams[1].State)
 	b.drainTick(start.Add(10 * time.Second))
 	require.Len(t, b.Status().Upstreams, 1)
 	require.Nil(t, b.upstream("app2"))
@@ -473,7 +474,7 @@ func TestBalancer_DrainUpstreamPaced(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		require.Equal(t, []string{"app2"}, names(b.Pick("s", "", keyFor(i))))
 	}
-	require.Equal(t, StateDraining, b.Status().Upstreams[0].State)
+	require.Equal(t, api.StateDraining, b.Status().Upstreams[0].State)
 
 	// Its streams are closed a few at a time, oldest first, all of them by the deadline
 	b.drainTick(start.Add(time.Second))
@@ -493,7 +494,7 @@ func TestBalancer_DrainUpstreamPaced(t *testing.T) {
 
 	// Undraining puts it back
 	require.NoError(t, b.UndrainUpstream("app1"))
-	require.Equal(t, StateHealthy, b.Status().Upstreams[0].State)
+	require.Equal(t, api.StateHealthy, b.Status().Upstreams[0].State)
 	keyPreferring(b, "app1")
 	require.Error(t, b.DrainUpstream("nope", time.Second))
 }
@@ -573,7 +574,7 @@ func TestBalancer_DrainUndrainUpstreamUnknown(t *testing.T) {
 	require.Len(t, b.Status().Upstreams, 2)
 	require.ErrorIs(t, b.DrainUpstream("app2", time.Second), ErrUpstreamNotFound)
 	require.ErrorIs(t, b.UndrainUpstream("app2"), ErrUpstreamNotFound)
-	require.Equal(t, StateDraining, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateDraining, b.Status().Upstreams[1].State)
 }
 
 func TestBalancer_UndrainUpstreamNotDraining(t *testing.T) {
@@ -587,8 +588,8 @@ func TestBalancer_UndrainUpstreamNotDraining(t *testing.T) {
 	b.drainTick(time.Now().Add(time.Hour))
 	require.False(t, s.canceled())
 	status := b.Status()
-	require.Equal(t, StateHealthy, status.Upstreams[0].State)
-	require.Equal(t, StateUnhealthy, status.Upstreams[1].State) // Undrain does not make it healthy
+	require.Equal(t, api.StateHealthy, status.Upstreams[0].State)
+	require.Equal(t, api.StateUnhealthy, status.Upstreams[1].State) // Undrain does not make it healthy
 	require.Equal(t, 1, status.Upstreams[0].Streams)
 }
 

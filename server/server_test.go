@@ -29,7 +29,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/api"
 	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/match"
 )
@@ -1950,7 +1950,7 @@ func TestServer_ReloadAddsServerThatIsDown(t *testing.T) {
 	app2.notReady.Store(false)
 	waitFor(t, func() bool {
 		for _, u := range s.balancer.Status().Upstreams {
-			if u.Name == "app2" && u.State == balancer.StateHealthy {
+			if u.Name == "app2" && u.State == api.StateHealthy {
 				return true
 			}
 		}

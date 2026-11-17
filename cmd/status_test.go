@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/api"
 	"heckel.io/ntlb/server"
 )
 
@@ -89,7 +89,7 @@ func TestStatus_JSON(t *testing.T) {
 	s, _ := newTestServer(t, "app1")
 	out, err := run(t, s, "status", "--json")
 	require.NoError(t, err)
-	status := &balancer.Status{}
+	status := &api.Status{}
 	require.NoError(t, json.Unmarshal([]byte(out), status))
 	require.True(t, status.Ready)
 	require.Equal(t, "app1", status.Upstreams[0].Name)
@@ -109,27 +109,27 @@ func TestLBState(t *testing.T) {
 	deadline := time.Now().Add(time.Hour + 500*time.Millisecond)
 	tests := []struct {
 		name   string
-		status *balancer.Status
+		status *api.Status
 		state  string
 	}{
 		{
 			name:   "ready",
-			status: &balancer.Status{Healthy: true, Ready: true},
+			status: &api.Status{Healthy: true, Ready: true},
 			state:  `^ready$`,
 		},
 		{
 			name:   "unhealthy",
-			status: &balancer.Status{},
+			status: &api.Status{},
 			state:  `^unhealthy \(no healthy upstream, sending to all\)$`,
 		},
 		{
 			name:   "draining",
-			status: &balancer.Status{Healthy: true, Draining: true, DrainDeadline: &deadline},
+			status: &api.Status{Healthy: true, Draining: true, DrainDeadline: &deadline},
 			state:  `^draining, done in (1h0m0s|59m59s) \(\d\d:\d\d:\d\d\)$`,
 		},
 		{
 			name:   "drained wins over draining",
-			status: &balancer.Status{Healthy: true, Draining: true, Drained: true, DrainDeadline: &deadline},
+			status: &api.Status{Healthy: true, Draining: true, Drained: true, DrainDeadline: &deadline},
 			state:  `^drained \(turning requests away\)$`,
 		},
 	}
@@ -144,67 +144,67 @@ func TestUpstreamNote(t *testing.T) {
 	deadline := time.Now().Add(90*time.Second + 500*time.Millisecond)
 	tests := []struct {
 		name     string
-		upstream *balancer.UpstreamStatus
+		upstream *api.UpstreamStatus
 		note     string
 	}{
 		{
 			name:     "healthy",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateHealthy, Healthy: true},
+			upstream: &api.UpstreamStatus{State: api.StateHealthy, Healthy: true},
 			note:     `^$`,
 		},
 		{
 			name:     "unhealthy with last error",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateUnhealthy, LastError: "connection refused"},
+			upstream: &api.UpstreamStatus{State: api.StateUnhealthy, LastError: "connection refused"},
 			note:     `^last check: connection refused$`,
 		},
 		{
 			name:     "draining",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateDraining, Healthy: true, DrainDeadline: &deadline},
+			upstream: &api.UpstreamStatus{State: api.StateDraining, Healthy: true, DrainDeadline: &deadline},
 			note:     `^drained in 1m(30|29)s \(\d\d:\d\d:\d\d\)$`,
 		},
 		{
 			name:     "draining without deadline",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateDraining, Healthy: true},
+			upstream: &api.UpstreamStatus{State: api.StateDraining, Healthy: true},
 			note:     `^$`,
 		},
 		{
 			name:     "draining and unhealthy",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateDraining, DrainDeadline: &deadline, LastError: "timeout"},
+			upstream: &api.UpstreamStatus{State: api.StateDraining, DrainDeadline: &deadline, LastError: "timeout"},
 			note:     `^drained in 1m(30|29)s \(\d\d:\d\d:\d\d\); unhealthy; last check: timeout$`,
 		},
 		{
 			name:     "drained",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateDrained, Healthy: true},
+			upstream: &api.UpstreamStatus{State: api.StateDrained, Healthy: true},
 			note:     `^$`,
 		},
 		{
 			name:     "drained and unhealthy",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateDrained},
+			upstream: &api.UpstreamStatus{State: api.StateDrained},
 			note:     `^unhealthy$`,
 		},
 		{
 			name:     "removed from config",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateDraining, Healthy: true, Removed: true, DrainDeadline: &deadline},
+			upstream: &api.UpstreamStatus{State: api.StateDraining, Healthy: true, Removed: true, DrainDeadline: &deadline},
 			note:     `^removed from config; drained in 1m(30|29)s \(\d\d:\d\d:\d\d\)$`,
 		},
 		{
 			name:     "weighted backup",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateHealthy, Healthy: true, Weight: 3, Backup: true},
+			upstream: &api.UpstreamStatus{State: api.StateHealthy, Healthy: true, Weight: 3, Backup: true},
 			note:     `^backup; weight 3$`,
 		},
 		{
 			name:     "in a named upstream",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateHealthy, Healthy: true, Pool: "app1", Weight: 2},
+			upstream: &api.UpstreamStatus{State: api.StateHealthy, Healthy: true, Pool: "app1", Weight: 2},
 			note:     `^upstreams\.app1; weight 2$`,
 		},
 		{
 			name:     "weight 1 is no note",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateHealthy, Healthy: true, Weight: 1},
+			upstream: &api.UpstreamStatus{State: api.StateHealthy, Healthy: true, Weight: 1},
 			note:     `^$`,
 		},
 		{
 			name:     "removed and drained",
-			upstream: &balancer.UpstreamStatus{State: balancer.StateDrained, Healthy: true, Removed: true},
+			upstream: &api.UpstreamStatus{State: api.StateDrained, Healthy: true, Removed: true},
 			note:     `^removed from config$`,
 		},
 	}
@@ -217,16 +217,16 @@ func TestUpstreamNote(t *testing.T) {
 
 func TestStatus_AllStates(t *testing.T) {
 	deadline := time.Now().Add(time.Hour + 500*time.Millisecond)
-	status := &balancer.Status{
+	status := &api.Status{
 		Healthy:       true,
 		Draining:      true,
 		DrainDeadline: &deadline,
 		Streams:       42,
-		Upstreams: []*balancer.UpstreamStatus{
+		Upstreams: []*api.UpstreamStatus{
 			{
 				Site:      "ntfy",
 				Name:      "app1",
-				State:     balancer.StateHealthy,
+				State:     api.StateHealthy,
 				Healthy:   true,
 				Addresses: []string{"10.0.0.1:2586", "10.0.0.1:2587"},
 				Streams:   40,
@@ -236,14 +236,14 @@ func TestStatus_AllStates(t *testing.T) {
 			{
 				Site:      "ntfy",
 				Name:      "app2",
-				State:     balancer.StateUnhealthy,
+				State:     api.StateUnhealthy,
 				Addresses: []string{"10.0.0.2:2586"},
 				LastError: "connection refused",
 			},
 			{
 				Site:          "ntfy",
 				Name:          "app3",
-				State:         balancer.StateDraining,
+				State:         api.StateDraining,
 				Addresses:     []string{"10.0.0.3:2586"},
 				Streams:       2,
 				DrainDeadline: &deadline,
@@ -251,7 +251,7 @@ func TestStatus_AllStates(t *testing.T) {
 			{
 				Site:      "ntfy",
 				Name:      "app4",
-				State:     balancer.StateDrained,
+				State:     api.StateDrained,
 				Healthy:   true,
 				Removed:   true,
 				Addresses: []string{"10.0.0.4:2586"},

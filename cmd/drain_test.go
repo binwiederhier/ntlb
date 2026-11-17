@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/api"
 	"heckel.io/ntlb/config"
 )
 
@@ -78,7 +78,7 @@ func TestDrain_DefaultDurationFromConfig(t *testing.T) {
 	require.NoError(t, err)
 	out, err := run(t, s, "status", "--json")
 	require.NoError(t, err)
-	status := &balancer.Status{}
+	status := &api.Status{}
 	require.NoError(t, json.Unmarshal([]byte(out), status))
 	require.WithinDuration(t, time.Now().Add(config.DefaultDrainDuration), *status.Upstreams[0].DrainDeadline, 10*time.Second)
 }

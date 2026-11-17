@@ -2,7 +2,6 @@ package balancer
 
 import (
 	"math"
-	"net/netip"
 	"slices"
 	"strings"
 )
@@ -11,26 +10,6 @@ const (
 	fnvOffset64 = 14695981039346656037
 	fnvPrime64  = 1099511628211
 )
-
-// ClientKey returns the hash key for a client address: the IPv4 address shortened to
-// ipv4PrefixBits, or the IPv6 address shortened to ipv6PrefixBits (with 64, a client rotating
-// through its privacy addresses stays on the node holding its rate limits). The key is the
-// masked prefix, cut to whole bytes; with the defaults of 32 and 64 it is 4 or 8 bytes.
-func ClientKey(addr netip.Addr, ipv4PrefixBits, ipv6PrefixBits int) []byte {
-	addr = addr.Unmap()
-	if !addr.IsValid() {
-		return nil
-	}
-	bits := ipv6PrefixBits
-	if addr.Is4() {
-		bits = ipv4PrefixBits
-	}
-	prefix, err := addr.Prefix(bits)
-	if err != nil {
-		return addr.AsSlice()
-	}
-	return prefix.Addr().AsSlice()[:(bits+7)/8]
-}
 
 // sortByHash orders upstreams by preference for a key, using rendezvous (highest random weight)
 // hashing on their names. The order depends only on the key and the names, not on the config

@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/clientkey"
 	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/match"
 )
@@ -127,16 +127,16 @@ func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 		case config.ActionAllow:
 			return nil
 		case config.ActionBlock:
-			e.strike(s.bansFor(env.Site), remoteAddr(r), rl.conf)
+			e.strike(s.bansFor(env.Site), clientkey.Parse(r.RemoteAddr), rl.conf)
 			return rl.conf
 		case config.ActionRedirect, config.ActionStatic, config.ActionProxy:
 			return rl.conf
 		case config.ActionLimit:
 			if key == "" {
-				key = string(balancer.ClientKey(remoteAddr(r), s.ipv4PrefixBits, s.ipv6PrefixBits))
+				key = string(clientkey.Of(clientkey.Parse(r.RemoteAddr), s.ipv4PrefixBits, s.ipv6PrefixBits))
 			}
-			if !rl.limiter.take(key, remoteAddr(r), e.now()) {
-				e.strike(s.bansFor(env.Site), remoteAddr(r), rl.conf)
+			if !rl.limiter.take(key, clientkey.Parse(r.RemoteAddr), e.now()) {
+				e.strike(s.bansFor(env.Site), clientkey.Parse(r.RemoteAddr), rl.conf)
 				return rl.conf
 			}
 		}
@@ -273,7 +273,7 @@ func (l *limiter) take(key string, addr netip.Addr, now time.Time) bool {
 			l.sweepNoLock(now)
 		}
 		if len(buckets) >= maxTracked {
-			buckets, key = l.overflow, string(balancer.ClientKey(addr, overflowIPv4PrefixBits, overflowIPv6PrefixBits))
+			buckets, key = l.overflow, string(clientkey.Of(addr, overflowIPv4PrefixBits, overflowIPv6PrefixBits))
 		}
 	}
 	b, ok := buckets[key]
@@ -312,13 +312,6 @@ func (b *bucket) refill(now time.Time, perSecond, capacity float64) {
 		b.tokens = min(capacity, b.tokens+elapsed*perSecond)
 		b.last = now
 	}
-}
-
-// remoteAddr is the client address, IPv4-mapped IPv6 addresses as IPv4; invalid if unparseable
-// (net/http always sets host:port), which puts all such requests into one limit bucket
-func remoteAddr(r *http.Request) netip.Addr {
-	ap, _ := netip.ParseAddrPort(r.RemoteAddr)
-	return ap.Addr().Unmap()
 }
 
 // strike adds a rule's strikes for a client to b, and hands the ban line on if that reports it

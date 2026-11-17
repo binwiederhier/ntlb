@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/urfave/cli/v3"
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/api"
 )
 
 func newStatusCommand() *cli.Command {
@@ -46,7 +46,7 @@ func execStatus(ctx context.Context, cmd *cli.Command) error {
 	return w.Flush()
 }
 
-func lbState(s *balancer.Status) string {
+func lbState(s *api.Status) string {
 	switch {
 	case s.Drained:
 		return "drained (turning requests away)"
@@ -61,7 +61,7 @@ func lbState(s *balancer.Status) string {
 	}
 }
 
-func upstreamNote(u *balancer.UpstreamStatus) string {
+func upstreamNote(u *api.UpstreamStatus) string {
 	var notes []string
 	if u.Removed {
 		notes = append(notes, "removed from config")
@@ -75,10 +75,10 @@ func upstreamNote(u *balancer.UpstreamStatus) string {
 	if u.Weight > 1 {
 		notes = append(notes, fmt.Sprintf("weight %d", u.Weight))
 	}
-	if u.State == balancer.StateDraining && u.DrainDeadline != nil {
+	if u.State == api.StateDraining && u.DrainDeadline != nil {
 		notes = append(notes, "drained "+until(*u.DrainDeadline))
 	}
-	if (u.State == balancer.StateDraining || u.State == balancer.StateDrained) && !u.Healthy {
+	if (u.State == api.StateDraining || u.State == api.StateDrained) && !u.Healthy {
 		notes = append(notes, "unhealthy")
 	}
 	if u.LastError != "" {

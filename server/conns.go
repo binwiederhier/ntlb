@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/clientkey"
 	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/match"
 )
@@ -96,12 +96,11 @@ type connInfo struct {
 
 // connContext registers a new connection, as http.Server.ConnContext
 func (t *connTracker) connContext(ctx context.Context, c net.Conn) context.Context {
-	ap, _ := netip.ParseAddrPort(c.RemoteAddr().String()) // Always ip:port from a TCP listener
-	key := t.config.Load().ClientKey
+	remote := c.RemoteAddr().String() // Always ip:port from a TCP listener
 	info := &connInfo{
 		pending: t.pending,
-		key:     string(balancer.ClientKey(ap.Addr(), key.IPv4PrefixBits, key.IPv6PrefixBits)),
-		network: string(balancer.ClientKey(ap.Addr(), pendingIPv4PrefixBits, pendingIPv6PrefixBits)),
+		key:     string(clientKey(remote, t.config.Load().ClientKey)),
+		network: string(clientkey.Of(clientkey.Parse(remote), pendingIPv4PrefixBits, pendingIPv6PrefixBits)),
 	}
 	if t.pending.add(info.key, info.network) {
 		info.counted.Store(true)

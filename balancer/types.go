@@ -8,17 +8,6 @@ import (
 	"heckel.io/ntlb/config"
 )
 
-// State is an upstream's routing state
-type State string
-
-// Upstream states, in the order they win: a draining upstream is draining whether healthy or not
-const (
-	StateHealthy   State = "healthy"   // In rotation
-	StateUnhealthy State = "unhealthy" // Failed its health checks, out of rotation; open streams keep running
-	StateDraining  State = "draining"  // Out of rotation; open streams are being closed until the deadline
-	StateDrained   State = "drained"   // Out of rotation, every stream closed
-)
-
 var (
 	// ErrDrained is the cause a stream is canceled with when its upstream or the load balancer drains
 	ErrDrained = errors.New("connection drained")
@@ -29,37 +18,6 @@ var (
 	// ErrUpstreamAmbiguous is returned for an upstream name that several sites have
 	ErrUpstreamAmbiguous = errors.New("several sites have an upstream of this name, use site/name")
 )
-
-// Status is a snapshot of the load balancer's state, as served by the admin API
-type Status struct {
-	Healthy       bool              `json:"healthy"`
-	Ready         bool              `json:"ready"`
-	Withdrawing   bool              `json:"withdrawing"`
-	Draining      bool              `json:"draining"`
-	Drained       bool              `json:"drained"`
-	DrainDeadline *time.Time        `json:"drain_deadline,omitempty"`
-	Streams       int               `json:"streams"`
-	Upstreams     []*UpstreamStatus `json:"upstreams"`
-}
-
-// UpstreamStatus is a snapshot of one upstream
-type UpstreamStatus struct {
-	Site          string     `json:"site"`
-	Name          string     `json:"name"`
-	Pool          string     `json:"pool"` // The name of the site's upstream block it is in
-	State         State      `json:"state"`
-	Healthy       bool       `json:"healthy"`
-	Removed       bool       `json:"removed,omitempty"`
-	Weight        int        `json:"weight"`
-	Backup        bool       `json:"backup,omitempty"`
-	Addresses     []string   `json:"addresses"`
-	Streams       int        `json:"streams"`
-	Requests      uint64     `json:"requests"`
-	Failures      uint64     `json:"failures"`
-	DrainDeadline *time.Time `json:"drain_deadline,omitempty"`
-	LastCheck     *time.Time `json:"last_check,omitempty"`
-	LastError     string     `json:"last_error,omitempty"`
-}
 
 // Session is one proxied request, typically a long-lived subscription stream. It is attached to
 // an upstream once the upstream answered, and canceled to drain it.

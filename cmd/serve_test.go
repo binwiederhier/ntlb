@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/api"
 	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/server"
 )
@@ -128,15 +128,15 @@ func waitServed(t *testing.T, served <-chan error) {
 	}
 }
 
-func fetchStatus(t *testing.T, s *server.Server) *balancer.Status {
+func fetchStatus(t *testing.T, s *server.Server) *api.Status {
 	out, err := run(t, s, "status", "--json")
 	require.NoError(t, err)
-	status := &balancer.Status{}
+	status := &api.Status{}
 	require.NoError(t, json.Unmarshal([]byte(out), status))
 	return status
 }
 
-func upstreamNames(status *balancer.Status) []string {
+func upstreamNames(status *api.Status) []string {
 	var names []string
 	for _, u := range status.Upstreams {
 		names = append(names, u.Name)

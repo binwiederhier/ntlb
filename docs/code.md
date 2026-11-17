@@ -42,7 +42,9 @@ About 7,300 lines of Go without tests. In this order, each step builds on the on
 |---|---|---|
 | `main` | `main.go` | Calls `cmd.New().Run`. Nothing else. |
 | `cmd` | `app.go`, `serve.go`, `status.go`, `drain.go` | The CLI (urfave/cli v3): `serve` runs a `server.Server` and handles signals; `check-config` loads a config; `status`, `reload`, `drain`, `undrain`, `upstream drain/undrain` talk to the admin API through `client`. |
-| `client` | `client.go` | HTTP client for the admin API, used by the CLI. Shares the response types with `server` and `balancer`. |
+| `client` | `client.go` | HTTP client for the admin API, used by the CLI. Imports only `api`. |
+| `api` | `api.go` | The admin API's wire format: paths, `Status`, `UpstreamStatus`, `State`, and the request and response bodies. No logic; `server`, `balancer` and `client` share it. |
+| `clientkey` | `clientkey.go` | What identifies a client: `Of` (its address shortened to a prefix) and `Parse` (an `ip:port` remote address). Sticky routing, the limits and bans, and the pending caps all count a client by it. |
 | `server` | `server.go` and 16 more | Everything HTTP: `observe` (site, validation, rules, logs, metrics), the listeners (`listeners.go`), the reverse proxy and its retries (`proxy.go`), the stream path (`stream.go`), the body and connection wrappers that bound reads and writes (`wrappers.go`), answers by rules (`rules.go`), error pages, gzip, access logs, certificates, metrics, the admin API. |
 | `balancer` | `service.go`, `session.go`, `strategy.go`, `hash.go`, `health.go`, `drain.go`, `types.go` | The state of the upstreams: which are healthy, which are draining, the open sessions, and the order to try them in. No HTTP serving, only the health probes. |
 | `rules` | `service.go`, `bans.go` | The rule engine: checks a request against the rules, keeps the token buckets of `limit` rules and the strikes towards bans. |
@@ -51,31 +53,30 @@ About 7,300 lines of Go without tests. In this order, each step builds on the on
 | `procs` | `service.go` | Adapts GOMAXPROCS to the CPU use (`Run`, started by `serve`): fewer Ps when the load is low, since every idle P costs scheduler wakeups. Off when `GOMAXPROCS` is set. |
 | `lab/replay` | `main.go` | Not part of the binary: sends the same requests to ntlb and nginx and compares the answers. |
 
-How they import each other (arrows point at the imported package). `config` and `match` are
-the leaves; `server` is the only package that knows about all the others.
+How they import each other (arrows point at the imported package). `api`, `clientkey` and
+`match` are the leaves; `server` is the only package that knows about all the others.
 
 ```mermaid
 flowchart TB
     main["main"] --> cmd
     cmd --> server
     cmd --> client
-    cmd --> balancer
+    cmd --> api
     cmd --> config
-    client --> server
-    client --> balancer
+    client --> api
     server --> rules
     server --> balancer
+    server --> clientkey
     server --> match
     server --> config
-    rules --> balancer
+    server --> api
+    rules --> clientkey
     rules --> match
     rules --> config
     balancer --> config
+    balancer --> api
     config --> match
 ```
-
-`rules` imports `balancer` only for `balancer.ClientKey` (the IPv4 /32 or IPv6 /64 a client is
-counted by), and `client` imports `server` only for the admin API's response types.
 
 External libraries: `expr-lang/expr` (expressions), `prometheus/client_golang` (metrics),
 `urfave/cli/v3` (CLI), `gopkg.in/yaml.v3` (config). TLS, HTTP/1.1, HTTP/2 and the reverse proxy

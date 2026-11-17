@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	"heckel.io/ntlb/api"
 	"heckel.io/ntlb/balancer"
 )
 
@@ -223,7 +224,7 @@ func (c *statusCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.draining, prometheus.GaugeValue, boolFloat(status.Draining))
 	ch <- prometheus.MustNewConstMetric(c.openRequests, prometheus.GaugeValue, float64(status.Streams))
 	for _, u := range status.Upstreams {
-		draining := u.State == balancer.StateDraining || u.State == balancer.StateDrained
+		draining := u.State == api.StateDraining || u.State == api.StateDrained
 		ch <- prometheus.MustNewConstMetric(c.upstreamHealthy, prometheus.GaugeValue, boolFloat(u.Healthy), u.Site, u.Name)
 		ch <- prometheus.MustNewConstMetric(c.upstreamDraining, prometheus.GaugeValue, boolFloat(draining), u.Site, u.Name)
 		ch <- prometheus.MustNewConstMetric(c.upstreamStreams, prometheus.GaugeValue, float64(u.Streams), u.Site, u.Name)

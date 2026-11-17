@@ -9,12 +9,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/clientkey"
 	"heckel.io/ntlb/config"
 	"heckel.io/ntlb/match"
 )
@@ -512,11 +512,11 @@ func proxyRequestFromContext(ctx context.Context) *proxyRequest {
 }
 
 func clientKey(remoteAddr string, key *config.ClientKey) []byte {
-	addrPort, err := netip.ParseAddrPort(remoteAddr)
-	if err != nil {
+	addr := clientkey.Parse(remoteAddr)
+	if !addr.IsValid() {
 		return []byte(remoteAddr)
 	}
-	return balancer.ClientKey(addrPort.Addr(), key.IPv4PrefixBits, key.IPv6PrefixBits)
+	return clientkey.Of(addr, key.IPv4PrefixBits, key.IPv6PrefixBits)
 }
 
 // isSubscription returns true for a long-lived stream, see config.Streams

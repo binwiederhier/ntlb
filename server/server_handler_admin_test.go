@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/api"
 )
 
 func adminDo(t testing.TB, s *Server, method, path, body string) (int, string) {
@@ -28,10 +28,10 @@ func adminDo(t testing.TB, s *Server, method, path, body string) (int, string) {
 	return resp.StatusCode, string(b)
 }
 
-func adminStatus(t testing.TB, s *Server) *balancer.Status {
+func adminStatus(t testing.TB, s *Server) *api.Status {
 	code, body := adminDo(t, s, http.MethodGet, "/v1/status", "")
 	require.Equal(t, http.StatusOK, code)
-	status := &balancer.Status{}
+	status := &api.Status{}
 	require.NoError(t, json.Unmarshal([]byte(body), status))
 	return status
 }
@@ -70,11 +70,11 @@ func TestAdmin_DrainUpstream(t *testing.T) {
 	code, _ := adminDo(t, s, http.MethodPost, "/v1/upstreams/app1/drain", `{"duration":"10m"}`)
 	require.Equal(t, http.StatusOK, code)
 	status := adminStatus(t, s)
-	require.Equal(t, balancer.StateDraining, status.Upstreams[0].State)
+	require.Equal(t, api.StateDraining, status.Upstreams[0].State)
 	require.WithinDuration(t, time.Now().Add(10*time.Minute), *status.Upstreams[0].DrainDeadline, time.Minute)
 	code, _ = adminDo(t, s, http.MethodDelete, "/v1/upstreams/app1/drain", "")
 	require.Equal(t, http.StatusOK, code)
-	require.Equal(t, balancer.StateHealthy, adminStatus(t, s).Upstreams[0].State)
+	require.Equal(t, api.StateHealthy, adminStatus(t, s).Upstreams[0].State)
 
 	// Errors
 	code, _ = adminDo(t, s, http.MethodPost, "/v1/upstreams/nope/drain", "")
@@ -85,7 +85,7 @@ func TestAdmin_DrainUpstream(t *testing.T) {
 	// By site/name, escaped
 	code, _ = adminDo(t, s, http.MethodPost, "/v1/upstreams/s%2Fapp2/drain", "")
 	require.Equal(t, http.StatusOK, code)
-	require.Equal(t, balancer.StateDraining, adminStatus(t, s).Upstreams[1].State)
+	require.Equal(t, api.StateDraining, adminStatus(t, s).Upstreams[1].State)
 	code, _ = adminDo(t, s, http.MethodDelete, "/v1/upstreams/s%2Fapp2/drain", "")
 	require.Equal(t, http.StatusOK, code)
 	code, _ = adminDo(t, s, http.MethodPost, "/v1/upstreams/x%2Fapp2/drain", "")
@@ -228,7 +228,7 @@ func TestAdmin_RejectsBrowserRequests(t *testing.T) {
 
 	// Cross-origin POST and rebound hostnames are refused
 	require.Equal(t, http.StatusForbidden, do(http.MethodPost, s.AdminAddr(), "/v1/upstreams/app1/drain", "", "https://evil.example"))
-	require.Equal(t, balancer.StateHealthy, adminStatus(t, s).Upstreams[0].State)
+	require.Equal(t, api.StateHealthy, adminStatus(t, s).Upstreams[0].State)
 	require.Equal(t, http.StatusForbidden, do(http.MethodGet, s.AdminAddr(), "/v1/status", "evil.example:"+port, ""))
 	require.Equal(t, http.StatusForbidden, do(http.MethodGet, s.ProfilerAddr(), "/debug/pprof/", "evil.example", ""))
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"heckel.io/ntlb/api"
 	"heckel.io/ntlb/config"
 )
 
@@ -199,13 +200,13 @@ func TestBalancer_HealthHysteresisFromConfig(t *testing.T) {
 	b.checkHealth(context.Background())
 	app2.ready.Store(false)
 	b.checkHealth(context.Background())
-	require.Equal(t, StateUnhealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateUnhealthy, b.Status().Upstreams[1].State)
 	app2.ready.Store(true)
 	b.checkHealth(context.Background())
 	b.checkHealth(context.Background())
-	require.Equal(t, StateUnhealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateUnhealthy, b.Status().Upstreams[1].State)
 	b.checkHealth(context.Background())
-	require.Equal(t, StateHealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateHealthy, b.Status().Upstreams[1].State)
 
 	reloaded := newTestConfig(app1, app2)
 	reloaded.Sites[0].DefaultUpstream().HealthCheck.Fails = 2
@@ -213,12 +214,12 @@ func TestBalancer_HealthHysteresisFromConfig(t *testing.T) {
 	b.Update(reloaded)
 	app2.ready.Store(false)
 	b.checkHealth(context.Background())
-	require.Equal(t, StateHealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateHealthy, b.Status().Upstreams[1].State)
 	b.checkHealth(context.Background())
-	require.Equal(t, StateUnhealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateUnhealthy, b.Status().Upstreams[1].State)
 	app2.ready.Store(true)
 	b.checkHealth(context.Background())
-	require.Equal(t, StateHealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateHealthy, b.Status().Upstreams[1].State)
 }
 
 func TestBalancer_CheckHealthSkipsRemoved(t *testing.T) {
@@ -322,7 +323,7 @@ func TestBalancer_ProbeOfReplacedAddressIsDiscarded(t *testing.T) {
 	<-checked
 	status := b.Status().Upstreams[1]
 	require.Equal(t, []string{app2new.addr()}, status.Addresses)
-	require.Equal(t, StateHealthy, status.State)
+	require.Equal(t, api.StateHealthy, status.State)
 	require.Empty(t, status.LastError)
 }
 

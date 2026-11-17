@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"heckel.io/ntlb/api"
+	"heckel.io/ntlb/clientkey"
 	"heckel.io/ntlb/config"
 )
 
@@ -113,7 +115,7 @@ func names(upstreams []*Upstream) []string {
 }
 
 func keyFor(i int) []byte {
-	return ClientKey(netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), 32, 64)
+	return clientkey.Of(netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), 32, 64)
 }
 
 // keyPreferring returns a client key whose first choice is the given upstream
@@ -150,7 +152,7 @@ func TestBalancer_InitialProbe(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		require.Equal(t, []string{"app1"}, names(b.Pick("s", "", keyFor(i))))
 	}
-	require.Equal(t, StateUnhealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateUnhealthy, b.Status().Upstreams[1].State)
 }
 
 func TestBalancer_HealthHysteresis(t *testing.T) {
@@ -201,7 +203,7 @@ func TestBalancer_UpdateRemovesUpstream(t *testing.T) {
 	status := b.Status()
 	require.Len(t, status.Upstreams, 2)
 	require.True(t, status.Upstreams[1].Removed)
-	require.Equal(t, StateDraining, status.Upstreams[1].State)
+	require.Equal(t, api.StateDraining, status.Upstreams[1].State)
 	require.False(t, s2.canceled())
 
 	// Gone once it is drained and its last stream closed
@@ -218,7 +220,7 @@ func TestBalancer_UpdateReaddsDrainingUpstream(t *testing.T) {
 	b := newTestBalancer(t, app1, app2)
 	b.Update(newTestConfig(app1))
 	b.Update(newTestConfig(app1, app2))
-	require.Equal(t, StateHealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateHealthy, b.Status().Upstreams[1].State)
 	keyPreferring(b, "app2")
 }
 
@@ -239,7 +241,7 @@ func TestBalancer_UpdateKeepsRuntimeDrain(t *testing.T) {
 	b := newTestBalancer(t, app1, app2)
 	require.NoError(t, b.DrainUpstream("app1", time.Minute))
 	b.Update(newTestConfig(app1, app2))
-	require.Equal(t, StateDraining, b.Status().Upstreams[0].State)
+	require.Equal(t, api.StateDraining, b.Status().Upstreams[0].State)
 }
 
 func TestBalancer_NextAddressLeastLoaded(t *testing.T) {
@@ -303,7 +305,7 @@ func TestBalancer_StatusUpstreamStates(t *testing.T) {
 
 	// Healthy
 	s := status.Upstreams[0]
-	require.Equal(t, StateHealthy, s.State)
+	require.Equal(t, api.StateHealthy, s.State)
 	require.True(t, s.Healthy)
 	require.False(t, s.Removed)
 	require.Equal(t, []string{app1.addr()}, s.Addresses)
@@ -314,14 +316,14 @@ func TestBalancer_StatusUpstreamStates(t *testing.T) {
 
 	// Unhealthy
 	s = status.Upstreams[1]
-	require.Equal(t, StateUnhealthy, s.State)
+	require.Equal(t, api.StateUnhealthy, s.State)
 	require.False(t, s.Healthy)
 	require.Contains(t, s.LastError, ": unexpected status 503") // Prefixed with the address
 	require.Nil(t, s.DrainDeadline)
 
 	// Draining, with its deadline
 	s = status.Upstreams[2]
-	require.Equal(t, StateDraining, s.State)
+	require.Equal(t, api.StateDraining, s.State)
 	require.True(t, s.Healthy)
 	require.Equal(t, 2, s.Streams)
 	require.NotNil(t, s.DrainDeadline)
@@ -330,15 +332,15 @@ func TestBalancer_StatusUpstreamStates(t *testing.T) {
 
 	// Drained, still with its deadline
 	s = status.Upstreams[3]
-	require.Equal(t, StateDrained, s.State)
+	require.Equal(t, api.StateDrained, s.State)
 	require.Equal(t, 0, s.Streams)
 	require.NotNil(t, s.DrainDeadline)
 
 	// A drained upstream that gets a (late) stream is draining again until it is closed
 	late := newTestSession(b, "app4")
-	require.Equal(t, StateDraining, b.Status().Upstreams[3].State)
+	require.Equal(t, api.StateDraining, b.Status().Upstreams[3].State)
 	b.Close(late.Session)
-	require.Equal(t, StateDrained, b.Status().Upstreams[3].State)
+	require.Equal(t, api.StateDrained, b.Status().Upstreams[3].State)
 
 	// A draining upstream that is also unhealthy is draining
 	app3.ready.Store(false)
@@ -346,7 +348,7 @@ func TestBalancer_StatusUpstreamStates(t *testing.T) {
 		b.checkHealth(context.Background())
 	}
 	s = b.Status().Upstreams[2]
-	require.Equal(t, StateDraining, s.State)
+	require.Equal(t, api.StateDraining, s.State)
 	require.False(t, s.Healthy)
 }
 
@@ -364,7 +366,7 @@ func TestBalancer_StatusLoadBalancerDrain(t *testing.T) {
 	require.NotNil(t, status.DrainDeadline)
 	require.False(t, status.DrainDeadline.Before(before.Add(time.Minute)))
 	require.False(t, status.DrainDeadline.After(after.Add(time.Minute)))
-	require.Equal(t, StateHealthy, status.Upstreams[0].State) // The upstreams are not draining
+	require.Equal(t, api.StateHealthy, status.Upstreams[0].State) // The upstreams are not draining
 
 	// A snapshot does not change when the drain does
 	deadline := *status.DrainDeadline
@@ -486,7 +488,7 @@ func TestBalancer_UpdateRemoveAndReaddMidDrain(t *testing.T) {
 	require.Equal(t, closed, countCanceled(sessions))
 	require.Same(t, u2, b.upstream("app2"))
 	status := b.Status().Upstreams[1]
-	require.Equal(t, StateHealthy, status.State)
+	require.Equal(t, api.StateHealthy, status.State)
 	require.False(t, status.Removed)
 	require.Nil(t, status.DrainDeadline)
 	require.Equal(t, 10-closed, status.Streams)
@@ -514,14 +516,14 @@ func TestBalancer_UpdateRemovesUpstreamWithCommandDrain(t *testing.T) {
 	b.Update(conf)
 	status := b.Status().Upstreams[1]
 	require.True(t, status.Removed)
-	require.Equal(t, StateDraining, status.State)
+	require.Equal(t, api.StateDraining, status.State)
 	require.Equal(t, deadline, *status.DrainDeadline)
 
 	// Re-added: still draining by command
 	b.Update(newTestConfig(app1, app2))
 	status = b.Status().Upstreams[1]
 	require.False(t, status.Removed)
-	require.Equal(t, StateDraining, status.State)
+	require.Equal(t, api.StateDraining, status.State)
 	for i := 0; i < 100; i++ {
 		require.Equal(t, []string{"app1"}, names(b.Pick("s", "", keyFor(i))))
 	}
@@ -630,7 +632,7 @@ func TestBalancer_UpdateReaddsUpstreamForgottenDuringProbe(t *testing.T) {
 	require.Len(t, status.Upstreams, 3)
 	require.Equal(t, "app2", status.Upstreams[1].Name)
 	require.False(t, status.Upstreams[1].Removed)
-	require.Equal(t, StateHealthy, status.Upstreams[1].State)
+	require.Equal(t, api.StateHealthy, status.Upstreams[1].State)
 	keyPreferring(b, "app2")
 }
 
@@ -642,7 +644,7 @@ func TestBalancer_StartAndStop(t *testing.T) {
 	before := runtime.NumGoroutine()
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Start(ctx)
-	require.Equal(t, StateUnhealthy, b.Status().Upstreams[0].State)
+	require.Equal(t, api.StateUnhealthy, b.Status().Upstreams[0].State)
 	require.NotNil(t, b.Status().Upstreams[0].LastCheck)
 	require.GreaterOrEqual(t, runtime.NumGoroutine(), before+2)
 	cancel()
@@ -857,7 +859,7 @@ func TestBalancer_UpdateAddressChangeResetsHealth(t *testing.T) {
 	b.Update(newTestConfig(app1, app2down))
 	status := b.Status().Upstreams[1]
 	require.Equal(t, []string{app2down.addr()}, status.Addresses)
-	require.Equal(t, StateUnhealthy, status.State)
+	require.Equal(t, api.StateUnhealthy, status.State)
 	require.Contains(t, status.LastError, ": unexpected status 503")
 	require.Equal(t, 1, status.Streams) // Existing streams stay where they are
 	require.False(t, s.canceled())
@@ -870,14 +872,14 @@ func TestBalancer_UpdateAddressChangeResetsHealth(t *testing.T) {
 	app2up := newTestUpstream(t, "app2")
 	b.Update(newTestConfig(app1, app2up))
 	status = b.Status().Upstreams[1]
-	require.Equal(t, StateHealthy, status.State)
+	require.Equal(t, api.StateHealthy, status.State)
 	require.Empty(t, status.LastError)
 	keyPreferring(b, "app2")
 
 	// The hysteresis starts over for the new address: a single failure does not take it out
 	app2up.ready.Store(false)
 	b.checkHealth(context.Background())
-	require.Equal(t, StateHealthy, b.Status().Upstreams[1].State)
+	require.Equal(t, api.StateHealthy, b.Status().Upstreams[1].State)
 }
 
 func TestBalancer_Sites(t *testing.T) {
@@ -1193,10 +1195,10 @@ func TestBalancer_ClientKeyAllocations(t *testing.T) {
 	// ClientKey runs for every request (sticky routing, limits, bans)
 	v4, v6 := netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("2001:db8::1")
 	require.LessOrEqual(t, testing.AllocsPerRun(100, func() {
-		ClientKey(v4, 32, 64)
+		clientkey.Of(v4, 32, 64)
 	}), 1.0)
 	require.LessOrEqual(t, testing.AllocsPerRun(100, func() {
-		ClientKey(v6, 32, 64)
+		clientkey.Of(v6, 32, 64)
 	}), 1.0)
 }
 

@@ -48,7 +48,7 @@ once per pick, and only for round-robin and least-conn.
 `splitmix64(fnv1a(key || 0xff || name))` mapped into (0,1), and sorts by score (name as
 tie-break); the score grows with the hash, so equal weights rank like plain rendezvous hashing. The key is the client IP shortened to `client-key.ipv4-prefix-bits`
 (default 32) or `client-key.ipv6-prefix-bits` (default 64), masked and cut to whole bytes
-(`ClientKey`); with the defaults that is 4 or 8 bytes. `TestRank_Golden` pins the hash.
+(`clientkey.Of`); with the defaults that is 4 or 8 bytes. `TestRank_Golden` pins the hash.
 Properties the tests pin down: the order does not depend on config order or process; removing a
 name only moves keys that ranked it first; adding one only moves keys to it; distribution is
 even.
@@ -327,7 +327,7 @@ access log line with `rule=<name>`, `ntlb_rule_matches_total{rule}`, and the ans
 the fallback, like `try_files $uri /index.html`; `http.ServeContent` does types, ranges and
 conditional requests).
 
-Limits are token buckets per client key (`balancer.ClientKey`, the same prefix as routing), with
+Limits are token buckets per client key (`clientkey.Of`, the same prefix as routing), with
 `burst + 1` tokens, like `limit_req ... burst=N nodelay`. A limited request takes no token.
 
 Bans work like ntfy's `ban.Service`: strikes (from a deciding `block`, from each request a `limit`

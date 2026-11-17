@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"heckel.io/ntlb/api"
 	"heckel.io/ntlb/config"
 )
 
@@ -323,12 +324,12 @@ func (b *Balancer) Healthy() bool {
 }
 
 // Status returns a snapshot of the load balancer and its upstreams
-func (b *Balancer) Status() *Status {
+func (b *Balancer) Status() *api.Status {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	now := time.Now()
 	healthy := b.healthyNoLock()
-	status := &Status{
+	status := &api.Status{
 		Healthy:     healthy,
 		Ready:       healthy && b.drain == nil && !b.withdrawn,
 		Withdrawing: b.withdrawn && b.drain == nil,
@@ -429,10 +430,10 @@ func servers(conf *config.Config) []*poolServer {
 }
 
 // statusNoLock returns the upstream's snapshot. The caller must hold Balancer.mu.
-func (u *Upstream) statusNoLock(now time.Time) *UpstreamStatus {
+func (u *Upstream) statusNoLock(now time.Time) *api.UpstreamStatus {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	s := &UpstreamStatus{
+	s := &api.UpstreamStatus{
 		Site:      u.site,
 		Name:      u.name,
 		Pool:      u.pool,
@@ -452,13 +453,13 @@ func (u *Upstream) statusNoLock(now time.Time) *UpstreamStatus {
 	}
 	switch {
 	case u.drain != nil && u.drain.finished && s.Streams == 0:
-		s.State = StateDrained
+		s.State = api.StateDrained
 	case u.drain != nil:
-		s.State = StateDraining
+		s.State = api.StateDraining
 	case u.healthy:
-		s.State = StateHealthy
+		s.State = api.StateHealthy
 	default:
-		s.State = StateUnhealthy
+		s.State = api.StateUnhealthy
 	}
 	if u.drain != nil {
 		deadline := u.drain.deadline

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"heckel.io/ntlb/balancer"
+	"heckel.io/ntlb/api"
 )
 
 // recordedRequest is what the fake admin API saw
@@ -50,7 +50,7 @@ func TestClient_Status(t *testing.T) {
 	require.Equal(t, 3, status.Streams)
 	require.Len(t, status.Upstreams, 1)
 	require.Equal(t, "app1", status.Upstreams[0].Name)
-	require.Equal(t, balancer.StateHealthy, status.Upstreams[0].State)
+	require.Equal(t, api.StateHealthy, status.Upstreams[0].State)
 }
 
 func TestClient_Status_InvalidJSON(t *testing.T) {

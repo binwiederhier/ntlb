@@ -9,12 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
-	"heckel.io/ntlb/balancer"
-	"heckel.io/ntlb/server"
+	"heckel.io/ntlb/api"
 )
 
 const (
@@ -38,9 +36,9 @@ func New(baseURL string) *Client {
 }
 
 // Status returns the load balancer's status
-func (c *Client) Status(ctx context.Context) (*balancer.Status, error) {
-	status := &balancer.Status{}
-	if err := c.do(ctx, http.MethodGet, "/v1/status", nil, status); err != nil {
+func (c *Client) Status(ctx context.Context) (*api.Status, error) {
+	status := &api.Status{}
+	if err := c.do(ctx, http.MethodGet, api.StatusPath, nil, status); err != nil {
 		return nil, err
 	}
 	return status, nil
@@ -49,8 +47,8 @@ func (c *Client) Status(ctx context.Context) (*balancer.Status, error) {
 // Reload makes the load balancer re-read its config file. It returns the changed settings that
 // only a restart applies.
 func (c *Client) Reload(ctx context.Context) ([]string, error) {
-	resp := &server.ReloadResponse{}
-	if err := c.do(ctx, http.MethodPost, "/v1/reload", nil, resp); err != nil {
+	resp := &api.ReloadResponse{}
+	if err := c.do(ctx, http.MethodPost, api.ReloadPath, nil, resp); err != nil {
 		return nil, err
 	}
 	return resp.RestartRequired, nil
@@ -58,12 +56,12 @@ func (c *Client) Reload(ctx context.Context) ([]string, error) {
 
 // DrainUpstream drains one upstream over duration, or the config's drain-duration if empty
 func (c *Client) DrainUpstream(ctx context.Context, name, duration string) error {
-	return c.do(ctx, http.MethodPost, "/v1/upstreams/"+url.PathEscape(name)+"/drain", &server.DrainRequest{Duration: duration}, nil)
+	return c.do(ctx, http.MethodPost, api.UpstreamDrainURL(name), &api.DrainRequest{Duration: duration}, nil)
 }
 
 // UndrainUpstream puts a drained upstream back into rotation
 func (c *Client) UndrainUpstream(ctx context.Context, name string) error {
-	return c.do(ctx, http.MethodDelete, "/v1/upstreams/"+url.PathEscape(name)+"/drain", nil, nil)
+	return c.do(ctx, http.MethodDelete, api.UpstreamDrainURL(name), nil, nil)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, result any) error {
@@ -89,7 +87,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, result any) 
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		errResp := &server.ErrorResponse{}
+		errResp := &api.ErrorResponse{}
 		if err := json.Unmarshal(b, errResp); err == nil && errResp.Error != "" {
 			return errors.New(errResp.Error)
 		}
