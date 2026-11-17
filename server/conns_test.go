@@ -289,9 +289,10 @@ func TestConns_PendingCapUsesClientKey(t *testing.T) {
 func TestConns_PendingPerNetworkCapped(t *testing.T) {
 	// Many clients of one network (a /24, or an IPv6 /48 of many /64 client keys) share a second,
 	// larger cap, so that one attacker cannot multiply the per-client cap by its addresses
-	defer func(old int) {
-		maxPendingConnsPerNetwork = old
-	}(maxPendingConnsPerNetwork)
+	old := maxPendingConnsPerNetwork
+	t.Cleanup(func() {
+		maxPendingConnsPerNetwork = old // After the server's cleanup, which runs first
+	})
 	maxPendingConnsPerNetwork = 2
 	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
 	c1 := dialFrom(t, "127.0.0.1", s.HTTPAddr())
@@ -305,9 +306,10 @@ func TestConns_TotalCapped(t *testing.T) {
 	// All client connections together stay below the file descriptor limit, with room for the
 	// upstream connections: past the cap, new ones are closed right away, like nginx's
 	// worker_connections, rather than failing the upstream dials of everyone
-	defer func(old int64) {
-		maxClientConns = old
-	}(maxClientConns)
+	old := maxClientConns
+	t.Cleanup(func() {
+		maxClientConns = old // After the server's cleanup, which runs first
+	})
 	maxClientConns = 2
 	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
 	c1 := dialFrom(t, "127.0.0.1", s.HTTPAddr())

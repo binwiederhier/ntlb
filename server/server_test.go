@@ -2051,9 +2051,10 @@ func TestServer_UnreadBodyDoesNotHoldTheConnection(t *testing.T) {
 	// After an answer that did not read the whole body (a rule's, or a proxied one after the body
 	// stalled), Go reads the rest before it closes the connection, without a deadline: a client
 	// that never sends it must not hold the connection and its goroutine (nginx's lingering_timeout)
-	defer func(linger, body time.Duration) {
-		lingerTimeout, clientBodyTimeout = linger, body
-	}(lingerTimeout, clientBodyTimeout)
+	linger, body := lingerTimeout, clientBodyTimeout
+	t.Cleanup(func() {
+		lingerTimeout, clientBodyTimeout = linger, body // After the server's cleanup, which runs first
+	})
 	lingerTimeout, clientBodyTimeout = 300*time.Millisecond, 300*time.Millisecond
 	s, _ := newTestServer(t, "rules: [{name: blocked, match: 'path == \"/blocked\"', action: block}]", newTestUpstream(t, "app1"))
 	for _, target := range []string{"/blocked", "/body-progress"} {
