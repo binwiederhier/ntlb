@@ -2075,3 +2075,16 @@ func TestServer_LongURIRejected(t *testing.T) {
 	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name?x="+strings.Repeat("a", maxRequestURIBytes))
 	require.Equal(t, http.StatusRequestURITooLong, status)
 }
+
+func TestServer_ShutdownWithoutDrainIsImmediate(t *testing.T) {
+	// Shutdown(0, 0) (Serve failing, or a second SIGTERM) ends the open streams right away rather
+	// than on the drain's next tick, up to a second later
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "", app1)
+	stream, closeStream := openStream(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/bcast/json")
+	defer closeStream()
+	require.NotNil(t, stream)
+	start := time.Now()
+	s.Shutdown(0, 0)
+	require.Less(t, time.Since(start), 300*time.Millisecond)
+}

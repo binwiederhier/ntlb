@@ -212,11 +212,13 @@ func (s *Server) Shutdown(delay, d time.Duration) {
 			s.balancer.Withdraw()
 			time.Sleep(delay)
 		}
-		s.balancer.Drain(d)
-		ctx, cancel := context.WithTimeout(context.Background(), d+drainTickSlack)
-		defer cancel()
-		if err := s.balancer.WaitIdle(ctx); err != nil {
-			slog.Warn("Streams still open after the drain, closing them", "error", err)
+		s.balancer.Drain(d) // Also without a duration: new streams are turned away from here on
+		if d > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), d+drainTickSlack)
+			defer cancel()
+			if err := s.balancer.WaitIdle(ctx); err != nil {
+				slog.Warn("Streams still open after the drain, closing them", "error", err)
+			}
 		}
 
 		// End whatever the drain did not (e.g. its loop stopped), and wait for the finishers
