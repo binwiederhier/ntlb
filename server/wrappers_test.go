@@ -152,3 +152,15 @@ func (w *deadlineRecorder) expire(t time.Time) {
 		})
 	}
 }
+
+func TestBufferPool_NoAllocations(t *testing.T) {
+	// Every read of a stream takes a buffer and returns it: in steady state, that allocates nothing
+	// (sync.Pool takes pointers, and a pointer to a fresh slice header would escape on every Put)
+	skipUnderRace(t) // sync.Pool drops items at random under -race
+	p := &bufferPool{}
+	p.Put(p.Get())
+	allocs := testing.AllocsPerRun(1000, func() {
+		p.Put(p.Get())
+	})
+	require.Zero(t, allocs)
+}

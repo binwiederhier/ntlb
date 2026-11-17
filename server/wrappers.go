@@ -196,18 +196,28 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-// bufferPool hands out the reverse proxy's copy buffers
+// bufferPool hands out the copy buffers of the reverse proxy and the stream path
 type bufferPool struct {
-	pool sync.Pool
+	buffers sync.Pool // *[]byte with a buffer
+	holders sync.Pool // *[]byte without one, reused by Put instead of a new pointer each time
 }
 
 func (p *bufferPool) Get() []byte {
-	if b, ok := p.pool.Get().(*[]byte); ok {
-		return *b
+	h, ok := p.buffers.Get().(*[]byte)
+	if !ok {
+		return make([]byte, copyBufferSize)
 	}
-	return make([]byte, copyBufferSize)
+	b := *h
+	*h = nil
+	p.holders.Put(h)
+	return b
 }
 
 func (p *bufferPool) Put(b []byte) {
-	p.pool.Put(&b)
+	h, ok := p.holders.Get().(*[]byte)
+	if !ok {
+		h = new([]byte)
+	}
+	*h = b
+	p.buffers.Put(h)
 }
