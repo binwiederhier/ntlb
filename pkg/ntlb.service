@@ -19,10 +19,43 @@ RestartMaxDelaySec=5min
 # One fd per client connection plus one per upstream connection
 LimitNOFILE=1000000
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 DynamicUser=yes
 # The certificate must be readable by the dynamic user, e.g. add "SupplementaryGroups=ssl-cert"
 # and give that group read access to /etc/letsencrypt/{live,archive}
 LogsDirectory=ntlb
+# Logs hold client addresses and request targets: not for other users (files are 0640 too)
+LogsDirectoryMode=0750
+UMask=0027
+
+# Sandboxing. DynamicUser implies the first six; they are spelled out so that a drop-in with
+# DynamicUser=no and a fixed user keeps them. ntlb needs TCP sockets, its config and certificate
+# (read), its log files (write), and /proc/self (metrics); nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RemoveIPC=yes
+RestrictSUIDSGID=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# A call outside @system-service fails with EPERM instead of killing the process (Go raises its
+# own RLIMIT_NOFILE at start, for one)
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
