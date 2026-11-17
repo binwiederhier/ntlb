@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,7 +23,7 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request, env *match.Env, 
 			writeError(w, pages, httpErrNoLocation)
 			return
 		}
-		w.Header().Set("Location", location)
+		w.Header().Set("Location", escapeLocation(location))
 		w.WriteHeader(rule.Status)
 	case config.ActionStatic:
 		serveStatic(w, r, rule.Root, rule.Fallback, pages)
@@ -77,4 +78,26 @@ func cleanStaticPath(p string) bool {
 		clean += "/"
 	}
 	return clean == p && !strings.Contains(p, "/.")
+}
+
+// escapeLocation percent-encodes the control bytes and spaces of a redirect location, which a
+// location built from the decoded path can carry (%00, %0d%0a, %20): a header value must not
+// contain them. A location without any is returned as it is.
+func escapeLocation(location string) string {
+	if !strings.ContainsFunc(location, isLocationControl) {
+		return location
+	}
+	var b strings.Builder
+	for i := 0; i < len(location); i++ {
+		if c := location[i]; c <= ' ' || c == 0x7f {
+			fmt.Fprintf(&b, "%%%02X", c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func isLocationControl(r rune) bool {
+	return r <= ' ' || r == 0x7f
 }

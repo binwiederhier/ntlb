@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"heckel.io/ntlb/config"
+	"heckel.io/ntlb/match"
 )
 
 // noRedirects is a client that shows redirects instead of following them
@@ -644,4 +647,21 @@ func TestServer_RuleAnswerDoesNotWaitForTheBody(t *testing.T) {
 		require.True(t, resp.Close, target) // The rest of the body is not read: the connection ends
 		conn.Close()
 	}
+}
+
+func TestRules_RedirectLocationEscapesControlBytes(t *testing.T) {
+	// A location built from the decoded path (%00, %0d%0a, %20 arrive decoded) must not put raw
+	// control bytes or spaces into the header: Go turns CR and LF into spaces, but writes a NUL
+	// as is on HTTP/1
+	program, err := match.Compile(`"https://docs.example.com" + path`, match.String)
+	require.NoError(t, err)
+	rule := &config.Rule{
+		Action:          config.ActionRedirect,
+		Status:          http.StatusMovedPermanently,
+		LocationProgram: program,
+	}
+	r := httptest.NewRequest(http.MethodGet, "/a%00b%20c%0d%0ad%7f", nil)
+	w := httptest.NewRecorder()
+	(&Server{}).answer(w, r, match.NewEnv(r), rule, nil)
+	require.Equal(t, "https://docs.example.com/a%00b%20c%0D%0Ad%7F", w.Header().Get("Location"))
 }
