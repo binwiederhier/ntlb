@@ -63,6 +63,7 @@ type Server struct {
 	files       *logFiles // Access logs and the ban file
 	metrics     *metrics
 	pending     *pendingConns            // Of all public listeners
+	clientConns atomic.Int64             // Open connections of all public listeners
 	public      map[string]*publicServer // Proxying servers by listen address
 	retired     []*publicServer          // Removed by a reload: no new connections, open ones run on
 	admin       *http.Server
@@ -107,7 +108,8 @@ func New(configFile string) (*Server, error) {
 	s.rules = rules.New(conf, s.writeBan)
 	s.metrics = newMetrics(s.balancer)
 	s.pending = &pendingConns{
-		counts: make(map[string]int),
+		counts:   make(map[string]int),
+		networks: make(map[string]int),
 	}
 	s.proxy = newProxy(s.balancer, s.metrics, conf)
 	certs, err := loadCerts(conf)

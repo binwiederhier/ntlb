@@ -292,6 +292,14 @@ limit sees it. Over the cap, `ConnContext` closes the new connection and counts
 rule counts its client), and so do a close and a hijack. Legitimate clients stay far below: a
 request follows the handshake right away, even through a carrier NAT.
 
+A second cap counts the pending connections of a client's network (IPv4 /24, IPv6 /48) at
+`maxPendingConnsPerNetwork` (8192), since addresses multiply the first: one /48 holds 65,536
+client keys of /64. And all client connections of the public listeners together stop at
+`maxClientConns` (400,000), like nginx's `worker_connections`: each stream also holds an upstream
+connection, and both must fit in `LimitNOFILE` (1M). Past it, `countingListener` closes new
+connections right away (also `ntlb_connections_refused_total`); without it, a flood of
+connections would use up the descriptors and fail the upstream dials of every client instead.
+
 ## Rules and bans (`rules/`, `match/`, `config/rules.go`, `server/rules.go`)
 
 All expressions in the config (rule and stream `match`, access log `match`, redirect `location`)
@@ -363,7 +371,7 @@ finisher as the access log (`Server.observe`), so detached streams are counted w
   none serves the host; upstream empty if none answered; code 499 if the client left before a
   response)
 - `ntlb_request_duration_seconds{kind="request"}`, `ntlb_stream_duration_seconds`
-- `ntlb_connections_refused_total`: connections closed by the pending cap (see "Requests Go rejects")
+- `ntlb_connections_refused_total`: connections closed by the pending caps or the total cap (see "Requests Go rejects")
 - `ntlb_connections`, `ntlb_connections_accepted_total`: client connections on the public
   listeners, like nginx's `stub_status` active and accepted. Counted at the listener (accept to
   first `Close`), not in `ConnState`, so hijacked HTTP/1 streams and WebSockets stay counted.
@@ -497,8 +505,9 @@ publishes incl. chunked and `Expect: 100-continue`, UnifiedPush, Matrix, account
 calls, CORS, HEAD, the website and redirects, the abuse rules, the garbage of nginx's
 `access_error_400.log`, oversized and slow requests) against both: 60 the same. The differences:
 nginx rejects a header line over 8 KiB (400), ntlb takes up to 64 KiB of headers (431 above);
-both reject a request target over 8 KiB (414; ntlb since 2026-11-17, before any rule runs over it); nginx rejects HTTP/1.0 without Host, ntlb proxies it; slowloris
-headers are cut after 30s (nginx: 60s). The replay found two ntlb bugs, both fixed: raw quotes in
+both reject a request target over 8 KiB (414; ntlb since 2026-11-17, before any rule runs over
+it); nginx rejects HTTP/1.0 without Host, ntlb proxies it; slowloris headers are cut after 30s
+(nginx: 60s). The replay found two ntlb bugs, both fixed: raw quotes in
 a query were refused, and a stalled body was only cut after 3m (now 60s, like
 `client_body_timeout`). A first nginx run failed on a lab mistake: one node's two ports listed as
 two upstream servers sent half the clients to it, over ntfy's global topic limit (429s).

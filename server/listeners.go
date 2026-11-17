@@ -156,6 +156,7 @@ func (s *Server) bindPublic(conf *config.Config, listeners []*config.Listener) (
 			ln: &countingListener{
 				Listener: ln,
 				metrics:  s.metrics,
+				open:     &s.clientConns,
 			},
 			tls: l.TLS,
 		}

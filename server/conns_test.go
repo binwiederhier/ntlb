@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -28,6 +29,26 @@ func sendRaw(t testing.TB, addr, data string) string {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	line, _ := bufio.NewReader(conn).ReadString('\n')
 	return strings.TrimSpace(line)
+}
+
+// closedByServer reports whether the server closed conn (read within 500ms ends other than by
+// the deadline)
+func closedByServer(conn net.Conn) bool {
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err := conn.Read(make([]byte, 1))
+	var netErr net.Error
+	return !errors.As(err, &netErr) || !netErr.Timeout()
+}
+
+// dialFrom connects to addr from a loopback address of choice (any of 127.0.0.0/8 on Linux)
+func dialFrom(t testing.TB, ip, addr string) net.Conn {
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: net.ParseIP(ip)},
+	}
+	conn, err := dialer.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	return conn
 }
 
 func TestConns_BadRequestsAreLoggedAndStruck(t *testing.T) {
@@ -174,7 +195,8 @@ func TestConns_CountedUntilClosed(t *testing.T) {
 
 func TestConns_CountedConnKeepsTCPMethods(t *testing.T) {
 	// net/http half-closes a connection before closing it (CloseWrite, so an early error response
-	// is not lost to a reset), and sendfile needs ReadFrom: the counting wrapper must keep both
+	// is not lost to a reset), sendfile needs ReadFrom, and the stream path waits for a plain-HTTP
+	// client's bytes in the netpoller (copyStream, SyscallConn): the counting wrapper keeps them
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer ln.Close()
@@ -190,6 +212,7 @@ func TestConns_CountedConnKeepsTCPMethods(t *testing.T) {
 	var conn net.Conn = &countedConn{
 		Conn:    inner,
 		metrics: newMetrics(nil),
+		open:    &atomic.Int64{},
 	}
 	defer conn.Close()
 	_, ok := conn.(interface{ CloseWrite() error })
@@ -198,6 +221,10 @@ func TestConns_CountedConnKeepsTCPMethods(t *testing.T) {
 	require.True(t, ok, "ReaderFrom")
 	_, ok = conn.(io.WriterTo)
 	require.True(t, ok, "WriterTo")
+	sc, ok := conn.(syscall.Conn)
+	require.True(t, ok, "SyscallConn")
+	_, err = sc.SyscallConn()
+	require.NoError(t, err)
 	require.NoError(t, conn.(interface{ CloseWrite() error }).CloseWrite())
 }
 
@@ -217,12 +244,6 @@ func TestConns_PendingPerIPCapped(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { conn.Close() })
 		return conn
-	}
-	closedByServer := func(conn net.Conn) bool {
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		_, err := conn.Read(make([]byte, 1))
-		var netErr net.Error
-		return !(errors.As(err, &netErr) && netErr.Timeout())
 	}
 	c1, c2 := dial(), dial()
 	require.True(t, closedByServer(dial()))
@@ -253,48 +274,41 @@ func TestConns_PendingCapUsesClientKey(t *testing.T) {
 	maxPendingConnsPerIP = 1
 	app1 := newTestUpstream(t, "app1")
 	s, _ := newTestServer(t, "client-key: {ipv4-prefix-bits: 24}", app1)
-	dialFrom := func(ip string) net.Conn {
-		dialer := &net.Dialer{
-			LocalAddr: &net.TCPAddr{IP: net.ParseIP(ip)},
-		}
-		conn, err := dialer.Dial("tcp", s.HTTPAddr())
-		require.NoError(t, err)
-		t.Cleanup(func() { conn.Close() })
-		return conn
-	}
-	closedByServer := func(conn net.Conn) bool {
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		_, err := conn.Read(make([]byte, 1))
-		var netErr net.Error
-		return !(errors.As(err, &netErr) && netErr.Timeout())
-	}
-	c1 := dialFrom("127.0.0.1")
-	require.True(t, closedByServer(dialFrom("127.0.0.2")))
+	c1 := dialFrom(t, "127.0.0.1", s.HTTPAddr())
+	require.True(t, closedByServer(dialFrom(t, "127.0.0.2", s.HTTPAddr())))
 	require.False(t, closedByServer(c1))
-	require.False(t, closedByServer(dialFrom("127.0.1.1"))) // Another /24
+	require.False(t, closedByServer(dialFrom(t, "127.0.1.1", s.HTTPAddr()))) // Another /24
 }
 
-func TestCountedConn_KeepsSyscallConn(t *testing.T) {
-	// The stream path waits for a plain-HTTP client's bytes in the netpoller, without a buffer
-	// (copyStream); that needs the TCP connection's SyscallConn through the counting wrapper
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	cl := &countingListener{
-		Listener: ln,
-		metrics:  newMetrics(nil),
-	}
-	defer cl.Close()
-	go func() {
-		if c, err := net.Dial("tcp", ln.Addr().String()); err == nil {
-			defer c.Close()
-			c.Write([]byte("x"))
-		}
-	}()
-	c, err := cl.Accept()
-	require.NoError(t, err)
-	defer c.Close()
-	sc, ok := c.(syscall.Conn)
-	require.True(t, ok)
-	_, err = sc.SyscallConn()
-	require.NoError(t, err)
+func TestConns_PendingPerNetworkCapped(t *testing.T) {
+	// Many clients of one network (a /24, or an IPv6 /48 of many /64 client keys) share a second,
+	// larger cap, so that one attacker cannot multiply the per-client cap by its addresses
+	defer func(old int) {
+		maxPendingConnsPerNetwork = old
+	}(maxPendingConnsPerNetwork)
+	maxPendingConnsPerNetwork = 2
+	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
+	c1 := dialFrom(t, "127.0.0.1", s.HTTPAddr())
+	dialFrom(t, "127.0.0.2", s.HTTPAddr())
+	require.True(t, closedByServer(dialFrom(t, "127.0.0.3", s.HTTPAddr())))
+	require.False(t, closedByServer(c1))
+	require.False(t, closedByServer(dialFrom(t, "127.0.1.1", s.HTTPAddr()))) // Another /24
+}
+
+func TestConns_TotalCapped(t *testing.T) {
+	// All client connections together stay below the file descriptor limit, with room for the
+	// upstream connections: past the cap, new ones are closed right away, like nginx's
+	// worker_connections, rather than failing the upstream dials of everyone
+	defer func(old int64) {
+		maxClientConns = old
+	}(maxClientConns)
+	maxClientConns = 2
+	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
+	c1 := dialFrom(t, "127.0.0.1", s.HTTPAddr())
+	dialFrom(t, "127.0.1.1", s.HTTPAddr())
+	require.True(t, closedByServer(dialFrom(t, "127.0.2.1", s.HTTPAddr())))
+	c1.Close()
+	waitFor(t, func() bool {
+		return !closedByServer(dialFrom(t, "127.0.3.1", s.HTTPAddr()))
+	})
 }

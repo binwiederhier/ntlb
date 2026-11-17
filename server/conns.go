@@ -23,6 +23,23 @@ var (
 	// maxPendingConnsPerIP caps a client's connections that have not sent a request yet (a
 	// variable for the tests)
 	maxPendingConnsPerIP = 256
+
+	// maxPendingConnsPerNetwork caps the pending connections of all clients of a network
+	// (pendingIPv4PrefixBits, pendingIPv6PrefixBits), so that addresses do not multiply the cap
+	// above: a /48 holds 65,536 client keys of /64 (a variable for the tests)
+	maxPendingConnsPerNetwork = 8192
+
+	// maxClientConns caps all open client connections of the public listeners, like nginx's
+	// worker_connections: each stream also holds an upstream connection, and both fit in the
+	// unit's LimitNOFILE (1M) with room for the logs and the health checks. Past it, new
+	// connections are closed right away, rather than every upstream dial failing (a variable for
+	// the tests).
+	maxClientConns int64 = 400_000
+)
+
+const (
+	pendingIPv4PrefixBits = 24
+	pendingIPv6PrefixBits = 48
 )
 
 // connInfoKey is the request context key for the connection's *connInfo
@@ -46,8 +63,9 @@ type connTracker struct {
 // counts the client instead. Legitimate clients hold few: a request follows the handshake right
 // away, and browsers open only a handful of HTTP/2 connections ahead of time.
 type pendingConns struct {
-	counts map[string]int
-	mu     sync.Mutex // Protects counts
+	counts   map[string]int // By client key
+	networks map[string]int // By network (pendingIPv4PrefixBits, pendingIPv6PrefixBits)
+	mu       sync.Mutex     // Protects counts and networks
 }
 
 // countingListener counts a public listener's client connections from accept to close. At the
@@ -55,12 +73,14 @@ type pendingConns struct {
 type countingListener struct {
 	net.Listener
 	metrics *metrics
+	open    *atomic.Int64 // Of all public listeners, for maxClientConns
 }
 
 // countedConn is an accepted connection, uncounted once on its first Close
 type countedConn struct {
 	net.Conn
 	metrics *metrics
+	open    *atomic.Int64
 	once    sync.Once
 }
 
@@ -70,6 +90,7 @@ type connInfo struct {
 	handled atomic.Bool
 	pending *pendingConns
 	key     string      // The client, for pending
+	network string      // The client's network, for pending
 	counted atomic.Bool // In pending, until the first request or the close
 }
 
@@ -80,8 +101,9 @@ func (t *connTracker) connContext(ctx context.Context, c net.Conn) context.Conte
 	info := &connInfo{
 		pending: t.pending,
 		key:     string(balancer.ClientKey(ap.Addr(), key.IPv4PrefixBits, key.IPv6PrefixBits)),
+		network: string(balancer.ClientKey(ap.Addr(), pendingIPv4PrefixBits, pendingIPv6PrefixBits)),
 	}
-	if t.pending.add(info.key) {
+	if t.pending.add(info.key, info.network) {
 		info.counted.Store(true)
 	} else {
 		t.refused.Inc()
@@ -118,21 +140,34 @@ func (t *connTracker) connState(c net.Conn, state http.ConnState) {
 	}
 }
 
+// Accept returns the next connection within maxClientConns; one past it is closed right away
 func (l *countingListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.open.Add(1) > maxClientConns {
+			l.open.Add(-1)
+			l.metrics.connectionsRefused.Inc()
+			c.Close()
+			continue
+		}
+		l.metrics.connectionsAccepted.Inc()
+		l.metrics.connections.Inc()
+		return &countedConn{
+			Conn:    c,
+			metrics: l.metrics,
+			open:    l.open,
+		}, nil
 	}
-	l.metrics.connectionsAccepted.Inc()
-	l.metrics.connections.Inc()
-	return &countedConn{
-		Conn:    c,
-		metrics: l.metrics,
-	}, nil
 }
 
 func (c *countedConn) Close() error {
-	c.once.Do(c.metrics.connections.Dec)
+	c.once.Do(func() {
+		c.metrics.connections.Dec()
+		c.open.Add(-1)
+	})
 	return c.Conn.Close()
 }
 
@@ -181,28 +216,36 @@ func markHandled(ctx context.Context) {
 // release takes the connection out of its client's pending count, once
 func (i *connInfo) release() {
 	if i.counted.CompareAndSwap(true, false) {
-		i.pending.remove(i.key)
+		i.pending.remove(i.key, i.network)
 	}
 }
 
-// add counts a pending connection of a client, and reports whether it is within the cap
-func (p *pendingConns) add(key string) bool {
+// add counts a pending connection of a client and its network, and reports whether both are
+// within their caps
+func (p *pendingConns) add(key, network string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.counts[key] >= maxPendingConnsPerIP {
+	if p.counts[key] >= maxPendingConnsPerIP || p.networks[network] >= maxPendingConnsPerNetwork {
 		return false
 	}
 	p.counts[key]++
+	p.networks[network]++
 	return true
 }
 
-func (p *pendingConns) remove(key string) {
+func (p *pendingConns) remove(key, network string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.counts[key] <= 1 {
-		delete(p.counts, key)
+	decrement(p.counts, key)
+	decrement(p.networks, network)
+}
+
+// decrement counts down a key, deleting it at zero so the map does not keep every client
+func decrement(counts map[string]int, key string) {
+	if counts[key] <= 1 {
+		delete(counts, key)
 	} else {
-		p.counts[key]--
+		counts[key]--
 	}
 }
 
