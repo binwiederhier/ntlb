@@ -2065,3 +2065,13 @@ func TestServer_UnreadBodyDoesNotHoldTheConnection(t *testing.T) {
 		conn.Close()
 	}
 }
+
+func TestServer_LongURIRejected(t *testing.T) {
+	// Like nginx's large_client_header_buffers: a request target over 8 KiB is 414, before any
+	// rule's expression runs over it (64 KiB paths through the abuse regexes cost ~5 ms each)
+	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
+	status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name?x="+strings.Repeat("a", maxRequestURIBytes-len("/name?x=")))
+	require.Equal(t, http.StatusOK, status)
+	status, _ = get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/name?x="+strings.Repeat("a", maxRequestURIBytes))
+	require.Equal(t, http.StatusRequestURITooLong, status)
+}

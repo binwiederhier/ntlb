@@ -22,6 +22,7 @@ var (
 	httpErrBlocked           = &httpError{Code: 40399, HTTP: http.StatusForbidden, Error: "blocked"}
 	httpErrNoSite            = &httpError{Code: 40499, HTTP: http.StatusNotFound, Error: "no site for this host"}
 	httpErrNotFound          = &httpError{Code: 40498, HTTP: http.StatusNotFound, Error: "not found"}
+	httpErrURITooLong        = &httpError{Code: 41499, HTTP: http.StatusRequestURITooLong, Error: "request target too long"}
 	httpErrRateLimited       = &httpError{Code: 42999, HTTP: http.StatusTooManyRequests, Error: "rate limited"}
 	httpErrNoLocation        = &httpError{Code: 50099, HTTP: http.StatusInternalServerError, Error: "redirect has no location"}
 	httpErrUpstreamFailed    = &httpError{Code: 50299, HTTP: http.StatusBadGateway, Error: "upstream failed"}

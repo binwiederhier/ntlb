@@ -496,8 +496,8 @@ clients' code: polls with every `since=` form, multi-topic polls, streams per pr
 publishes incl. chunked and `Expect: 100-continue`, UnifiedPush, Matrix, account and web push
 calls, CORS, HEAD, the website and redirects, the abuse rules, the garbage of nginx's
 `access_error_400.log`, oversized and slow requests) against both: 60 the same. The differences:
-nginx rejects a header line over 8 KiB (400) and a request line over 8 KiB (414), ntlb takes up to
-64 KiB of headers (431 above); nginx rejects HTTP/1.0 without Host, ntlb proxies it; slowloris
+nginx rejects a header line over 8 KiB (400), ntlb takes up to 64 KiB of headers (431 above);
+both reject a request target over 8 KiB (414; ntlb since 2026-11-17, before any rule runs over it); nginx rejects HTTP/1.0 without Host, ntlb proxies it; slowloris
 headers are cut after 30s (nginx: 60s). The replay found two ntlb bugs, both fixed: raw quotes in
 a query were refused, and a stalled body was only cut after 3m (now 60s, like
 `client_body_timeout`). A first nginx run failed on a lab mistake: one node's two ports listed as

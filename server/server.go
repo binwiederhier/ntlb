@@ -22,11 +22,12 @@ import (
 )
 
 const (
-	readHeaderTimeout = 30 * time.Second
-	idleTimeout       = 65 * time.Second // Like nginx's keepalive_timeout
-	maxHeaderBytes    = 64 * 1024
-	shutdownGrace     = 5 * time.Second // After the drain: how long the last responses get to finish
-	drainTickSlack    = 2 * time.Second // The drain closes the last streams on its first tick after the deadline
+	readHeaderTimeout  = 30 * time.Second
+	idleTimeout        = 65 * time.Second // Like nginx's keepalive_timeout
+	maxHeaderBytes     = 64 * 1024
+	maxRequestURIBytes = 8 * 1024        // nginx's large_client_header_buffers: 414 above
+	shutdownGrace      = 5 * time.Second // After the drain: how long the last responses get to finish
+	drainTickSlack     = 2 * time.Second // The drain closes the last streams on its first tick after the deadline
 )
 
 // Names of the admin, metrics and profiler listeners; the public ones are named by their address
@@ -337,7 +338,8 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 			errorPages: conf.ErrorPagesFor(site),
 		}
 		sw := &statusWriter{ResponseWriter: w}
-		valid := validRequest(r)
+		tooLong := len(r.RequestURI) > maxRequestURIBytes
+		valid := !tooLong && validRequest(r)
 		var rule *config.Rule
 		if valid {
 			rule = s.rules.Check(r, env)
@@ -367,7 +369,10 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 				pr.finish()
 			}
 		}()
-		if !valid {
+		if tooLong {
+			writeError(sw, pr.errorPages, httpErrURITooLong)
+			return
+		} else if !valid {
 			writeError(sw, pr.errorPages, httpErrBadRequest)
 			return
 		}
