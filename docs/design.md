@@ -635,6 +635,42 @@ popular topic) took twice as long to reach them all at 2 Ps (median under 32 ms 
 like the one without it: peaks of 3.2-3.4 cores, 79-103 extra CPU-seconds per storm, 95% of the
 clients back after 72-85s, 9 lost messages in the run (12 without).
 
+## GC and CPU contention (2026-11-17)
+
+Next to HAProxy and nginx on lab VM 961, under a heavier load than the runs above (40k streams,
+150 publishes/s, 430 polls/s), ntlb's request p99 jumped to 1-3s for 2-3 seconds every ~50s,
+where nginx stayed under 170 ms and HAProxy under 350 ms. The load generator shares the 6-core
+VM and took ~4.4 cores, ntlb ~1.6: the machine was 98% busy, with 6-14 runnable threads.
+
+The jumps are GC cycles, one per ~50s at GOGC=100 (live heap ~585 MB plus 121 MB of goroutine
+stacks, allocation ~9 MB/s). Marking that heap takes ~4.3 CPU-seconds (CPU profile: 3.7s
+background mark, 0.6s assists), and it has to happen within the cycle. With idle cores, the
+idle mark workers take it and the mark ends in ~1s. With none, the mark ran 2.7-2.9s and the
+request goroutines paid for it in assists (gctrace: 5-7s of assist time a cycle), so every request
+in the window waited. The server side shows it too (`request_time` in the access log), so it was
+not only the generator being starved.
+
+15-minute runs, same load (seconds of the 8 steady minutes where the per-second p99 of polls and
+publishes, server side, was over 300 ms):
+
+| Setting | Spike seconds | p99 / p999 / max (server) | Client worst p99 | PSS | GC mark |
+|---|---|---|---|---|---|
+| default | 16 | 386 / 1,055 / 2,627 ms | 1.6 s | 1.73 GB | 2.9 s, assists 5-7 s |
+| `GOMAXPROCS=6` (no adapting) | 23 | 462 / 1,491 / 2,203 ms | 1.6 s | 1.71 GB | 2.9 s |
+| `GOGC=200` | 10 | 275 / 1,052 / 2,386 ms | 1.6 s | 2.47 GB | 3.0 s, half as often |
+| `CPUWeight=1000` | 0 | 18 / 59 / 144 ms | 0.12 s | 1.74 GB | 1.1 s, assists 0.1-0.4 s |
+
+The adapted GOMAXPROCS is not the cause (6 Ps were no better), and a laxer GC only spaces the
+stalls out. What fixes them is the CPU being there when the mark needs it: `CPUWeight=1000` in
+the unit gives ntlb the first claim over other units (default 100), at no cost in CPU or memory.
+On a load balancer that is CrowdSec (it slowed every LB in the lab while it ran), rsyslog,
+log rotation and the exporters. When ntlb itself is what fills the machine (a reconnect storm),
+the weight cannot help, and assists are the runtime working as designed.
+
+The live heap is spread over many owners, none worth a rewrite on its own: HTTP/2 server state
+(~19% of live objects), the per-request observe and proxy state, TLS handshake state the
+connection keeps (~6%), and goroutine stacks (~21% of the mark CPU).
+
 ## Faults under load (2026-11-11)
 
 The same 40k-stream load, with one fault every few minutes (lab ntfy nodes, not clustered).
