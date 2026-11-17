@@ -662,7 +662,9 @@ publishes, server side, was over 300 ms):
 
 The adapted GOMAXPROCS is not the cause (6 Ps were no better), and a laxer GC only spaces the
 stalls out. What fixes them is the CPU being there when the mark needs it: `CPUWeight=1000` in
-the unit gives ntlb the first claim over other units (default 100), at no cost in CPU or memory.
+a drop-in (`systemctl edit ntlb`) gives ntlb the first claim over other units (default 100), at
+no cost in CPU or memory. The package's unit leaves the weight alone, since what it should win
+over depends on the machine.
 On a load balancer that is CrowdSec (it slowed every LB in the lab while it ran), rsyslog,
 log rotation and the exporters. When ntlb itself is what fills the machine (a reconnect storm),
 the weight cannot help, and assists are the runtime working as designed.
