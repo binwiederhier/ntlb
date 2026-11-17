@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -1764,12 +1765,15 @@ func TestServer_ReloadMovesServerBetweenUpstreams(t *testing.T) {
 	})
 	_, body, _ = hostGet(t, s, "127.0.0.1", "x", "/two")
 	require.Equal(t, "app2", body)
-	for _, u := range s.balancer.Status().Upstreams {
-		if u.Name == "app2" {
-			require.Equal(t, "two", u.Pool)
-			require.Equal(t, 1, u.Streams)
+	// The stream stays; /two's session closes right after its answer, which the client may read first
+	waitFor(t, func() bool {
+		for _, u := range s.balancer.Status().Upstreams {
+			if u.Name == "app2" {
+				return u.Pool == "two" && u.Streams == 1
+			}
 		}
-	}
+		return false
+	})
 }
 
 func TestServer_ReloadChangesErrorPages(t *testing.T) {
@@ -2062,13 +2066,11 @@ func TestServer_UnreadBodyDoesNotHoldTheConnection(t *testing.T) {
 		require.NoError(t, err)
 		fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nx", target)
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		br := bufio.NewReader(conn)
-		resp, err := http.ReadResponse(br, nil)
-		require.NoError(t, err, target)
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		_, err = br.ReadByte()
-		require.ErrorIs(t, err, io.EOF, target) // Closed by the server, not the read deadline
+		// The rule answers; the stalled proxied upload gets no answer at all (see
+		// TestProxy_StalledUploadIsNeverASuccess). Either way the server closes the connection.
+		_, err = io.Copy(io.Discard, conn)
+		var netErr net.Error
+		require.False(t, errors.As(err, &netErr) && netErr.Timeout(), target) // Not the read deadline
 		conn.Close()
 	}
 }

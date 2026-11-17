@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,15 +51,20 @@ func (a *attemptBody) retire() bool {
 // the timeout (a client that stalls an upload is cut, like nginx's client_body_timeout), and a
 // drain interrupts a blocked read (see ServeHTTP)
 type clientBody struct {
-	rc      io.ReadCloser
-	conn    *clientConn
-	timeout time.Duration
+	rc       io.ReadCloser
+	conn     *clientConn
+	timeout  time.Duration
+	timedOut *atomic.Bool // Set when a read hit the timeout: the client stalled (see handleError)
 }
 
 func (b *clientBody) Read(p []byte) (int, error) {
 	b.conn.startRead(b.timeout)
 	defer b.conn.stopRead()
-	return b.rc.Read(p)
+	n, err := b.rc.Read(p)
+	if err != nil && isTimeout(err) {
+		b.timedOut.Store(true)
+	}
+	return n, err
 }
 
 func (b *clientBody) Close() error {

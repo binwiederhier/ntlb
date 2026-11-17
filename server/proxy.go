@@ -110,7 +110,8 @@ type proxyRequest struct {
 	readTimeout    time.Duration
 	detached       bool // The stream path took over, and runs the finishers itself
 	finishers      []func()
-	untrack        func() // Set by track, run after the finishers
+	untrack        func()      // Set by track, run after the finishers
+	bodyTimedOut   atomic.Bool // The client stalled its upload past the body timeout
 	finishOnce     sync.Once
 }
 
@@ -231,9 +232,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cc.end() // Before the finishers cancel ctx: a finished request must not touch the connection
 	if r.Body != nil && r.Body != http.NoBody {
 		r.Body = &clientBody{
-			rc:      r.Body,
-			conn:    cc,
-			timeout: min(clientBodyTimeout, pr.readTimeout),
+			rc:       r.Body,
+			conn:     cc,
+			timeout:  min(clientBodyTimeout, pr.readTimeout),
+			timedOut: &pr.bodyTimedOut,
 		}
 	}
 	stop := context.AfterFunc(ctx, func() {
@@ -443,15 +445,24 @@ func (p *proxy) rewrite(r *httputil.ProxyRequest) {
 
 func (p *proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	cause := context.Cause(r.Context())
-	pages := proxyRequestFromContext(r.Context()).errorPages
+	pr := proxyRequestFromContext(r.Context())
+	pages := pr.errorPages
 	switch {
+	case pr.bodyTimedOut.Load():
+		// The client stalled its upload: close without an answer, like nginx's client_body_timeout
+		// (logged as its 408). Not a 504: the upstream is fine, the client is gone or stuck.
+		pr.status = http.StatusRequestTimeout
+		panic(http.ErrAbortHandler)
 	case errors.Is(cause, balancer.ErrDrained):
 		w.Header().Set(headerConnection, connectionClose)
 		writeError(w, pages, httpErrDrained)
 	case errors.Is(cause, errUpstreamReadTimeout), isTimeout(err):
 		writeError(w, pages, httpErrUpstreamTimeout)
 	case r.Context().Err() != nil:
-		// Client went away, nobody to answer
+		// The client went away, or its upload stalled past the body timeout (which cancels the
+		// request): nobody to answer. Abort the connection instead of returning, or Go answers
+		// with an empty 200, telling a stalled publisher it went through.
+		panic(http.ErrAbortHandler)
 	case errors.Is(err, errNoUpstream):
 		writeError(w, pages, httpErrNoHealthyUpstream)
 	default:

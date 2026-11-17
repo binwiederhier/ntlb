@@ -1509,3 +1509,37 @@ func TestProxy_UpgradeWithBodyIsAPlainRequest(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, `upgrade="" connection="" body=hi`, string(body))
 }
+
+func TestProxy_StalledUploadIsNeverASuccess(t *testing.T) {
+	// A client that stalls its upload is cut by the body timeout: the connection closes without an
+	// answer, like nginx's client_body_timeout, and the log says 408. Not Go's default empty 200
+	// (the client would think its publish went through), and not a 504, which blames the upstream
+	// (and lands in the 5xx log and alerts).
+	old := clientBodyTimeout
+	t.Cleanup(func() {
+		clientBodyTimeout = old // After the server's cleanup, which runs first
+	})
+	clientBodyTimeout = 200 * time.Millisecond
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/readall", func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		io.WriteString(w, "published")
+	})
+	logFile := filepath.Join(t.TempDir(), "access.log")
+	s, _ := newTestServer(t, "access-logs: [{file: "+logFile+"}]", app1)
+	for i := 0; i < 10; i++ { // The timeout races the upstream's answer: either way, no answer
+		conn, err := net.Dial("tcp", s.HTTPAddr())
+		require.NoError(t, err)
+		fmt.Fprint(conn, "POST /readall HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nab")
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err == nil {
+			require.Fail(t, "an answer to a stalled upload", "round %d: %d", i, resp.StatusCode)
+		}
+		conn.Close()
+	}
+	waitFor(t, func() bool {
+		b, _ := os.ReadFile(logFile)
+		return strings.Count(string(b), `"POST /readall HTTP/1.1" 408 `) == 10
+	})
+}
