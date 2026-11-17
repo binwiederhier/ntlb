@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"testing"
 
+	"github.com/expr-lang/expr/vm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -385,5 +386,19 @@ func TestHostname_Normalized(t *testing.T) {
 		"a.com:":        "a.com",
 	} {
 		require.Equal(t, want, Hostname(host), host)
+	}
+}
+
+func TestMatch_PooledVMKeepsNothing(t *testing.T) {
+	// A VM goes back to the pool after each run; what the run pushed (here, the path) must not
+	// stay referenced from its stack until the next run on it
+	p, err := Compile(`path + "/x" == "/secret/x" && header("X-A") != "b"`, Request)
+	require.NoError(t, err)
+	r := testRequest("GET", "/secret", "203.0.113.9:1234", "X-A", "a")
+	require.True(t, p.Match(NewEnv(r)))
+	v := vmPool.Get().(*vm.VM) // The same P, so the VM the run used
+	defer vmPool.Put(v)
+	for i, value := range v.Stack[:cap(v.Stack)] {
+		require.Nil(t, value, "stack slot %d", i)
 	}
 }

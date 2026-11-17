@@ -184,7 +184,13 @@ func (p *Program) String(env *Env) string {
 
 func (p *Program) run(env any) any {
 	v := vmPool.Get().(*vm.VM)
-	defer vmPool.Put(v)
+	defer func() {
+		// Run clears only the stack's length and leaves what it popped: drop the request's values
+		// before the VM waits in the pool
+		clear(v.Stack[:cap(v.Stack)])
+		clear(v.Variables)
+		vmPool.Put(v)
+	}()
 	out, err := v.Run(p.program, env)
 	if err != nil {
 		return nil
