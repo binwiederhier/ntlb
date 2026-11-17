@@ -351,3 +351,36 @@ func skipUnderRace(t *testing.T) {
 		}
 	}
 }
+
+func TestHostname(t *testing.T) {
+	// host is the header as sent; hostname is the host as site selection sees it (lowercase, no
+	// port, no trailing dot), so a rule on it cannot be dodged by "API.example.com.:443"
+	for _, host := range []string{"api.example.com", "API.Example.com", "api.example.com.", "api.example.com:443", "API.example.com.:8443"} {
+		r := testRequest("GET", "/", "203.0.113.9:1234")
+		r.Host = host
+		require.True(t, matches(t, `hostname == "api.example.com"`, r), host)
+		p, err := Compile(`hostname == "api.example.com"`, Response)
+		require.NoError(t, err)
+		require.True(t, p.Match(NewResponseEnv(NewEnv(r))), host)
+	}
+	r := testRequest("GET", "/", "203.0.113.9:1234")
+	r.Host = "[2001:db8::1]:443"
+	require.True(t, matches(t, `hostname == "2001:db8::1"`, r)) // Like net.SplitHostPort
+}
+
+func TestHostname_Normalized(t *testing.T) {
+	for host, want := range map[string]string{
+		"a.com":         "a.com",
+		"A.Com.":        "a.com",
+		"a.com:8080":    "a.com",
+		"a.com.:443":    "a.com",
+		"[::1]":         "[::1]",
+		"[::1]:80":      "::1",
+		"::1":           "::1",
+		"[2001:DB8::1]": "[2001:db8::1]",
+		"":              "",
+		"a.com:":        "a.com",
+	} {
+		require.Equal(t, want, Hostname(host), host)
+	}
+}

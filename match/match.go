@@ -55,14 +55,15 @@ const (
 
 // Env is what a request expression sees
 type Env struct {
-	Method string `expr:"method"`
-	Path   string `expr:"path"`   // Decoded, without the query
-	Query  string `expr:"query"`  // Raw query string
-	URI    string `expr:"uri"`    // Path (escaped as sent) and query
-	Host   string `expr:"host"`   // The Host header
-	Scheme string `expr:"scheme"` // "http" or "https"
-	IP     string `expr:"ip"`     // Client address; IPv4-mapped IPv6 as IPv4
-	Site   string `expr:"site"`   // The site serving the host, "" if none does
+	Method   string `expr:"method"`
+	Path     string `expr:"path"`     // Decoded, without the query
+	Query    string `expr:"query"`    // Raw query string
+	URI      string `expr:"uri"`      // Path (escaped as sent) and query
+	Host     string `expr:"host"`     // The Host header as sent
+	Hostname string `expr:"hostname"` // The host as sites are selected by: lowercase, no port or trailing dot
+	Scheme   string `expr:"scheme"`   // "http" or "https"
+	IP       string `expr:"ip"`       // Client address; IPv4-mapped IPv6 as IPv4
+	Site     string `expr:"site"`     // The site serving the host, "" if none does
 
 	// header(name) is the first value of a header, "" if missing; flag(name...) see flag
 	req *http.Request
@@ -77,6 +78,7 @@ type ResponseEnv struct {
 	Query          string `expr:"query"`
 	URI            string `expr:"uri"`
 	Host           string `expr:"host"`
+	Hostname       string `expr:"hostname"`
 	Scheme         string `expr:"scheme"`
 	IP             string `expr:"ip"`
 	Site           string `expr:"site"`
@@ -139,14 +141,15 @@ func NewEnv(r *http.Request) *Env {
 		scheme = "https"
 	}
 	return &Env{
-		Method: r.Method,
-		Path:   r.URL.Path,
-		Query:  r.URL.RawQuery,
-		URI:    r.URL.RequestURI(),
-		Host:   r.Host,
-		Scheme: scheme,
-		IP:     clientIP(r.RemoteAddr),
-		req:    r,
+		Method:   r.Method,
+		Path:     r.URL.Path,
+		Query:    r.URL.RawQuery,
+		URI:      r.URL.RequestURI(),
+		Host:     r.Host,
+		Hostname: Hostname(r.Host),
+		Scheme:   scheme,
+		IP:       clientIP(r.RemoteAddr),
+		req:      r,
 	}
 }
 
@@ -154,14 +157,15 @@ func NewEnv(r *http.Request) *Env {
 // itself can be let go; the caller fills in the outcome when the request ends
 func NewResponseEnv(env *Env) *ResponseEnv {
 	return &ResponseEnv{
-		Method: env.Method,
-		Path:   env.Path,
-		Query:  env.Query,
-		URI:    env.URI,
-		Host:   env.Host,
-		Scheme: env.Scheme,
-		IP:     env.IP,
-		Site:   env.Site,
+		Method:   env.Method,
+		Path:     env.Path,
+		Query:    env.Query,
+		URI:      env.URI,
+		Host:     env.Host,
+		Hostname: env.Hostname,
+		Scheme:   env.Scheme,
+		IP:       env.IP,
+		Site:     env.Site,
 	}
 }
 
@@ -380,4 +384,16 @@ func clientIP(remoteAddr string) string {
 		return addr.Unmap().String()
 	}
 	return host
+}
+
+// Hostname lowercases a Host header and strips its port and trailing dot, as site selection and
+// the hostname variable see it. Only a host with
+// a port goes through net.SplitHostPort, whose error for the usual host without one allocates.
+func Hostname(host string) string {
+	if strings.LastIndexByte(host, ':') > strings.LastIndexByte(host, ']') {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+	}
+	return strings.TrimSuffix(strings.ToLower(host), ".")
 }

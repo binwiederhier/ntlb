@@ -402,23 +402,6 @@ func TestConfig_SiteForAllocations(t *testing.T) {
 	}
 }
 
-func TestNormalizeHost(t *testing.T) {
-	for host, want := range map[string]string{
-		"a.com":         "a.com",
-		"A.Com.":        "a.com",
-		"a.com:8080":    "a.com",
-		"a.com.:443":    "a.com",
-		"[::1]":         "[::1]",
-		"[::1]:80":      "::1",
-		"::1":           "::1",
-		"[2001:DB8::1]": "[2001:db8::1]",
-		"":              "",
-		"a.com:":        "a.com",
-	} {
-		require.Equal(t, want, normalizeHost(host), host)
-	}
-}
-
 // skipUnderRace skips an allocation budget under the race detector, which allocates on its own
 func skipUnderRace(t *testing.T) {
 	if info, ok := debug.ReadBuildInfo(); ok {

@@ -330,7 +330,7 @@ sites:
         action: proxy
         upstream: app1
       - name: to-app2
-        match: path startsWith "/app2/" || host == "api.example.com"
+        match: path startsWith "/app2/" || hostname == "api.example.com"
         action: proxy
         upstream: app2
 ```
@@ -744,6 +744,7 @@ There are three kinds:
 | `query` | all | the raw query string, without `?`: `x=1&y=a%20b` |
 | `uri` | all | the path and query as sent: `/a%20b/c?x=1` |
 | `host` | all | the `Host` header as sent (may include a port): `example.com`, `example.com:8080` |
+| `hostname` | all | the host as sites are selected by: lowercase, without port or trailing dot (`API.Example.com.:443` -> `api.example.com`). Use it for rules on the host, `host` can be written in many ways. |
 | `scheme` | all | `"http"` or `"https"` |
 | `ip` | all | the client's IP, the TCP peer (IPv4-mapped IPv6 as IPv4): `203.0.113.9`, `2001:db8::1` |
 | `site` | all | the name of the site serving the host, `""` if none |
@@ -787,10 +788,10 @@ uri contains "%2e%2e"                                  # encoded "..", only visi
 query contains "debug="
 query matches "(^|&)token=[^&]{0,8}(&|$)"              # a short token parameter
 
-host == "example.com"
-host endsWith ".example.com"
-host == "example.com" || host startsWith "example.com:"
-lower(host) startsWith "www."
+hostname == "example.com"                              # also EXAMPLE.com, example.com.:443
+hostname endsWith ".example.com"
+hostname startsWith "www."
+host == "example.com:8080"                             # the header as sent, port and all
 scheme == "http"
 
 ip == "192.0.2.10"

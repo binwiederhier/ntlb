@@ -89,7 +89,7 @@ func (c *Config) SiteFor(listen, host string) *Site {
 	if l == nil {
 		return nil
 	}
-	h := normalizeHost(host)
+	h := match.Hostname(host)
 	if site, ok := l.index.exact[h]; ok {
 		return site
 	}
@@ -391,15 +391,4 @@ func overlaps(a, b string) bool {
 		return true
 	}
 	return errA == nil && errB == nil && ipA.Unmap() == ipB.Unmap()
-}
-
-// normalizeHost lowercases a Host header and strips its port and trailing dot. Only a host with
-// a port goes through net.SplitHostPort, whose error for the usual host without one allocates.
-func normalizeHost(host string) string {
-	if strings.LastIndexByte(host, ':') > strings.LastIndexByte(host, ']') {
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-	}
-	return strings.TrimSuffix(strings.ToLower(host), ".")
 }
