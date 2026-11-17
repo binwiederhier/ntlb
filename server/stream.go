@@ -346,7 +346,9 @@ func copyStream(src net.Conn, act *activity, write func([]byte) error) error {
 		return copyBuffered(src, act, write)
 	}
 	raw, err := sc.SyscallConn()
-	if err != nil {
+	if errors.Is(err, errors.ErrUnsupported) {
+		return copyBuffered(src, act, write) // A wrapper (countedConn) around a conn without one
+	} else if err != nil {
 		return err
 	}
 	src.SetReadDeadline(act.deadline())

@@ -3,12 +3,14 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -157,6 +159,15 @@ func (c *countedConn) WriteTo(w io.Writer) (int64, error) {
 		return wt.WriteTo(w)
 	}
 	return io.Copy(w, struct{ io.Reader }{c.Conn})
+}
+
+// SyscallConn keeps the TCP connection's, so the stream path can wait for a plain-HTTP client's
+// bytes without a buffer (copyStream)
+func (c *countedConn) SyscallConn() (syscall.RawConn, error) {
+	if sc, ok := c.Conn.(syscall.Conn); ok {
+		return sc.SyscallConn()
+	}
+	return nil, errors.ErrUnsupported
 }
 
 // markHandled records that a handler got the connection's request

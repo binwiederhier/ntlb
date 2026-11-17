@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -271,4 +272,29 @@ func TestConns_PendingCapUsesClientKey(t *testing.T) {
 	require.True(t, closedByServer(dialFrom("127.0.0.2")))
 	require.False(t, closedByServer(c1))
 	require.False(t, closedByServer(dialFrom("127.0.1.1"))) // Another /24
+}
+
+func TestCountedConn_KeepsSyscallConn(t *testing.T) {
+	// The stream path waits for a plain-HTTP client's bytes in the netpoller, without a buffer
+	// (copyStream); that needs the TCP connection's SyscallConn through the counting wrapper
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	cl := &countingListener{
+		Listener: ln,
+		metrics:  newMetrics(nil),
+	}
+	defer cl.Close()
+	go func() {
+		if c, err := net.Dial("tcp", ln.Addr().String()); err == nil {
+			defer c.Close()
+			c.Write([]byte("x"))
+		}
+	}()
+	c, err := cl.Accept()
+	require.NoError(t, err)
+	defer c.Close()
+	sc, ok := c.(syscall.Conn)
+	require.True(t, ok)
+	_, err = sc.SyscallConn()
+	require.NoError(t, err)
 }
