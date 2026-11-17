@@ -281,11 +281,14 @@ func BenchmarkNewEnv(b *testing.B) {
 
 func TestNewEnvAllocations(t *testing.T) {
 	skipUnderRace(t)
-	// The Env itself, and the request URI
-	r := testRequest("GET", "http://ntfy.sh/mytopic/json?since=10m", "203.0.113.9:1234")
+	// The Env itself only: an origin-form target (as servers see it) is the uri as sent, not
+	// rebuilt from path and query, and a stream keeps the env for hours
+	r := testRequest("GET", "/mytopic/json?since=10m", "203.0.113.9:1234")
+	r.RequestURI = "/mytopic/json?since=10m"
 	require.LessOrEqual(t, testing.AllocsPerRun(100, func() {
 		NewEnv(r)
-	}), 2.0)
+	}), 1.0)
+	require.Equal(t, "/mytopic/json?since=10m", NewEnv(r).URI)
 }
 
 func TestMatchAllocations(t *testing.T) {

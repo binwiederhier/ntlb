@@ -144,7 +144,7 @@ func NewEnv(r *http.Request) *Env {
 		Method:   r.Method,
 		Path:     r.URL.Path,
 		Query:    r.URL.RawQuery,
-		URI:      r.URL.RequestURI(),
+		URI:      requestURI(r),
 		Host:     r.Host,
 		Hostname: Hostname(r.Host),
 		Scheme:   scheme,
@@ -396,4 +396,14 @@ func Hostname(host string) string {
 		}
 	}
 	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+// requestURI is the path and query as sent: the request target itself when it is origin-form
+// ("/a?b", HTTP/1 and HTTP/2's :path), which saves rebuilding it; an absolute-form one
+// ("http://host/a?b") without its scheme and host
+func requestURI(r *http.Request) string {
+	if strings.HasPrefix(r.RequestURI, "/") {
+		return r.RequestURI
+	}
+	return r.URL.RequestURI()
 }
