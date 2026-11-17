@@ -46,7 +46,9 @@ func openLogFiles(paths []string) (map[string]*os.File, error) {
 		if files[path] != nil {
 			continue
 		}
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		// Like nginx's logs: they hold client addresses and topic names, which only the log
+		// readers' group (adm, via the directory) may read
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 		if err != nil {
 			for _, f := range files {
 				f.Close()

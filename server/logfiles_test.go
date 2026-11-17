@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -55,4 +56,17 @@ func openFDs(t testing.TB) int {
 	entries, err := os.ReadDir("/proc/self/fd")
 	require.NoError(t, err)
 	return len(entries)
+}
+
+func TestOpenLogFiles_NotWorldReadable(t *testing.T) {
+	// Access logs hold every client address and topic name, and ntfy's topic names are secrets
+	// for open topics: like nginx's logs (0640, group adm), others cannot read them
+	defer syscall.Umask(syscall.Umask(0o022))
+	path := filepath.Join(t.TempDir(), "access.log")
+	files, err := openLogFiles([]string{path})
+	require.NoError(t, err)
+	files[path].Close()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), info.Mode().Perm())
 }
