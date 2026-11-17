@@ -195,6 +195,16 @@ func TestProxy_DrainingRefusesNewSubscriptions(t *testing.T) {
 		}
 	}
 	require.False(t, streamClosed(r)) // Open streams are closed by the drain's pacing, not here
+
+	// Any upgrade is long-lived like a subscription, also one outside streams.match
+	conn, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer conn.Close()
+	fmt.Fprint(conn, "GET /v1/upgrade HTTP/1.1\r\nHost: x\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, "upgrade outside streams.match")
 }
 
 func TestIsSubscription(t *testing.T) {

@@ -156,16 +156,18 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// upgrades (WebSockets, subscriptions or not). Other methods and requests with a body stay on
 	// the reverse proxy.
 	bodyless := r.Method == http.MethodGet && r.ContentLength == 0
-	stream := bodyless && (subscription && !upgrade || r.ProtoMajor == 1 && upgradeType(r.Header) != "")
+	upgraded := bodyless && r.ProtoMajor == 1 && upgradeType(r.Header) != ""
+	stream := bodyless && subscription && !upgrade || upgraded
+	longLived := subscription || upgraded // An upgrade is long-lived whether streams.match says so or not
 	switch {
-	case subscription && upgrade:
+	case longLived && upgrade:
 		pr.kind = kindWebSocket
-	case subscription:
+	case longLived:
 		pr.kind = kindStream
 	default:
 		pr.kind = kindRequest
 	}
-	if p.balancer.Draining() && (p.balancer.Drained() || subscription) {
+	if p.balancer.Draining() && (p.balancer.Drained() || longLived) {
 		p.metrics.refused.Inc()
 		w.Header().Set(headerConnection, connectionClose)
 		writeError(w, pr.errorPages, httpErrDraining)
@@ -194,7 +196,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		pr.onFinish(pr.conns.transport.CloseIdleConnections)
 	}
 	pr.session = p.balancer.NewSession(cancel)
-	if subscription {
+	if longLived {
 		gauge := p.metrics.streams.WithLabelValues(streamProtocol(pr.kind, r.ProtoMajor))
 		gauge.Inc()
 		pr.onFinish(func() {
