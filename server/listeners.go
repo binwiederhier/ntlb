@@ -18,6 +18,10 @@ var (
 	// clientSendTimeout closes an HTTP/2 connection whose writes made no progress for this long,
 	// and bounds the end of an HTTP/1 response (like nginx's send_timeout default), a var for the tests
 	clientSendTimeout = time.Minute
+
+	// lingerTimeout bounds how long the rest of a request body that the answer did not read may
+	// take to arrive after the handler, like nginx's lingering_timeout (a var for the tests)
+	lingerTimeout = 5 * time.Second
 )
 
 // publicServer is the proxying server of one listen address

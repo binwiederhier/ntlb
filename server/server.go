@@ -391,15 +391,20 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 // boundFinalWrites clears the write deadline an HTTP/1 keep-alive connection kept from its last
 // response, and returns a func that sets one for what is still written after the handler: Go
 // flushes its buffers and the chunked end there, outside the write timers, so a client that stops
-// reading right at the end would hold the connection forever. HTTP/2 has WriteByteTimeout.
+// reading right at the end would hold the connection forever. HTTP/2 has WriteByteTimeout. The
+// same goes for reads: Go reads the rest of a body the answer left unread (up to 256 KiB) before
+// it closes or reuses the connection, without a deadline, so a client that never sends it would
+// hold the connection too. The next request's reads set their own deadlines.
 func boundFinalWrites(w http.ResponseWriter, r *http.Request) func() {
 	if r.ProtoMajor != 1 {
-		return func() {} // Bounded by WriteByteTimeout
+		return func() {} // Bounded by WriteByteTimeout, and a stream's body is dropped with it
 	}
 	ctrl := http.NewResponseController(w)
 	ctrl.SetWriteDeadline(time.Time{})
 	return func() {
-		ctrl.SetWriteDeadline(time.Now().Add(clientSendTimeout)) // Fails once hijacked, which is fine: the stream owns it
+		// Both fail once hijacked, which is fine: the stream owns the connection then
+		ctrl.SetWriteDeadline(time.Now().Add(clientSendTimeout))
+		ctrl.SetReadDeadline(time.Now().Add(lingerTimeout))
 	}
 }
 

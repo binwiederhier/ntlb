@@ -2040,3 +2040,28 @@ func TestServer_HTTP1FinalWritesHaveDeadline(t *testing.T) {
 		}
 	}
 }
+
+func TestServer_UnreadBodyDoesNotHoldTheConnection(t *testing.T) {
+	// After an answer that did not read the whole body (a rule's, or a proxied one after the body
+	// stalled), Go reads the rest before it closes the connection, without a deadline: a client
+	// that never sends it must not hold the connection and its goroutine (nginx's lingering_timeout)
+	defer func(linger, body time.Duration) {
+		lingerTimeout, clientBodyTimeout = linger, body
+	}(lingerTimeout, clientBodyTimeout)
+	lingerTimeout, clientBodyTimeout = 300*time.Millisecond, 300*time.Millisecond
+	s, _ := newTestServer(t, "rules: [{name: blocked, match: 'path == \"/blocked\"', action: block}]", newTestUpstream(t, "app1"))
+	for _, target := range []string{"/blocked", "/body-progress"} {
+		conn, err := net.Dial("tcp", s.HTTPAddr())
+		require.NoError(t, err)
+		fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nx", target)
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err, target)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		_, err = br.ReadByte()
+		require.ErrorIs(t, err, io.EOF, target) // Closed by the server, not the read deadline
+		conn.Close()
+	}
+}
