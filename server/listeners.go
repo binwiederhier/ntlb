@@ -29,6 +29,13 @@ var (
 	lingerTimeout = 5 * time.Second
 )
 
+// sideServer is the server of a listener that does not proxy: admin, metrics, health, profiler
+type sideServer struct {
+	name string
+	srv  *http.Server
+	ln   net.Listener
+}
+
 // publicServer is the proxying server of one listen address
 type publicServer struct {
 	srv     *http.Server
@@ -80,45 +87,31 @@ func (s *Server) listen(conf *config.Config) error {
 	}
 	for addr, ps := range public {
 		s.public[addr] = ps
-		s.listeners[addr] = ps.ln
 	}
 
-	// Admin listener
-	ln, err := net.Listen("tcp", conf.ListenAdmin)
-	if err != nil {
-		return err
+	// The other listeners: admin always, the rest if set
+	sides := []struct {
+		name, addr string
+		handler    func() http.Handler
+	}{
+		{listenerAdmin, conf.ListenAdmin, s.adminHandler},
+		{listenerMetrics, conf.ListenMetrics, s.metricsHandler},
+		{listenerHealth, conf.ListenHealth, s.healthHandler},
+		{listenerProfiler, conf.ListenProfiler, profilerHandler},
 	}
-	s.listeners[listenerAdmin] = ln
-	s.admin = newHTTPServer(listenerAdmin, s.adminHandler())
-
-	// Metrics listener
-	if conf.ListenMetrics != "" {
-		ln, err := net.Listen("tcp", conf.ListenMetrics)
+	for _, side := range sides {
+		if side.addr == "" {
+			continue
+		}
+		ln, err := net.Listen("tcp", side.addr)
 		if err != nil {
 			return err
 		}
-		s.listeners[listenerMetrics] = ln
-		s.metricsSrv = newHTTPServer(listenerMetrics, s.metricsHandler())
-	}
-
-	// Health listener
-	if conf.ListenHealth != "" {
-		ln, err := net.Listen("tcp", conf.ListenHealth)
-		if err != nil {
-			return err
-		}
-		s.listeners[listenerHealth] = ln
-		s.healthSrv = newHTTPServer(listenerHealth, s.healthHandler())
-	}
-
-	// Profiler listener
-	if conf.ListenProfiler != "" {
-		ln, err := net.Listen("tcp", conf.ListenProfiler)
-		if err != nil {
-			return err
-		}
-		s.listeners[listenerProfiler] = ln
-		s.profilerSrv = newHTTPServer(listenerProfiler, profilerHandler())
+		s.side = append(s.side, &sideServer{
+			name: side.name,
+			srv:  newHTTPServer(side.name, side.handler()),
+			ln:   ln,
+		})
 	}
 	return nil
 }
@@ -187,7 +180,6 @@ func (s *Server) swapPublic(conf *config.Config, added map[string]*publicServer)
 	defer s.mu.Unlock()
 	for addr, ps := range added {
 		s.public[addr] = ps
-		s.listeners[addr] = ps.ln
 		if s.serving {
 			go s.servePublic(ps)
 		}
@@ -199,7 +191,6 @@ func (s *Server) swapPublic(conf *config.Config, added map[string]*publicServer)
 			ps.ln.Close()
 			s.retired = append(s.retired, ps)
 			delete(s.public, addr)
-			delete(s.listeners, addr)
 			go s.forgetRetired(ps)
 		}
 	}
@@ -233,16 +224,24 @@ func closePublic(public map[string]*publicServer) {
 }
 
 func (s *Server) closeListeners() {
-	for _, ln := range s.listeners {
-		ln.Close()
+	closePublic(s.public)
+	for _, side := range s.side {
+		side.ln.Close()
 	}
 }
 
+// listenerAddr returns the bound address of a side listener (by name) or a public one (by its
+// configured address), "" if there is none
 func (s *Server) listenerAddr(name string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ln, ok := s.listeners[name]; ok {
-		return ln.Addr().String()
+	for _, side := range s.side {
+		if side.name == name {
+			return side.ln.Addr().String()
+		}
+	}
+	if ps, ok := s.public[name]; ok {
+		return ps.ln.Addr().String()
 	}
 	return ""
 }

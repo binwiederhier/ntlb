@@ -66,18 +66,14 @@ type Server struct {
 	clientConns atomic.Int64             // Open connections of all public listeners
 	public      map[string]*publicServer // Proxying servers by listen address
 	retired     []*publicServer          // Removed by a reload: no new connections, open ones run on
-	admin       *http.Server
-	metricsSrv  *http.Server // listen-metrics, if set
-	profilerSrv *http.Server // listen-profiler, if set
-	healthSrv   *http.Server // listen-health, if set
-	listeners   map[string]net.Listener
-	serving     bool       // Serve started the servers; ones added later start right away
-	errChan     chan error // A listener that failed; Serve shuts down
+	side        []*sideServer            // Admin, then metrics, health and profiler if set
+	serving     bool                     // Serve started the servers; ones added later start right away
+	errChan     chan error               // A listener that failed; Serve shuts down
 	stopped     chan struct{}
 	stopping    bool // Shutdown began: no more reloads, protected by reloadMu
 	stopOnce    sync.Once
 	reloadMu    sync.Mutex // Serializes reloads, and keeps them out of Shutdown
-	mu          sync.Mutex // Protects public, retired, listeners, serving
+	mu          sync.Mutex // Protects public, retired, side (while listen fills it), serving
 }
 
 // statusWriter records the status and body size of a response. Unwrap lets
@@ -100,7 +96,6 @@ func New(configFile string) (*Server, error) {
 		balancer:   balancer.New(conf),
 		files:      newLogFiles(),
 		public:     make(map[string]*publicServer),
-		listeners:  make(map[string]net.Listener),
 		errChan:    make(chan error, 1),
 		stopped:    make(chan struct{}),
 	}
@@ -140,15 +135,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	for _, ps := range s.public {
 		go s.servePublic(ps)
 	}
-	go s.serve(listenerAdmin, s.admin, s.listeners[listenerAdmin], false)
-	if s.metricsSrv != nil {
-		go s.serve(listenerMetrics, s.metricsSrv, s.listeners[listenerMetrics], false)
-	}
-	if s.profilerSrv != nil {
-		go s.serve(listenerProfiler, s.profilerSrv, s.listeners[listenerProfiler], false)
-	}
-	if s.healthSrv != nil {
-		go s.serve(listenerHealth, s.healthSrv, s.listeners[listenerHealth], false)
+	for _, side := range s.side {
+		go s.serve(side.name, side.srv, side.ln, false)
 	}
 	s.mu.Unlock()
 	select {
@@ -238,15 +226,9 @@ func (s *Server) Shutdown(delay, d time.Duration) {
 			slog.Warn("Requests still open after closing them", "error", err)
 		}
 		var wg sync.WaitGroup
-		servers := []*http.Server{s.admin}
-		if s.metricsSrv != nil {
-			servers = append(servers, s.metricsSrv)
-		}
-		if s.profilerSrv != nil {
-			servers = append(servers, s.profilerSrv)
-		}
-		if s.healthSrv != nil {
-			servers = append(servers, s.healthSrv)
+		var servers []*http.Server
+		for _, side := range s.side {
+			servers = append(servers, side.srv)
 		}
 		s.mu.Lock()
 		for _, ps := range s.public {
