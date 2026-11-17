@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -925,4 +926,31 @@ func TestStream_HTTP2HostHeaderSentOnce(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("request did not reach the upstream")
 	}
+}
+
+func TestStream_HTTP2DropsTheUpstreamResponse(t *testing.T) {
+	// Once its headers are sent, an HTTP/2 stream lets go of the upstream's response (headers and
+	// all), like an HTTP/1 one: tens of thousands of streams hold it for hours otherwise
+	upstream, client := net.Pipe()
+	client.Close() // The body ends right away
+	us := &upstreamStream{
+		conn: upstream,
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": {"application/x-ndjson"},
+			},
+		},
+		raw: true,
+	}
+	rec := httptest.NewRecorder()
+	cc := &clientConn{
+		ctrl: http.NewResponseController(rec),
+	}
+	pr := &proxyRequest{
+		readTimeout: time.Second,
+	}
+	require.NoError(t, copyStreamHTTP2(rec, us, cc, pr))
+	require.Equal(t, "application/x-ndjson", rec.Header().Get("Content-Type"))
+	require.Nil(t, us.resp)
 }

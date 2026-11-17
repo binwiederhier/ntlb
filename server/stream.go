@@ -280,12 +280,13 @@ func copyStreamHTTP1(client net.Conn, us *upstreamStream, head []byte, pr *proxy
 // returns an error if the stream did not end cleanly (upstream cut, read timeout, drain).
 func copyStreamHTTP2(w http.ResponseWriter, us *upstreamStream, cc *clientConn, pr *proxyRequest) error {
 	rc := cc.ctrl
-	header := us.resp.Header.Clone()
+	header, status := us.resp.Header, us.resp.StatusCode
+	us.resp = nil // Like a detached stream's: the headers go to w, and a stream lasts hours
 	removeHopHeaders(header)
 	for k, v := range header {
 		w.Header()[k] = v
 	}
-	w.WriteHeader(us.resp.StatusCode)
+	w.WriteHeader(status)
 	if err := rc.Flush(); err != nil { // Send the headers right away: the stream is open
 		return err
 	}
