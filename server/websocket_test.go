@@ -317,3 +317,47 @@ func TestWebSocket_MemoryPerWebSocket(t *testing.T) {
 
 // maxHeapPerWebSocket is TestWebSocket_MemoryPerWebSocket's budget, test side included
 const maxHeapPerWebSocket = 8 * 1024
+
+func TestWebSocket_DrainClosesWithoutCloseFrame(t *testing.T) {
+	// The ntfy clients do not reconnect after a WebSocket close frame, so a drain must end the
+	// connection the way ntfy does: just close it
+	app1 := newTestUpstream(t, "app1")
+	s, _ := newTestServer(t, "", app1)
+	conn, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.Write([]byte("GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")) // The fake upstream speaks "test"
+	require.NoError(t, err)
+	r := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(r, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 1
+	})
+	require.NoError(t, s.balancer.DrainUpstream("app1", 0))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	rest, err := io.ReadAll(r)
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded) // Closed
+	for i := 0; i+1 < len(rest); i++ {
+		require.NotEqual(t, byte(0x88), rest[i], "close frame sent") // FIN + opcode 8
+	}
+}
+
+func TestWebSocket_EndsWhenUpstreamCloses(t *testing.T) {
+	// ntfy closes a WebSocket whose client stopped answering pings: the load balancer must end
+	// the client side too, even if the client sends nothing more, or the connection is a zombie
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/gone/ws", upgradeThen(func(conn net.Conn) {
+		time.Sleep(100 * time.Millisecond)
+	}))
+	s, _ := newTestServer(t, "", app1)
+	conn, r := openUpgrade(t, s.HTTPAddr(), "/gone/ws")
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err := r.ReadByte()
+	require.Error(t, err)
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded)
+	waitFor(t, func() bool {
+		return s.balancer.Status().Streams == 0
+	})
+}

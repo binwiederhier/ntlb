@@ -462,7 +462,7 @@ func TestStream_NoGoroutineLeak(t *testing.T) {
 		},
 	}
 	before := runtime.NumGoroutine()
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 5; i++ { // Each round ends a stream in each way; a leak shows after a few
 		resp, _ := openSubscription(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/mytopic/json")
 		resp.Body.Close() // Client gone (noticed on the next write)
 		resp, _ = openSubscription(t, h2, "https://"+s.HTTPSAddr()+"/mytopic/json")

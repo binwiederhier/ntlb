@@ -300,7 +300,7 @@ sequenceDiagram
                     RT->>B: RecordAddressFailure, try the next address or server
                 else answered
                     RT->>B: Attach(session, u, addr)
-                    RT->>RT: wrap body: idleTimeoutBody / upgradedBody (read timeout)
+                    RT->>RT: wrap body: idleTimeoutBody (read timeout)
                 end
             end
             RT-->>RP: response, or error: handleError writes 502/503/504 page
@@ -388,9 +388,9 @@ timeout counts from the last bytes either way, like nginx's `proxy_read_timeout`
 connection. The first direction to end (EOF, error, timeout) closes both connections. A TLS
 client cannot be waited on without reading (crypto/tls buffers its records), so its direction
 reads with a small buffer of its own (`copyBuffered`). Any other answer than a 101 (ntfy's 401,
-403, 429) is relayed like a stream's response, and the connection closes. Upgrades with a body
-or another method than `GET` stay on `ReverseProxy`, with `upgradedBody` bounding idleness both
-ways.
+403, 429) is relayed like a stream's response, and the connection closes. Any other request with
+an Upgrade header (a body, another method, curl's `Upgrade: h2c` on a POST) is proxied by
+`ReverseProxy` without the header, so it never switches protocols.
 
 ## The per-request state and its finishers
 

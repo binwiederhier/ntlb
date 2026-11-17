@@ -68,7 +68,13 @@ rules: [{name: bad-requests, on: response, match: 'status == 400 && upstream_sta
 	require.Equal(t, "HTTP/1.1 400 Bad Request", sendRaw(t, addr, "\x16\x03\x01\x00{\x01\x00\x00w\r\n\r\n"))
 	require.Equal(t, "HTTP/1.1 400 Bad Request", sendRaw(t, addr, "GET Kvissle&message=x y HTTP/1.1\r\nHost: a\r\n\r\n"))
 	require.Equal(t, "HTTP/1.1 431 Request Header Fields Too Large", sendRaw(t, addr, "GET / HTTP/1.1\r\nHost: a\r\nX-Big: "+strings.Repeat("a", 70*1024)+"\r\n\r\n"))
-	require.Equal(t, "", sendRaw(t, addr, "GET /mytopic/json HTTP/1.1\r\nHo")) // Cut off: no answer
+	cut, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	io.WriteString(cut, "GET /mytopic/json HTTP/1.1\r\nHo")
+	cut.(*net.TCPConn).CloseWrite() // Cut off: the server reads EOF right away, not after 30s
+	cut.SetReadDeadline(time.Now().Add(5 * time.Second))
+	io.Copy(io.Discard, cut) // Until the server closed it
+	cut.Close()
 	waitFor(t, func() bool {
 		b, _ := os.ReadFile(badLog)
 		return strings.Count(string(b), "\n") == 4

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -28,10 +27,10 @@ const (
 	// events are small, and larger bodies (attachments) just take more reads.
 	copyBufferSize = 4 * 1024
 
-	// upgradedDownBufferSize and upgradedUpBufferSize are the copy buffers of an upgraded connection
-	// (WebSocket), upstream to client and back
-	upgradedDownBufferSize = 4 * 1024
-	upgradedUpBufferSize   = 1024
+	// upgradedUpBufferSize is the copy buffer of an upgraded connection (WebSocket) from a TLS
+	// client to the upstream (copyBuffered): clients send small frames (pings, pongs; ntfy reads
+	// at most 64 bytes per message)
+	upgradedUpBufferSize = 1024
 
 	statusClientClosedRequest = 499 // nginx's status for a request that ended before a response
 )
@@ -63,7 +62,6 @@ var (
 var (
 	errNoUpstream          = errors.New("no upstream available")
 	errUpstreamReadTimeout = errors.New("upstream read timeout")
-	errUpstreamClosed      = errors.New("upstream closed the connection")
 	errBodyRetired         = errors.New("request body handed to another attempt")
 )
 
@@ -221,6 +219,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only the stream path switches protocols: anything else with an Upgrade header (curl's
+	// "Upgrade: h2c" on a POST) is an ordinary request, so the reverse proxy never upgrades
+	if upgrade {
+		r.Header.Del(headerUpgrade)
+	}
+
 	// Bound reads from and writes to the client, and let a drain interrupt both
 	cc := &clientConn{
 		ctrl: http.NewResponseController(w),
@@ -287,19 +291,10 @@ func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	timer := time.AfterFunc(timeout, func() {
 		pr.cancel(errUpstreamReadTimeout)
 	})
-	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
-		resp.Body = &upgradedBody{ // Must stay an io.ReadWriteCloser
-			rwc:     rwc,
-			timer:   timer,
-			timeout: timeout,
-			cancel:  pr.cancel,
-		}
-	} else {
-		resp.Body = &idleTimeoutBody{
-			rc:      resp.Body,
-			timer:   timer,
-			timeout: timeout,
-		}
+	resp.Body = &idleTimeoutBody{
+		rc:      resp.Body,
+		timer:   timer,
+		timeout: timeout,
 	}
 	return resp, nil
 }

@@ -77,7 +77,7 @@ type Server struct {
 }
 
 // statusWriter records the status and body size of a response. Unwrap lets
-// http.ResponseController (used by the reverse proxy) reach Flush and Hijack.
+// http.ResponseController reach Flush (the reverse proxy) and Hijack (the stream path).
 type statusWriter struct {
 	http.ResponseWriter
 	status int

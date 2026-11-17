@@ -15,11 +15,16 @@ import (
 	"time"
 )
 
-const (
+var (
+	// accessLogFlushInterval is how long a log line may wait in the buffer (a variable for the
+	// tests, which wait for lines)
 	accessLogFlushInterval = time.Second
-	accessLogLineSize      = 320                          // Room for a typical line, built in one allocation
-	accessLogTimeFormat    = "02/Jan/2006:15:04:05 -0700" // nginx's $time_local
-	maxLogField            = 4096                         // Bytes per escaped field, so one request cannot write a huge line
+)
+
+const (
+	accessLogLineSize   = 320                          // Room for a typical line, built in one allocation
+	accessLogTimeFormat = "02/Jan/2006:15:04:05 -0700" // nginx's $time_local
+	maxLogField         = 4096                         // Bytes per escaped field, so one request cannot write a huge line
 )
 
 // accessLog is a buffered log file that a reload can swap for a reopened one (for logrotate). As

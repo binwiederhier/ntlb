@@ -34,6 +34,11 @@ import (
 	"heckel.io/ntlb/match"
 )
 
+func TestMain(m *testing.M) {
+	accessLogFlushInterval = 10 * time.Millisecond // Tests wait for log lines; a second each adds up
+	os.Exit(m.Run())
+}
+
 // testUpstream is a fake ntfy node. Paths:
 //
 //	/v1/ready      200, or 503 if notReady is set

@@ -248,31 +248,32 @@ writes through the `ResponseWriter` and flushes every write.
 
 ### A WebSocket
 
-Upgrades stay on `ReverseProxy`, which hijacks the client connection after the 101 and copies
-both ways. ntlb wraps the upstream side to bound idleness in both directions, to end the client
-side when the upstream closes, and to use small copy buffers (ntfy's clients send tiny frames).
+A WebSocket (a bodyless HTTP/1.1 GET with an Upgrade header) takes the stream path: ntlb sends
+the handshake upstream on a connection of its own, and after the 101 hijacks the client
+connection and copies both ways, one goroutine per direction, each waiting for bytes without a
+buffer (a TLS client's direction reads with a small one). Traffic either way keeps it open, like
+nginx's `proxy_read_timeout`; the first direction to end closes both. Any other request with an
+Upgrade header is proxied as an ordinary one, without it.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
-    participant P as ReverseProxy
-    participant W as upgradedBody
+    participant S as Stream path
     participant U as app node
-    C->>P: GET /mytopic/ws, Upgrade: websocket
-    P->>U: same, Upgrade: websocket
-    U-->>P: 101 Switching Protocols
-    P->>C: 101, hijack
-    par Upstream to client (4 KiB buffer)
-        U->>W: frame
-        W->>C: frame, idle timer reset
-    and Client to upstream (1 KiB buffer)
-        C->>W: frame
-        W->>U: frame, idle timer reset
+    C->>S: GET /mytopic/ws, Upgrade: websocket
+    S->>U: same, on a connection of its own
+    U-->>S: 101 Switching Protocols
+    S->>C: 101, hijack
+    par Upstream to client
+        U->>S: frame
+        S->>C: frame, idle timer reset
+    and Client to upstream
+        C->>S: frame
+        S->>U: frame, idle timer reset
     end
-    U--xW: closes (e.g. no pong)
-    W->>P: cancel: upstream closed
-    P--xC: close (no close frame: clients do not reconnect after one)
+    U--xS: closes (e.g. no pong)
+    S--xC: close (no close frame: clients do not reconnect after one)
 ```
 
 ### Draining an upstream

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -123,31 +122,6 @@ func TestProxy_UpstreamReadTimeout(t *testing.T) {
 	_, err = io.ReadAll(resp.Body)
 	require.Error(t, err) // Cut, not a clean end
 	require.Less(t, time.Since(start), 3*time.Second)
-}
-
-func TestProxy_WebSocketUpgrade(t *testing.T) {
-	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "", app1)
-	conn, err := net.Dial("tcp", s.HTTPAddr())
-	require.NoError(t, err)
-	defer conn.Close()
-	fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")
-	r := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(r, nil)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
-	fmt.Fprint(conn, "ping\n")
-	line, err := r.ReadString('\n')
-	require.NoError(t, err)
-	require.Equal(t, "ping\n", line)
-
-	// Draining the upstream cuts the upgraded connection too
-	require.NoError(t, s.balancer.DrainUpstream("app1", 0))
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	_, err = r.ReadString('\n')
-	require.Error(t, err)
-	var netErr net.Error
-	require.False(t, errors.As(err, &netErr) && netErr.Timeout(), "connection was not cut")
 }
 
 func TestProxy_DrainedRejectsNewRequests(t *testing.T) {
@@ -797,7 +771,7 @@ func TestProxy_CancelRacesHandlerEnd(t *testing.T) {
 			}
 		}()
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(1500 * time.Millisecond) // Thousands of races; the crash showed within a second
 	for time.Now().Before(deadline) {
 		s.proxy.mu.Lock()
 		for pr := range s.proxy.active {
@@ -1187,32 +1161,6 @@ func TestProxy_SmugglingAttemptsRejected(t *testing.T) {
 	require.Empty(t, got.header.Get("Content-Length"))
 }
 
-func TestProxy_WebSocketDrainClosesWithoutCloseFrame(t *testing.T) {
-	// The ntfy clients do not reconnect after a WebSocket close frame, so a drain must end the
-	// connection the way ntfy does: just close it
-	app1 := newTestUpstream(t, "app1")
-	s, _ := newTestServer(t, "", app1)
-	conn, err := net.Dial("tcp", s.HTTPAddr())
-	require.NoError(t, err)
-	defer conn.Close()
-	_, err = conn.Write([]byte("GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")) // The fake upstream speaks "test"
-	require.NoError(t, err)
-	r := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(r, nil)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
-	waitFor(t, func() bool {
-		return s.balancer.Status().Streams == 1
-	})
-	require.NoError(t, s.balancer.DrainUpstream("app1", 0))
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	rest, err := io.ReadAll(r)
-	require.NotErrorIs(t, err, os.ErrDeadlineExceeded) // Closed
-	for i := 0; i+1 < len(rest); i++ {
-		require.NotEqual(t, byte(0x88), rest[i], "close frame sent") // FIN + opcode 8
-	}
-}
-
 func TestProxy_NoExtendedConnectOverHTTP2(t *testing.T) {
 	// Browsers would send WebSockets as HTTP/2 extended CONNECT (RFC 8441) if the server allowed
 	// it, which ntfy behind us cannot take; the HTTP/2 SETTINGS must not enable it
@@ -1273,77 +1221,6 @@ func openUpgrade(t testing.TB, addr, path string) (net.Conn, *bufio.Reader) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 	return conn, r
-}
-
-func TestProxy_WebSocketEndsWhenUpstreamCloses(t *testing.T) {
-	// ntfy closes a WebSocket whose client stopped answering pings: the load balancer must end
-	// the client side too, even if the client sends nothing more, or the connection is a zombie
-	app1 := newTestUpstream(t, "app1")
-	app1.on("/gone/ws", upgradeThen(func(conn net.Conn) {
-		time.Sleep(100 * time.Millisecond)
-	}))
-	s, _ := newTestServer(t, "", app1)
-	conn, r := openUpgrade(t, s.HTTPAddr(), "/gone/ws")
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, err := r.ReadByte()
-	require.Error(t, err)
-	require.NotErrorIs(t, err, os.ErrDeadlineExceeded)
-	waitFor(t, func() bool {
-		return s.balancer.Status().Streams == 0
-	})
-}
-
-func TestProxy_WebSocketIdleTimeout(t *testing.T) {
-	// An upgraded connection on which nothing moves either way for the read timeout is cut
-	app1 := newTestUpstream(t, "app1")
-	app1.on("/silent/ws", upgradeThen(func(conn net.Conn) {
-		io.Copy(io.Discard, conn) // Reads until the load balancer closes it
-	}))
-	s, _ := newTestServer(t, "timeouts: {read: 300ms}", app1)
-	conn, r := openUpgrade(t, s.HTTPAddr(), "/silent/ws")
-	start := time.Now()
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, err := r.ReadByte()
-	require.Error(t, err)
-	require.NotErrorIs(t, err, os.ErrDeadlineExceeded)
-	require.Less(t, time.Since(start), 3*time.Second)
-
-	// Traffic in either direction keeps it open
-	app1.on("/echo/ws", upgradeThen(func(conn net.Conn) {
-		io.Copy(conn, conn)
-	}))
-	conn, r = openUpgrade(t, s.HTTPAddr(), "/echo/ws")
-	for range 5 {
-		time.Sleep(150 * time.Millisecond)
-		fmt.Fprint(conn, "ping\n")
-		line, err := r.ReadString('\n')
-		require.NoError(t, err)
-		require.Equal(t, "ping\n", line)
-	}
-}
-
-func TestProxy_WebSocketSmallCopyBuffers(t *testing.T) {
-	// The reverse proxy copies an upgraded connection with io.Copy, 32 KiB per direction unless
-	// the upstream side copies itself: ~64 KiB per WebSocket, which mostly waits for a message
-	var body io.ReadWriteCloser = &upgradedBody{}
-	_, ok := body.(io.WriterTo)
-	require.True(t, ok, "WriterTo")
-	_, ok = body.(io.ReaderFrom)
-	require.True(t, ok, "ReaderFrom")
-
-	// Both directions still move everything, also messages larger than the buffers
-	app1 := newTestUpstream(t, "app1")
-	app1.on("/echo/ws", upgradeThen(func(conn net.Conn) {
-		io.Copy(conn, conn)
-	}))
-	s, _ := newTestServer(t, "", app1)
-	conn, r := openUpgrade(t, s.HTTPAddr(), "/echo/ws")
-	message := strings.Repeat("x", 100*1024) + "\n"
-	go fmt.Fprint(conn, message)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	line, err := r.ReadString('\n')
-	require.NoError(t, err)
-	require.Equal(t, message, line)
 }
 
 func TestProxy_UpdateKeepsUnchangedConns(t *testing.T) {
@@ -1613,4 +1490,26 @@ func TestProxy_ReloadAddsRuleAndUpstreamTogether(t *testing.T) {
 		status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/app2/x")
 		require.NotEqual(t, http.StatusBadGateway, status)
 	}
+}
+
+func TestProxy_UpgradeWithBodyIsAPlainRequest(t *testing.T) {
+	// Only bodyless HTTP/1.1 GETs can switch protocols (the stream path). Any other request with
+	// an Upgrade header, like curl's "Upgrade: h2c" on a POST, is proxied without it: ntfy never
+	// switches for those, and the reverse proxy has no upgrade path to keep
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/echo-upgrade", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, "upgrade=%q connection=%q body=%s", r.Header.Get("Upgrade"), r.Header.Get("Connection"), body)
+	})
+	s, _ := newTestServer(t, "", app1)
+	req, err := http.NewRequest(http.MethodPost, "http://"+s.HTTPAddr()+"/echo-upgrade", strings.NewReader("hi"))
+	require.NoError(t, err)
+	req.Header.Set("Upgrade", "h2c")
+	req.Header.Set("Connection", "Upgrade, HTTP2-Settings")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, `upgrade="" connection="" body=hi`, string(body))
 }

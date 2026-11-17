@@ -2,7 +2,6 @@ package server
 
 import (
 	"errors"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -38,26 +37,4 @@ func safely(where string, f func()) {
 		}
 	}()
 	f()
-}
-
-// copySmall copies until EOF or an error with a buffer of size bytes. A loop of its own, not
-// io.CopyBuffer, which would hand the copy to w's ReadFrom or r's WriteTo and their 32 KiB buffers.
-func copySmall(w io.Writer, r io.Reader, size int) (int64, error) {
-	buf := make([]byte, size)
-	var written int64
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			m, werr := w.Write(buf[:n])
-			written += int64(m)
-			if werr != nil {
-				return written, werr
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			return written, nil
-		} else if err != nil {
-			return written, err
-		}
-	}
 }
