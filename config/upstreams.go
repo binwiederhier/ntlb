@@ -148,18 +148,14 @@ func validateServers(servers []*Server, section string) error {
 	if len(servers) == 0 {
 		return fmt.Errorf("at least one server is required (%s.servers)", section)
 	}
-	names := make(map[string]bool)
-	for i, srv := range servers {
+	for i, srv := range servers { // Names are unique over the site: validateUpstreams
 		if srv == nil {
 			return fmt.Errorf("%s.servers[%d] is empty", section, i)
 		} else if !nameRegex.MatchString(srv.Name) {
 			return fmt.Errorf("invalid server name %q", srv.Name)
-		} else if names[srv.Name] {
-			return fmt.Errorf("duplicate server name %q", srv.Name)
 		} else if len(srv.Addresses) == 0 {
 			return fmt.Errorf("server %s has no addresses", srv.Name)
 		}
-		names[srv.Name] = true
 		if srv.Weight == 0 {
 			srv.Weight = 1
 		} else if srv.Weight < 1 || srv.Weight > maxWeight {

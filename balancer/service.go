@@ -189,8 +189,8 @@ func (b *Balancer) Pick(site, pool string, key []byte) []*Upstream {
 }
 
 // RecordAddressFailure counts a request that an upstream failed on an address (connection error,
-// timeout), and skips that address for new attempts for a while, longer with each failure in a row, since
-// the health check only probes an upstream's first address
+// timeout), and skips that address for new attempts for a while, longer with each failure in a
+// row: between health checks, the next request should not try it again right away
 func (b *Balancer) RecordAddressFailure(u *Upstream, addr string) {
 	u.failures.Add(1)
 	u.mu.Lock()

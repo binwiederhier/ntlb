@@ -147,7 +147,6 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, pr.errorPages, httpErrNoSite)
 		return
 	}
-	pr.site = site.Name
 	subscription := isSubscription(env, site.Streams)
 	pr.env = nil // Its header() holds the whole request, which a detached stream must not keep
 	upgrade := r.Header.Get(headerUpgrade) != ""
@@ -172,12 +171,6 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, pr.errorPages, httpErrDraining)
 		return
 	}
-	parent := r.Context()
-	if stream && r.ProtoMajor == 1 {
-		parent = context.WithoutCancel(parent) // Detached from the handler, see serveStream
-	}
-	ctx, cancel := context.WithCancelCause(parent)
-	pr.key, pr.cancel = clientKey(r.RemoteAddr, conf.ClientKey), cancel
 	pool := site.UpstreamNamed(pr.pool)
 	if pool == nil {
 		// A reload's new rules met the site of the old config, which lacks the upstream they name
@@ -185,6 +178,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, pr.errorPages, httpErrUpstreamMissing)
 		return
 	}
+	parent := r.Context()
+	if stream && r.ProtoMajor == 1 {
+		parent = context.WithoutCancel(parent) // Detached from the handler, see serveStream
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	pr.key, pr.cancel = clientKey(r.RemoteAddr, conf.ClientKey), cancel
 	pr.pool = pool.Name
 	pr.readTimeout = pool.Timeouts.Read
 	pr.conns = (*p.conns.Load())[pool.ID]
@@ -255,9 +254,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // A request whose body was partly sent is never resent, as there is no copy of it.
 func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	pr := proxyRequestFromContext(req.Context())
-	var body *trackingBody
-	if req.Body != nil && req.Body != http.NoBody {
-		body = &trackingBody{rc: req.Body}
+	body := req.Body
+	if body == http.NoBody {
+		body = nil
 	}
 	send := func(transport *http.Transport, addr string) (*http.Response, int, func() bool, error) {
 		// A shallow copy per attempt, with its own URL: req is the reverse proxy's copy already,
@@ -268,7 +267,7 @@ func (p *proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		out.URL = &target
 		var attempt *attemptBody
 		if body != nil {
-			attempt = body.attempt()
+			attempt = &attemptBody{rc: body}
 			out.Body = attempt
 		}
 		untouched := func() bool {

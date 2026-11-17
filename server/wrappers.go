@@ -4,39 +4,20 @@ import (
 	"io"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 // Wrappers around the request and response bodies and the client connection, which bound
 // reads and writes by timeouts, let drains interrupt them, and track what a retry may resend.
 
-// trackingBody wraps a request body so a failed attempt neither closes it (the transport closes
-// a request body on error) nor hides whether any of it was sent, which decides a retry
-type trackingBody struct {
-	rc      io.ReadCloser
-	touched atomic.Bool
-}
-
-func (b *trackingBody) Read(p []byte) (int, error) {
-	b.touched.Store(true)
-	return b.rc.Read(p)
-}
-
-func (b *trackingBody) attempt() *attemptBody {
-	return &attemptBody{body: b}
-}
-
-func (b *trackingBody) Close() error {
-	return nil // The server closes the real body when the handler returns
-}
-
-// attemptBody is one attempt's handle on the shared request body. The transport may still read
-// a failed attempt's body after RoundTrip returned (its writer runs on), so before the next
-// attempt the old handle is retired: it reads nothing more, and retire tells whether it read
-// anything, which rules out the retry.
+// attemptBody is one attempt's handle on the request body. It never closes the body (the
+// transport closes a request body on error; the server closes the real one when the handler
+// returns). The transport may still read a failed attempt's body after RoundTrip returned (its
+// writer runs on), so before the next attempt the old handle is retired: it reads nothing more,
+// and retire tells whether it read anything, which rules out the retry. So a later attempt only
+// ever follows ones that read nothing, and its own reads are all that count.
 type attemptBody struct {
-	body    *trackingBody
+	rc      io.ReadCloser
 	retired bool
 	read    bool
 	mu      sync.Mutex // Protects retired and read
@@ -50,19 +31,19 @@ func (a *attemptBody) Read(p []byte) (int, error) {
 	}
 	a.read = true
 	a.mu.Unlock()
-	return a.body.Read(p)
+	return a.rc.Read(p)
 }
 
 func (a *attemptBody) Close() error {
 	return nil // The server closes the real body when the handler returns
 }
 
-// retire stops the handle from reading and returns true if the body was touched by any attempt
+// retire stops the handle from reading and returns true if it read any of the body
 func (a *attemptBody) retire() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.retired = true
-	return a.read || a.body.touched.Load()
+	return a.read
 }
 
 // clientBody is the request body as read from the client: each read must make progress within

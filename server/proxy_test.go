@@ -905,10 +905,6 @@ sites:
 	require.Equal(t, http.StatusNotFound, getHost(s.ListenerAddr("127.0.0.2:0"), "a.com"))
 }
 
-func touched(body *trackingBody) bool {
-	return body != nil && body.touched.Load()
-}
-
 // echoUpstream is an upstream that records what reached it and answers with a fixed response
 type echoUpstream struct {
 	srv  *httptest.Server
