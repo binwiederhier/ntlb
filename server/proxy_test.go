@@ -1585,3 +1585,32 @@ func TestProxy_TrackedUntilEveryFinisherRan(t *testing.T) {
 	require.True(t, trackedWhileLogging)
 	require.Empty(t, p.active)
 }
+
+func TestProxy_ReloadAddsRuleAndUpstreamTogether(t *testing.T) {
+	// A reload probes a new upstream before it takes traffic. Meanwhile, requests see either the
+	// old config or the new one, never the new rules with the old sites: a proxy rule to the new
+	// upstream must not meet a site that lacks it (502)
+	web, a1, b1 := newTestUpstream(t, "web"), newTestUpstream(t, "a1"), newTestUpstream(t, "b1")
+	b1.on("/v1/ready", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(700 * time.Millisecond) // The probe takes a while, within the 1s timeout
+	})
+	filename := filepath.Join(t.TempDir(), "config.yml")
+	routedConfig(t, filename, web, []*testUpstream{a1}, nil)
+	s := startTestServer(t, filename)
+	routedConfig(t, filename, web, []*testUpstream{a1}, []*testUpstream{b1})
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Reload()
+		done <- err
+	}()
+	for reloading := true; reloading; {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+			reloading = false
+		default:
+		}
+		status, _ := get(t, http.DefaultClient, "http://"+s.HTTPAddr()+"/app2/x")
+		require.NotEqual(t, http.StatusBadGateway, status)
+	}
+}

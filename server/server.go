@@ -198,9 +198,12 @@ func (s *Server) Reload() ([]string, error) {
 	}
 	s.certs.store(certs)
 	s.files.swap(files)
-	s.rules.Update(conf)
+	// The balancer first: it probes new upstreams before they take traffic, which takes up to a
+	// health check timeout. Only then the rules and the sites, back to back, so that a request
+	// sees the new rules with the new sites (a proxy rule to a new upstream finds it).
 	s.balancer.Update(conf)
 	s.proxy.update(conf)
+	s.rules.Update(conf)
 	s.config.Store(conf)
 	s.swapPublic(conf, added)
 	slog.Info("Config reloaded", "sites", len(conf.Sites), "upstreams", conf.UpstreamCount())

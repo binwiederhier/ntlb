@@ -460,16 +460,20 @@ sequenceDiagram
     R->>R: loadCerts, bindAdded (new addresses), openLogFiles
     Note over R: any error so far: close what was bound, return it, nothing changed
     R->>R: certs.store, files.swap
-    R->>E: Update: new state, limiters and bans carried over if unchanged
     R->>B: Update: tryUpdate until consistent
     Note over B: probe new servers first, keep health and streams of the ones that stay,<br/>move servers between pools, drain removed ones
     R->>P: update: new upstreamConns per pool, unchanged ones kept (their idle conns)
+    R->>E: Update: new state, limiters and bans carried over if unchanged
     R->>R: config.Store(new), swapPublic: start added servers, retire removed ones
 ```
 
-Requests in flight keep the old `*Config` and the old `upstreamConns` they loaded. A request
-routed by the new rules may meet a site of the old config that lacks its pool; `proxy.ServeHTTP`
-answers that with 502 (`upstream not configured`) instead of guessing. The other way round, a
+Requests in flight keep the old `*Config` and the old `upstreamConns` they loaded. The rules and
+the config are swapped back to back, after the balancer probed the new servers (which takes up to
+a health check timeout), so a request sees the new rules with the new sites
+(`TestProxy_ReloadAddsRuleAndUpstreamTogether`). The two are separate pointers, though: a request
+that loaded the new rules an instant before the new config may still meet a site that lacks its
+pool, and `proxy.ServeHTTP` answers that with 502 (`upstream not configured`) instead of
+guessing. The other way round, a
 request routed by the old config whose site or pool the reload removed is still served: `Pick`
 returns the removed servers while they drain, and `proxy.ServeHTTP` gives it connections of its
 own, since the pool's are gone from `proxy.conns`. `TestServer_ReloadStormKeepsServing` checks
