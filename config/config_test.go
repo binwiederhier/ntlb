@@ -147,6 +147,13 @@ func TestParse_Invalid(t *testing.T) {
 			errMsg: "client-key.ipv4-prefix-bits",
 		},
 		{
+			// An IPv6 key of 4 bytes or fewer could equal an IPv4 key: both share the limits,
+			// the bans and the hash
+			name:   "ipv6 prefix as short as an ipv4 key",
+			config: "client-key: {ipv6-prefix-bits: 32}\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
+			errMsg: "client-key.ipv6-prefix-bits must be between 33 and 128",
+		},
+		{
 			name:   "ipv6 prefix too long",
 			config: "client-key: {ipv6-prefix-bits: 129}\nsites: [{name: s, listen-http: ':80', upstreams: {default: {servers: [{name: a, addresses: ['1.2.3.4:80']}]}}}]",
 			errMsg: "client-key.ipv6-prefix-bits",

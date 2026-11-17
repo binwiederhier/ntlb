@@ -215,8 +215,9 @@ func (c *Config) validate() error {
 	if c.ClientKey.IPv4PrefixBits < 1 || c.ClientKey.IPv4PrefixBits > 32 {
 		return errors.New("client-key.ipv4-prefix-bits must be between 1 and 32")
 	}
-	if c.ClientKey.IPv6PrefixBits < 1 || c.ClientKey.IPv6PrefixBits > 128 {
-		return errors.New("client-key.ipv6-prefix-bits must be between 1 and 128")
+	if c.ClientKey.IPv6PrefixBits <= 32 || c.ClientKey.IPv6PrefixBits > 128 {
+		// Up to 32 bits, an IPv6 key (cut to whole bytes) could equal an IPv4 one
+		return errors.New("client-key.ipv6-prefix-bits must be between 33 and 128")
 	}
 	if err := validateAccessLogs(c.AccessLogs); err != nil {
 		return err

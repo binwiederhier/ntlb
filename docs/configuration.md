@@ -69,7 +69,7 @@ flowchart LR
 | `drain-duration` | `5m` | Default for `upstream drain`, and for servers removed from the config. |
 | `shutdown-drain-delay` | `0` | On SIGTERM, before the drain: withdrawing, i.e. not ready but still serving everything (new streams too), so the health check in front takes ntlb out before streams close. Set it to that check's detection time plus the DNS TTL. Like ntfy's `cluster-drain-delay`. |
 | `shutdown-drain-duration` | `2m` | On SIGTERM (after `shutdown-drain-delay`): not ready, streams closed over this long, then exit. |
-| `client-key` | `{ipv4-prefix-bits: 32, ipv6-prefix-bits: 64}` | What identifies a client for `balance: hash`, limits and bans: its IP, shortened to a prefix. |
+| `client-key` | `{ipv4-prefix-bits: 32, ipv6-prefix-bits: 64}` | What identifies a client for `balance: hash`, limits and bans: its IP, shortened to a prefix (IPv4 1-32 bits, IPv6 33-128, so the two never share a key). |
 | `bans` | off | Strike counting and the ban file. See [Bans](#bans). |
 | `gzip` | off | Compression for sites without their own. See [Compression](#compression). |
 | `errors` | `{format: html}` | How ntlb answers what it does not proxy, for sites without their own and requests no site serves. See [Error pages](#error-pages). |
