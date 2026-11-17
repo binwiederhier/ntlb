@@ -81,3 +81,11 @@ func (c *stallingConn) Read(p []byte) (int, error) {
 	c.read.Add(int64(n))
 	return n, err
 }
+
+func TestListeners_HTTP2Limits(t *testing.T) {
+	// nginx's http2_max_concurrent_streams (128), not Go's 250; and a ping when a connection sent
+	// nothing for 2m, so a client that vanished is noticed even while its streams only receive
+	h2 := newHTTPServer("test", http.NotFoundHandler()).HTTP2
+	require.Equal(t, 128, h2.MaxConcurrentStreams)
+	require.Equal(t, 2*time.Minute, h2.SendPingTimeout)
+}
