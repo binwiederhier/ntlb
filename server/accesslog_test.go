@@ -1,6 +1,9 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -346,4 +349,35 @@ func TestAccessLog_EscapeAndRedact(t *testing.T) {
 	require.Equal(t, "/a?Auth=REDACTED&AUTH=REDACTED&auth", redactAuth("/a?Auth=x&AUTH=y&auth"))
 	require.Equal(t, "/a?x=1&y=2", redactAuth("/a?x=1&y=2"))
 	require.Equal(t, "/auth", redactAuth("/auth"))
+}
+
+// flakyWriter fails its first fails writes, then takes everything
+type flakyWriter struct {
+	fails   int
+	written bytes.Buffer
+}
+
+func (w *flakyWriter) Write(p []byte) (int, error) {
+	if w.fails > 0 {
+		w.fails--
+		return 0, errors.New("no space left on device")
+	}
+	return w.written.Write(p)
+}
+
+func TestAccessLog_RecoversFromWriteError(t *testing.T) {
+	// A failed write (a full disk) loses what was buffered, but not every line after it: bufio's
+	// errors are sticky, and the ban file must keep reaching the ban tool once there is room again
+	fw := &flakyWriter{
+		fails: 1,
+	}
+	l := &accessLog{
+		out: fw,
+		w:   bufio.NewWriter(fw),
+	}
+	l.writeLine([]byte("lost\n"))
+	l.flush()
+	l.writeLine([]byte("kept\n"))
+	l.flush()
+	require.Equal(t, "kept\n", fw.written.String())
 }

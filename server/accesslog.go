@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -25,9 +26,10 @@ const (
 // "combined_ssl" on ntfy.sh (combined, then key=value fields), so the existing parsers keep working.
 type accessLog struct {
 	file *os.File
+	out  io.Writer // What w writes to: file, or a test's writer
 	w    *bufio.Writer
 	done chan struct{}
-	mu   sync.Mutex // Protects file and w
+	mu   sync.Mutex // Protects file, out and w
 }
 
 // accessLogEntry holds what a log line needs from the request, taken upfront so that a stream
@@ -110,7 +112,9 @@ func (l *accessLog) writeLine(line []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.w != nil { // Closed while the request ran
-		l.w.Write(line)
+		if _, err := l.w.Write(line); err != nil { // A full buffer is written out first
+			l.failedNoLock(err)
+		}
 	}
 }
 
@@ -123,9 +127,9 @@ func (l *accessLog) swap(file *os.File) {
 		l.w.Flush()
 		l.file.Close()
 	}
-	l.file, l.w = file, nil
+	l.file, l.out, l.w = file, nil, nil
 	if file != nil {
-		l.w = bufio.NewWriterSize(file, 64*1024)
+		l.out, l.w = file, bufio.NewWriterSize(file, 64*1024)
 	}
 }
 
@@ -142,15 +146,27 @@ func (l *accessLog) flushLoop() {
 		case <-l.done:
 			return
 		case <-ticker.C:
-			l.mu.Lock()
-			if l.w != nil {
-				if err := l.w.Flush(); err != nil {
-					slog.Warn("Cannot write access log", "error", err)
-				}
-			}
-			l.mu.Unlock()
+			l.flush()
 		}
 	}
+}
+
+func (l *accessLog) flush() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.w != nil {
+		if err := l.w.Flush(); err != nil {
+			l.failedNoLock(err)
+		}
+	}
+}
+
+// failedNoLock drops what is buffered after a failed write (say, a full disk). bufio keeps its
+// first error and fails every write after it, which would silence the log, and with the ban file
+// the bans, until the next reload. The caller must hold l.mu.
+func (l *accessLog) failedNoLock(err error) {
+	slog.Warn("Cannot write log file, dropping its buffered lines", "error", err)
+	l.w.Reset(l.out)
 }
 
 // escape escapes a log field the way nginx does: quotes, backslashes, and the bytes that are not
