@@ -358,6 +358,13 @@ reaching the admin API (no auth: reload, drain, pprof). `listen-profiler` serves
 `/debug/pprof/` (index and named profiles, CPU profile, trace, symbol), for profiling under load
 without the admin API either.
 
+Profiling is ready before a problem shows: mutex contention is sampled 1 in 100 (the mutex profile
+is empty by default). The block profile and a flight recorder stay off: on the lab soak (40k
+streams) the flight recorder cost 28% more CPU (1.45 to 1.85 cores) and p99 latency spikes up to
+1.4s (from ~100ms), and the block profile, which hooks every channel and select wait, about 10%
+more CPU (1.52 to 1.67 cores; without it 1.66 to 1.68, within the runs' noise).
+`GET /debug/pprof/trace?seconds=N` traces on demand instead.
+
 Cost: rules shaped like ntfy.sh's nginx config (13 topic patterns, a user agent, the topic count,
 6 exempt networks, a limit) take ~1.2 us per request on one core (`BenchmarkEngine_Check`, with
 building the `Env`), about 0.1% of a core at ntfy.sh's ~720 requests/s.
@@ -371,7 +378,9 @@ finisher as the access log (`Server.observe`), so detached streams are counted w
   none serves the host; upstream empty if none answered; code 499 if the client left before a
   response)
 - `ntlb_request_duration_seconds{kind="request"}`, `ntlb_stream_duration_seconds`
-- `ntlb_connections_refused_total`: connections closed by the pending caps or the total cap (see "Requests Go rejects")
+- `ntlb_connections_refused_total{reason}`: connections closed right away, by the cap (client,
+  network, total; see "Requests Go rejects"); `ntlb_connections_pending`: connections without a
+  request yet, what the pending caps count
 - `ntlb_connections`, `ntlb_connections_accepted_total`: client connections on the public
   listeners, like nginx's `stub_status` active and accepted. Counted at the listener (accept to
   first `Close`), not in `ConnState`, so hijacked HTTP/1 streams and WebSockets stay counted.
@@ -381,7 +390,10 @@ finisher as the access log (`Server.observe`), so detached streams are counted w
   `ntlb_streams_closed_total{reason}` (drained, read_timeout)
 - `ntlb_rule_matches_total{rule}`: requests a rule decided; `ntlb_bans_total`: ban lines
 - `ntlb_ready`, `ntlb_draining`, `ntlb_upstream_{healthy,draining,streams,requests_total,failures_total}{site,upstream}`
-- the Go and process collectors (`go_*`, `process_*`: memory, goroutines, fds)
+- the Go and process collectors (`go_*`, `process_*`: memory, goroutines, fds), with the
+  runtime's scheduler and GC histograms and the GC's CPU (`go_sched_latencies_seconds`,
+  `go_gc_pauses_seconds`, `go_cpu_classes_gc_*`): a GC that cannot get the CPU shows as scheduler
+  latency and GC CPU
 
 ## Memory
 

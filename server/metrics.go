@@ -2,6 +2,7 @@ package server
 
 import (
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -46,6 +47,15 @@ const (
 	requestDurationMax = 5 * time.Minute
 )
 
+var (
+	goGCCPUMetrics = regexp.MustCompile(`^/cpu/classes/gc/`) // Not in collectors.MetricsGC
+)
+
+// Profiling rate, set when the server starts
+const (
+	mutexProfileFraction = 100 // One in this many lock contentions sampled (runtime.SetMutexProfileFraction)
+)
+
 // metrics are the load balancer's Prometheus metrics. Counters and histograms are updated as
 // requests end; the gauges that mirror the balancer's state are read from its Status on scrape.
 type metrics struct {
@@ -61,7 +71,7 @@ type metrics struct {
 	bans                prometheus.Counter
 	connections         prometheus.Gauge
 	connectionsAccepted prometheus.Counter
-	connectionsRefused  prometheus.Counter
+	connectionsRefused  *prometheus.CounterVec
 }
 
 // processCollector exports the process metrics of Prometheus' process collector, without the open
@@ -149,11 +159,11 @@ func newMetrics(b *balancer.Balancer) *metrics {
 			Name:      "connections_accepted_total",
 			Help:      "Client connections accepted on the public listeners",
 		}),
-		connectionsRefused: prometheus.NewCounter(prometheus.CounterOpts{
+		connectionsRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "connections_refused_total",
-			Help:      "Client connections closed right away: the client already had too many without a request",
-		}),
+			Help:      "Client connections closed right away, by the cap that refused them: client (too many without a request), network (the same for the client's /24 or /48), total (all client connections)",
+		}, []string{"reason"}),
 	}
 	for _, protocol := range []string{protocolHTTP1, protocolHTTP2, protocolWebSocket} {
 		m.streams.WithLabelValues(protocol)
@@ -163,6 +173,9 @@ func newMetrics(b *balancer.Balancer) *metrics {
 	}
 	for _, reason := range []string{closedDrained, closedReadTimeout} {
 		m.streamsClosed.WithLabelValues(reason)
+	}
+	for _, reason := range []string{refusedClient, refusedNetwork, refusedTotal} {
+		m.connectionsRefused.WithLabelValues(reason)
 	}
 	m.registry.MustRegister(
 		m.requests,
@@ -178,7 +191,13 @@ func newMetrics(b *balancer.Balancer) *metrics {
 		m.connectionsAccepted,
 		m.connectionsRefused,
 		newStatusCollector(b),
-		collectors.NewGoCollector(),
+		// The scheduler and GC histograms and the GC's CPU, on top of the default Go metrics: a GC
+		// that cannot get the CPU shows as scheduler latency (docs/design.md, GC and CPU contention)
+		collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(
+			collectors.MetricsGC,
+			collectors.MetricsScheduler,
+			collectors.GoRuntimeMetricsRule{Matcher: goGCCPUMetrics},
+		)),
 		newProcessCollector(),
 	)
 	return m

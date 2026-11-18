@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -17,4 +18,21 @@ func TestMetrics_ProcessWithoutOpenFDs(t *testing.T) {
 		require.Contains(t, body, want)
 	}
 	require.NotContains(t, body, "process_open_fds")
+}
+
+func TestMetrics_GoRuntime(t *testing.T) {
+	// The scheduler and GC histograms (runtime/metrics): a GC that cannot get the CPU shows as
+	// scheduler latency and GC CPU, which the default Go collector does not export
+	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
+	_, body := adminDo(t, s, http.MethodGet, "/metrics", "")
+	for _, want := range []string{"go_sched_latencies_seconds_bucket", "go_gc_pauses_seconds_bucket", "go_cpu_classes_gc_total_cpu_seconds_total", "go_sched_gomaxprocs_threads"} {
+		require.Contains(t, body, want)
+	}
+}
+
+func TestMetrics_MutexProfile(t *testing.T) {
+	// Lock contention is sampled from the start, so the profiler's mutex profile has data when a
+	// problem shows (it is empty unless a rate is set)
+	newTestServer(t, "", newTestUpstream(t, "app1"))
+	require.Equal(t, mutexProfileFraction, runtime.SetMutexProfileFraction(-1))
 }

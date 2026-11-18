@@ -43,6 +43,13 @@ const (
 	pendingIPv6PrefixBits = 48
 )
 
+// Reasons a connection is refused, ntlb_connections_refused_total's label
+const (
+	refusedClient  = "client"
+	refusedNetwork = "network"
+	refusedTotal   = "total"
+)
+
 // connInfoKey is the request context key for the connection's *connInfo
 type connInfoKey struct{}
 
@@ -54,7 +61,7 @@ type connTracker struct {
 	conns   sync.Map                       // net.Conn -> *connInfo
 	config  *atomic.Pointer[config.Config] // The client key, as the limits and bans count a client
 	pending *pendingConns
-	refused prometheus.Counter // Connections closed right away by the pending cap
+	refused *prometheus.CounterVec // Connections closed right away by a pending cap, by reason
 	onBad   func(remoteAddr string)
 }
 
@@ -66,7 +73,8 @@ type connTracker struct {
 type pendingConns struct {
 	counts   map[string]int // By client key
 	networks map[string]int // By network (pendingIPv4PrefixBits, pendingIPv6PrefixBits)
-	mu       sync.Mutex     // Protects counts and networks
+	total    int
+	mu       sync.Mutex // Protects counts, networks and total
 }
 
 // countingListener counts a public listener's client connections from accept to close. At the
@@ -103,10 +111,10 @@ func (t *connTracker) connContext(ctx context.Context, c net.Conn) context.Conte
 		key:     string(clientKey(remote, t.config.Load().ClientKey)),
 		network: string(clientkey.Of(clientkey.Parse(remote), pendingIPv4PrefixBits, pendingIPv6PrefixBits)),
 	}
-	if t.pending.add(info.key, info.network) {
+	if refused := t.pending.add(info.key, info.network); refused == "" {
 		info.counted.Store(true)
 	} else {
-		t.refused.Inc()
+		t.refused.WithLabelValues(refused).Inc()
 		c.Close() // Go then sees a closed connection, and drops it
 	}
 	t.conns.Store(c, info)
@@ -149,7 +157,7 @@ func (l *countingListener) Accept() (net.Conn, error) {
 		}
 		if l.open.Add(1) > maxClientConns {
 			l.open.Add(-1)
-			l.metrics.connectionsRefused.Inc()
+			l.metrics.connectionsRefused.WithLabelValues(refusedTotal).Inc()
 			c.Close()
 			continue
 		}
@@ -220,17 +228,20 @@ func (i *connInfo) release() {
 	}
 }
 
-// add counts a pending connection of a client and its network, and reports whether both are
-// within their caps
-func (p *pendingConns) add(key, network string) bool {
+// add counts a pending connection of a client and its network if both are within their caps;
+// otherwise it returns the cap that refuses it (refusedClient, refusedNetwork)
+func (p *pendingConns) add(key, network string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.counts[key] >= maxPendingConnsPerIP || p.networks[network] >= maxPendingConnsPerNetwork {
-		return false
+	if p.counts[key] >= maxPendingConnsPerIP {
+		return refusedClient
+	} else if p.networks[network] >= maxPendingConnsPerNetwork {
+		return refusedNetwork
 	}
 	p.counts[key]++
 	p.networks[network]++
-	return true
+	p.total++
+	return ""
 }
 
 func (p *pendingConns) remove(key, network string) {
@@ -238,6 +249,14 @@ func (p *pendingConns) remove(key, network string) {
 	defer p.mu.Unlock()
 	decrement(p.counts, key)
 	decrement(p.networks, network)
+	p.total--
+}
+
+// count is the number of pending connections, for the metrics
+func (p *pendingConns) count() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return float64(p.total)
 }
 
 // decrement counts down a key, deleting it at zero so the map does not keep every client

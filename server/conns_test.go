@@ -254,6 +254,9 @@ func TestConns_PendingPerIPCapped(t *testing.T) {
 	c1, c2 := dial(), dial()
 	require.True(t, closedByServer(dial()))
 	require.False(t, closedByServer(c2))
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_connections_refused_total{reason="client"} 1`)
+	require.Contains(t, metrics, "ntlb_connections_pending 2\n")
 
 	// A request on c1 makes room
 	io.WriteString(c1, "GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -300,6 +303,8 @@ func TestConns_PendingPerNetworkCapped(t *testing.T) {
 	require.True(t, closedByServer(dialFrom(t, "127.0.0.3", s.HTTPAddr())))
 	require.False(t, closedByServer(c1))
 	require.False(t, closedByServer(dialFrom(t, "127.0.1.1", s.HTTPAddr()))) // Another /24
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_connections_refused_total{reason="network"} 1`)
 }
 
 func TestConns_TotalCapped(t *testing.T) {
@@ -315,6 +320,8 @@ func TestConns_TotalCapped(t *testing.T) {
 	c1 := dialFrom(t, "127.0.0.1", s.HTTPAddr())
 	dialFrom(t, "127.0.1.1", s.HTTPAddr())
 	require.True(t, closedByServer(dialFrom(t, "127.0.2.1", s.HTTPAddr())))
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_connections_refused_total{reason="total"} 1`)
 	c1.Close()
 	waitFor(t, func() bool {
 		return !closedByServer(dialFrom(t, "127.0.3.1", s.HTTPAddr()))

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"heckel.io/ntlb/accesslog"
 	"heckel.io/ntlb/balancer"
 	"heckel.io/ntlb/config"
@@ -107,6 +108,12 @@ func New(configFile string) (*Server, error) {
 		counts:   make(map[string]int),
 		networks: make(map[string]int),
 	}
+	s.metrics.registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Name:      "connections_pending",
+		Help:      "Client connections that have not sent a request yet (what the pending caps count)",
+	}, s.pending.count))
+	setProfileRates()
 	s.proxy = newProxy(s.balancer, s.metrics, conf)
 	certs, err := loadCerts(conf)
 	if err != nil {
