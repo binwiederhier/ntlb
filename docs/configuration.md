@@ -495,10 +495,12 @@ sequenceDiagram
 
 ## Access logs
 
-One line per request, in nginx's `combined` format plus key=value fields:
+One line per request, in nginx's `combined` format plus key=value fields. `rule=` is there only
+when a rule decided the request; `http_origin` is always last, quoted (it is client-controlled),
+`"-"` without one:
 
 ```
-203.0.113.9 - - [10/Nov/2026:14:03:11 -0500] "GET /mytopic/json HTTP/2.0" 200 412 "-" "ntfy/1.21" http_host=ntfy.sh site=ntfy request_time=1834.201 upstream=app1:25012 upstream_status=200
+203.0.113.9 - - [10/Nov/2026:14:03:11 -0500] "GET /mytopic/json HTTP/2.0" 200 412 "-" "ntfy/1.21" http_host=ntfy.sh site=ntfy request_time=1834.201 upstream=app1:25012 upstream_status=200 http_origin="https://app.example.com"
 ```
 
 A request goes to the **first** file whose `match` (a response expression) is true; an entry

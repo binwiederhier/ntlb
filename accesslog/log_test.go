@@ -133,19 +133,20 @@ func TestAccessLog_WriteAllocations(t *testing.T) {
 }
 
 func TestAccessLog_LineFormat(t *testing.T) {
-	// The line, byte for byte, as nginx's combined_ssl plus the key=value fields: the formula
-	// here is the reference the writer must match, whatever it does to be cheap
+	// The line, byte for byte, as nginx's combined_ssl plus the key=value fields, http_origin last
+	// (quoted, client-controlled): the formula here is the reference the writer must match,
+	// whatever it does to be cheap
 	dir := t.TempDir()
 	start := time.Now().Add(-1500 * time.Millisecond)
 	for name, tc := range map[string]struct {
-		target, ua, referer, host string
-		o                         Outcome
-		status                    int
+		target, ua, referer, host, origin string
+		o                                 Outcome
+		status                            int
 	}{
-		"proxied":       {target: "/mytopic/json?poll=1", ua: "ntfy/1.27.0 (Android; 14)", host: "ntfy.sh", o: Outcome{Site: "ntfy", Upstream: "app3", UpstreamStatus: 200, Bytes: 120}, status: 200},
+		"proxied":       {target: "/mytopic/json?poll=1", ua: "ntfy/1.27.0 (Android; 14)", host: "ntfy.sh", origin: "https://app.example.com", o: Outcome{Site: "ntfy", Upstream: "app3", UpstreamStatus: 200, Bytes: 120}, status: 200},
 		"rule":          {target: "/sp_x/json", ua: "curl/8", host: "ntfy.sh", o: Outcome{Site: "ntfy", Rule: "ntfy/abuse"}, status: 403},
 		"no site":       {target: "/", host: "other", o: Outcome{}, status: 404},
-		"escaped":       {target: "/a?auth=secret&x=\"1\"", ua: "bad\"agent\\x", referer: "https://x/?a b", host: "ntfy.sh", o: Outcome{Site: "ntfy", Upstream: "app5", UpstreamStatus: 502, Bytes: 0}, status: 502},
+		"escaped":       {target: "/a?auth=secret&x=\"1\"", ua: "bad\"agent\\x", referer: "https://x/?a b", host: "ntfy.sh", origin: "https://x\" y", o: Outcome{Site: "ntfy", Upstream: "app5", UpstreamStatus: 502, Bytes: 0}, status: 502},
 		"long":          {target: "/" + strings.Repeat("a", 5000), ua: strings.Repeat("u", 4096), host: "ntfy.sh", o: Outcome{Site: "ntfy"}, status: 200},
 		"exactly max":   {target: "/", ua: strings.Repeat("u", maxLogField), host: "ntfy.sh", o: Outcome{Site: "ntfy"}, status: 200},
 		"upstream 101":  {target: "/mytopic/ws", ua: "ntfy", host: "ntfy.sh", o: Outcome{Site: "ntfy", Upstream: "app3", UpstreamStatus: 101, Bytes: 4096}, status: 101},
@@ -163,6 +164,9 @@ func TestAccessLog_LineFormat(t *testing.T) {
 		}
 		if tc.referer != "" {
 			r.Header.Set("Referer", tc.referer)
+		}
+		if tc.origin != "" {
+			r.Header.Set("Origin", tc.origin)
 		}
 		e := NewEntry(r, start)
 		o := tc.o
@@ -193,6 +197,7 @@ func TestAccessLog_LineFormat(t *testing.T) {
 		if tc.o.Rule != "" {
 			tail += " rule=" + tc.o.Rule
 		}
+		tail += ` http_origin="` + orDash(escape(tc.origin)) + `"`
 		require.Equal(t, tail+"\n", rest, name)
 	}
 }

@@ -49,6 +49,7 @@ type Entry struct {
 	Referer    string
 	UserAgent  string
 	Host       string
+	Origin     string // Last on the line, like ntfy.sh's nginx: web apps send it, often without a Referer
 }
 
 // Outcome is what a line says about how a request ended
@@ -84,13 +85,15 @@ func NewEntry(r *http.Request, start time.Time) *Entry {
 		Referer:    escape(r.Referer()),
 		UserAgent:  escape(r.UserAgent()),
 		Host:       escapeUnquoted(r.Host),
+		Origin:     escape(r.Header.Get("Origin")),
 	}
 }
 
 // Write writes the line of a request that ended
 func (l *Log) Write(e *Entry, o Outcome) {
 	// Appended field by field, like fmt's "%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s
-	// site=%s request_time=%.3f upstream=%s upstream_status=%s", without boxing every argument
+	// site=%s request_time=%.3f upstream=%s upstream_status=%s[ rule=%s] http_origin=\"%s\"",
+	// without boxing every argument
 	line := make([]byte, 0, lineSize)
 	line = append(line, e.RemoteAddr...)
 	line = append(line, " - - ["...)
@@ -123,7 +126,9 @@ func (l *Log) Write(e *Entry, o Outcome) {
 		line = append(line, " rule="...)
 		line = append(line, o.Rule...)
 	}
-	l.WriteLine(append(line, '\n'))
+	line = append(line, " http_origin=\""...)
+	line = append(line, orDash(e.Origin)...)
+	l.WriteLine(append(line, "\"\n"...))
 }
 
 // WriteLine writes a line that ends in a newline (a ban line, say)

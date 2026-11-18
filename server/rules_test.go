@@ -75,9 +75,9 @@ rules:
 	b, err := os.ReadFile(accessLogFile)
 	require.NoError(t, err)
 	require.Contains(t, string(b), `"GET /sp_x/json HTTP/1.1" 403 `)
-	require.Contains(t, string(b), " upstream=- upstream_status=- rule=abuse\n")
-	require.Contains(t, string(b), "rule=spy\n")
-	require.Contains(t, string(b), "upstream=app1 upstream_status=200\n") // No rule field when none decided
+	require.Contains(t, string(b), " upstream=- upstream_status=- rule=abuse http_origin=\"-\"\n")
+	require.Contains(t, string(b), "rule=spy http_origin=\"-\"\n")
+	require.Contains(t, string(b), "upstream=app1 upstream_status=200 http_origin=\"-\"\n") // No rule field when none decided
 
 	// Counted per rule
 	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
