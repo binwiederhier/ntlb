@@ -6,6 +6,7 @@ package rules
 
 import (
 	"iter"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"sync"
@@ -135,8 +136,10 @@ func (e *Engine) Check(r *http.Request, env *match.Env) *config.Rule {
 			if key == "" {
 				key = string(clientkey.Of(clientkey.Parse(r.RemoteAddr), s.ipv4PrefixBits, s.ipv6PrefixBits))
 			}
-			if !rl.limiter.take(key, clientkey.Parse(r.RemoteAddr), e.now()) {
-				e.strike(s.bansFor(env.Site), clientkey.Parse(r.RemoteAddr), rl.conf)
+			if allowed, shared := rl.limiter.take(key, clientkey.Parse(r.RemoteAddr), e.now()); !allowed {
+				if !shared { // A shared bucket's 429 may be a neighbor's doing: no strike
+					e.strike(s.bansFor(env.Site), clientkey.Parse(r.RemoteAddr), rl.conf)
+				}
 				return rl.conf
 			}
 		}
@@ -260,8 +263,8 @@ func (s *state) all() iter.Seq[*rule] {
 }
 
 // take takes a token from the client's bucket, and reports whether there was one. Over
-// maxTracked, a new client takes from the bucket of its coarse prefix instead.
-func (l *limiter) take(key string, addr netip.Addr, now time.Time) bool {
+// maxTracked, a new client takes from the bucket of its coarse prefix instead (shared).
+func (l *limiter) take(key string, addr netip.Addr, now time.Time) (allowed, shared bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if now.Sub(l.lastSweep) >= sweepInterval {
@@ -271,14 +274,17 @@ func (l *limiter) take(key string, addr netip.Addr, now time.Time) bool {
 	if _, ok := buckets[key]; !ok && len(buckets) >= maxTracked {
 		if now.Sub(l.lastSweep) >= fullSweepInterval {
 			l.sweepNoLock(now)
+			if len(buckets) >= maxTracked { // Once per fullSweepInterval at most
+				slog.Warn("Rate limiter full, new clients share a bucket per network", "tracked", maxTracked)
+			}
 		}
 		if len(buckets) >= maxTracked {
-			buckets, key = l.overflow, string(clientkey.Of(addr, overflowIPv4PrefixBits, overflowIPv6PrefixBits))
+			buckets, key, shared = l.overflow, string(clientkey.Of(addr, overflowIPv4PrefixBits, overflowIPv6PrefixBits)), true
 		}
 	}
 	b, ok := buckets[key]
 	if !ok && len(buckets) >= maxTracked {
-		return true // Untracked: more networks than maxTracked, which a spray from a few cannot reach
+		return true, shared // Untracked: more networks than maxTracked, which a spray from a few cannot reach
 	} else if !ok {
 		b = &bucket{
 			tokens: l.capacity,
@@ -288,10 +294,10 @@ func (l *limiter) take(key string, addr netip.Addr, now time.Time) bool {
 	}
 	b.refill(now, l.perSecond, l.capacity)
 	if b.tokens < 1 {
-		return false
+		return false, shared
 	}
 	b.tokens--
-	return true
+	return true, shared
 }
 
 // sweepNoLock forgets the buckets that refilled: a new bucket is full anyway

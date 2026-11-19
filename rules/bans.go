@@ -2,6 +2,7 @@ package rules
 
 import (
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"sync"
 	"time"
@@ -65,6 +66,9 @@ func (b *bans) strike(addr netip.Addr, weight float64, rule string, now time.Tim
 	if !ok && len(b.clients) >= maxTracked {
 		if now.Sub(b.lastSweep) >= fullSweepInterval {
 			b.sweepNoLock(now)
+			if len(b.clients) >= maxTracked { // Once per fullSweepInterval at most
+				slog.Warn("Bans full, new clients are not counted", "tracked", maxTracked)
+			}
 		}
 		if len(b.clients) >= maxTracked {
 			return "", false // Untracked, see maxTracked

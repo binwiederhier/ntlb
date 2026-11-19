@@ -530,3 +530,21 @@ func skipUnderRace(t *testing.T) {
 		}
 	}
 }
+
+func TestEngine_SharedBucketDoesNotStrike(t *testing.T) {
+	// Over maxTracked, new clients share their /16's bucket: one of them may use it up for its
+	// neighbors, whose 429s must not strike them towards a ban, as they did nothing
+	defer func(old int) {
+		maxTracked = old
+	}(maxTracked)
+	maxTracked = 2 // Also the bans', which have room for one more after 192.0.2.1
+	e, _, lines := testEngineBans(t, testBans+"rules: [{name: limit, action: limit, rate: 1/h, strike: 11}]")
+	decided(e, request("GET", "/", "192.0.2.1:1"))
+	decided(e, request("GET", "/", "192.0.2.2:1")) // The limiter is full now
+	require.Equal(t, "limit", decided(e, request("GET", "/", "192.0.2.1:1")))
+	require.Len(t, *lines, 1) // Its own bucket: struck, banned
+
+	decided(e, request("GET", "/", "198.51.100.1:1")) // Uses up 198.51/16's shared bucket
+	require.Equal(t, "limit", decided(e, request("GET", "/", "198.51.100.2:1")))
+	require.Len(t, *lines, 1) // Limited by the shared bucket: no strike
+}
