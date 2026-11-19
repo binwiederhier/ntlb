@@ -293,6 +293,7 @@ func TestWebSocket_MemoryPerWebSocket(t *testing.T) {
 	// The live heap and goroutines an open WebSocket holds, test side included (two connections
 	// and the upstream's goroutine, all small): one copy per direction, no buffer while waiting
 	skipUnderRace(t)
+	liftOpenConnCaps(t)
 	app1 := newRawUpstream(t, "app1", func(conn net.Conn) {
 		head := readHeadBytewise(conn)
 		if answerReady(conn, head) {

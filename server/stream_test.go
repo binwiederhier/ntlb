@@ -816,6 +816,7 @@ func TestStream_MemoryPerStream(t *testing.T) {
 	// The live heap and goroutines a detached HTTP/1.1 stream holds, test side included (two
 	// connections and the upstream's goroutine, all small). Tens of thousands are open at once.
 	skipUnderRace(t)
+	liftOpenConnCaps(t)
 	app1 := newRawUpstream(t, "app1", func(conn net.Conn) {
 		head := readHeadBytewise(conn)
 		if answerReady(conn, head) {

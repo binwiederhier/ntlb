@@ -1994,6 +1994,16 @@ func TestValidRequestAllocations(t *testing.T) {
 	}
 }
 
+// liftOpenConnCaps lifts the open connection caps for a test that opens many connections from
+// one address to measure them, until the test ends (call it before starting the server)
+func liftOpenConnCaps(t testing.TB) {
+	oldClient, oldNetwork := maxOpenConnsPerClient, maxOpenConnsPerNetwork
+	t.Cleanup(func() {
+		maxOpenConnsPerClient, maxOpenConnsPerNetwork = oldClient, oldNetwork // After the server's cleanup, which runs first
+	})
+	maxOpenConnsPerClient, maxOpenConnsPerNetwork = 1_000_000, 1_000_000
+}
+
 // skipUnderRace skips an allocation budget under the race detector, which allocates on its own
 func skipUnderRace(t *testing.T) {
 	if info, ok := debug.ReadBuildInfo(); ok {
