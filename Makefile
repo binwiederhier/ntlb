@@ -33,6 +33,9 @@ bench:
 	go test -run '^$$' -bench . -benchmem -count 6 ./...
 
 # A release from the checked-out tag: the .deb and a tarball on the GitHub release (.goreleaser.yml)
+# Built with go.mod's toolchain line, not whatever Go is installed (v0.2.0 was built with an
+# older one by accident)
+release: export GOTOOLCHAIN := $(shell awk '/^toolchain/ {print $$2}' go.mod)
 release: all
 	GITHUB_TOKEN=$$(gh auth token) goreleaser release --clean
 
