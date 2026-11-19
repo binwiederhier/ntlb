@@ -174,7 +174,7 @@ func newMetrics(b *balancer.Balancer) *metrics {
 	for _, reason := range []string{closedDrained, closedReadTimeout} {
 		m.streamsClosed.WithLabelValues(reason)
 	}
-	for _, reason := range []string{refusedClient, refusedNetwork, refusedTotal} {
+	for _, reason := range []string{refusedClient, refusedNetwork, refusedClientOpen, refusedNetworkOpen, refusedTotal} {
 		m.connectionsRefused.WithLabelValues(reason)
 	}
 	m.registry.MustRegister(

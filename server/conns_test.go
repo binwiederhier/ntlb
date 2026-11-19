@@ -216,9 +216,10 @@ func TestConns_CountedConnKeepsTCPMethods(t *testing.T) {
 	inner, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
 	var conn net.Conn = &countedConn{
-		Conn:    inner,
-		metrics: newMetrics(nil),
-		open:    &atomic.Int64{},
+		Conn:     inner,
+		metrics:  newMetrics(nil),
+		open:     &atomic.Int64{},
+		byClient: newConnCounts(1, 1, refusedClientOpen, refusedNetworkOpen),
 	}
 	defer conn.Close()
 	_, ok := conn.(interface{ CloseWrite() error })
@@ -326,4 +327,56 @@ func TestConns_TotalCapped(t *testing.T) {
 	waitFor(t, func() bool {
 		return !closedByServer(dialFrom(t, "127.0.3.1", s.HTTPAddr()))
 	})
+}
+
+func TestConns_OpenPerClientCapped(t *testing.T) {
+	// A client's open connections are capped too, after their first request: a request that
+	// never ends costs only one limit token, so the limit does not bound how many it holds
+	old := maxOpenConnsPerClient
+	t.Cleanup(func() {
+		maxOpenConnsPerClient = old // After the server's cleanup, which runs first
+	})
+	maxOpenConnsPerClient = 2
+	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
+	request := func(c net.Conn) {
+		io.WriteString(c, "GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		require.NoError(t, err)
+		resp.Body.Close()
+	}
+	c1 := dialFrom(t, "127.0.0.1", s.HTTPAddr())
+	request(c1)
+	c2 := dialFrom(t, "127.0.0.1", s.HTTPAddr())
+	request(c2) // Both sent a request: no longer pending, still open
+	require.True(t, closedByServer(dialFrom(t, "127.0.0.1", s.HTTPAddr())))
+	require.False(t, closedByServer(dialFrom(t, "127.0.1.1", s.HTTPAddr()))) // Another client
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_connections_refused_total{reason="client_open"} 1`)
+
+	// Closing one makes room
+	c1.Close()
+	waitFor(t, func() bool {
+		return !closedByServer(dialFrom(t, "127.0.0.1", s.HTTPAddr()))
+	})
+}
+
+func TestConns_OpenPerNetworkCapped(t *testing.T) {
+	// And a network's, so that its addresses do not multiply the per-client cap
+	old := maxOpenConnsPerNetwork
+	t.Cleanup(func() {
+		maxOpenConnsPerNetwork = old // After the server's cleanup, which runs first
+	})
+	maxOpenConnsPerNetwork = 2
+	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
+	for _, ip := range []string{"127.0.0.1", "127.0.0.2"} {
+		c := dialFrom(t, ip, s.HTTPAddr())
+		io.WriteString(c, "GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		require.NoError(t, err)
+		resp.Body.Close()
+	}
+	require.True(t, closedByServer(dialFrom(t, "127.0.0.3", s.HTTPAddr())))
+	require.False(t, closedByServer(dialFrom(t, "127.0.1.1", s.HTTPAddr()))) // Another /24
+	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
+	require.Contains(t, metrics, `ntlb_connections_refused_total{reason="network_open"} 1`)
 }

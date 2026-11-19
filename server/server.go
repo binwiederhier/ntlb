@@ -64,7 +64,8 @@ type Server struct {
 	certs       *certStore
 	files       *accesslog.Files // Access logs and the ban file
 	metrics     *metrics
-	pending     *pendingConns            // Of all public listeners
+	pending     *connCounts              // Of all public listeners
+	openConns   *connCounts              // Of all public listeners, by client and network
 	clientConns atomic.Int64             // Open connections of all public listeners
 	public      map[string]*publicServer // Proxying servers by listen address
 	retired     []*publicServer          // Removed by a reload: no new connections, open ones run on
@@ -104,10 +105,8 @@ func New(configFile string) (*Server, error) {
 	s.config.Store(conf)
 	s.rules = rules.New(conf, s.writeBan)
 	s.metrics = newMetrics(s.balancer)
-	s.pending = &pendingConns{
-		counts:   make(map[string]int),
-		networks: make(map[string]int),
-	}
+	s.pending = newConnCounts(maxPendingConnsPerIP, maxPendingConnsPerNetwork, refusedClient, refusedNetwork)
+	s.openConns = newConnCounts(maxOpenConnsPerClient, maxOpenConnsPerNetwork, refusedClientOpen, refusedNetworkOpen)
 	s.metrics.registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Name:      "connections_pending",

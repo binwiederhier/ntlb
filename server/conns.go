@@ -36,6 +36,15 @@ var (
 	// connections are closed right away, rather than every upstream dial failing (a variable for
 	// the tests).
 	maxClientConns int64 = 400_000
+
+	// maxOpenConnsPerClient and maxOpenConnsPerNetwork cap a client's open connections, and its
+	// network's (pendingIPv4PrefixBits, pendingIPv6PrefixBits), from accept to close, requests
+	// sent or not, like nginx's limit_conn: a request that never ends (a stalled upload, a stream)
+	// costs one limit token, so without them a few networks could hold maxClientConns and lock
+	// everyone else out. ntfy.sh (lb-2, 2026-11-19, 53k connections): at most 38 per IPv4 address
+	// or /24, 48 per IPv6 address, 79 per /48 (vars for the tests).
+	maxOpenConnsPerClient  = 500
+	maxOpenConnsPerNetwork = 2000
 )
 
 const (
@@ -45,9 +54,11 @@ const (
 
 // Reasons a connection is refused, ntlb_connections_refused_total's label
 const (
-	refusedClient  = "client"
-	refusedNetwork = "network"
-	refusedTotal   = "total"
+	refusedClient      = "client"       // Pending
+	refusedNetwork     = "network"      // Pending
+	refusedClientOpen  = "client_open"  // Open
+	refusedNetworkOpen = "network_open" // Open
+	refusedTotal       = "total"
 )
 
 // connInfoKey is the request context key for the connection's *connInfo
@@ -60,44 +71,54 @@ type connInfoKey struct{}
 type connTracker struct {
 	conns   sync.Map                       // net.Conn -> *connInfo
 	config  *atomic.Pointer[config.Config] // The client key, as the limits and bans count a client
-	pending *pendingConns
+	pending *connCounts
 	refused *prometheus.CounterVec // Connections closed right away by a pending cap, by reason
 	onBad   func(remoteAddr string)
 }
 
-// pendingConns counts each client's connections that have not sent a request yet, over all
-// public listeners: one costs memory until the header timeout (HTTP/2: the idle timeout), and no
-// rate limit sees it, so one client could hold any number. Once a request arrived, the limit rule
-// counts the client instead. Legitimate clients hold few: a request follows the handshake right
-// away, and browsers open only a handful of HTTP/2 connections ahead of time.
-type pendingConns struct {
-	counts   map[string]int // By client key
-	networks map[string]int // By network (pendingIPv4PrefixBits, pendingIPv6PrefixBits)
-	total    int
-	mu       sync.Mutex // Protects counts, networks and total
+// connCounts counts connections by client and by network over all public listeners, within a
+// cap for each. Two of them: the pending connections, which have not sent a request yet (one
+// costs memory until the header timeout, HTTP/2: the idle timeout, and no rate limit sees it, so
+// one client could hold any number; legitimate clients hold few, as a request follows the
+// handshake right away and browsers open only a handful of HTTP/2 connections ahead of time),
+// and all open ones, whose requests the limit rule sees, but only once each.
+type connCounts struct {
+	maxClient      int
+	maxNetwork     int
+	refusedClient  string // The refused reasons when a cap is reached
+	refusedNetwork string
+	counts         map[string]int // By client key
+	networks       map[string]int // By network (pendingIPv4PrefixBits, pendingIPv6PrefixBits)
+	total          int
+	mu             sync.Mutex // Protects counts, networks and total
 }
 
 // countingListener counts a public listener's client connections from accept to close. At the
 // listener, not in ConnState: a hijacked connection (a stream, a WebSocket) is still open.
 type countingListener struct {
 	net.Listener
-	metrics *metrics
-	open    *atomic.Int64 // Of all public listeners, for maxClientConns
+	metrics  *metrics
+	open     *atomic.Int64                  // Of all public listeners, for maxClientConns
+	byClient *connCounts                    // The same by client and network, for maxOpenConnsPerClient and maxOpenConnsPerNetwork
+	config   *atomic.Pointer[config.Config] // The client key
 }
 
 // countedConn is an accepted connection, uncounted once on its first Close
 type countedConn struct {
 	net.Conn
-	metrics *metrics
-	open    *atomic.Int64
-	once    sync.Once
+	metrics  *metrics
+	open     *atomic.Int64
+	byClient *connCounts
+	key      string // The client, for byClient
+	network  string // The client's network, for byClient
+	once     sync.Once
 }
 
 // connInfo is one connection's state: reading a request (active) and whether a handler got it
 type connInfo struct {
 	active  atomic.Bool
 	handled atomic.Bool
-	pending *pendingConns
+	pending *connCounts
 	key     string      // The client, for pending
 	network string      // The client's network, for pending
 	counted atomic.Bool // In pending, until the first request or the close
@@ -161,12 +182,24 @@ func (l *countingListener) Accept() (net.Conn, error) {
 			c.Close()
 			continue
 		}
+		remote := c.RemoteAddr().String() // Always ip:port from a TCP listener
+		key := string(clientKey(remote, l.config.Load().ClientKey))
+		network := string(clientkey.Of(clientkey.Parse(remote), pendingIPv4PrefixBits, pendingIPv6PrefixBits))
+		if refused := l.byClient.add(key, network); refused != "" {
+			l.open.Add(-1)
+			l.metrics.connectionsRefused.WithLabelValues(refused).Inc()
+			c.Close()
+			continue
+		}
 		l.metrics.connectionsAccepted.Inc()
 		l.metrics.connections.Inc()
 		return &countedConn{
-			Conn:    c,
-			metrics: l.metrics,
-			open:    l.open,
+			Conn:     c,
+			metrics:  l.metrics,
+			open:     l.open,
+			byClient: l.byClient,
+			key:      key,
+			network:  network,
 		}, nil
 	}
 }
@@ -175,6 +208,7 @@ func (c *countedConn) Close() error {
 	c.once.Do(func() {
 		c.metrics.connections.Dec()
 		c.open.Add(-1)
+		c.byClient.remove(c.key, c.network)
 	})
 	return c.Conn.Close()
 }
@@ -228,15 +262,28 @@ func (i *connInfo) release() {
 	}
 }
 
-// add counts a pending connection of a client and its network if both are within their caps;
-// otherwise it returns the cap that refuses it (refusedClient, refusedNetwork)
-func (p *pendingConns) add(key, network string) string {
+// newConnCounts creates counts with a cap per client and per network, and the refused reasons
+// for each
+func newConnCounts(maxClient, maxNetwork int, refusedClient, refusedNetwork string) *connCounts {
+	return &connCounts{
+		maxClient:      maxClient,
+		maxNetwork:     maxNetwork,
+		refusedClient:  refusedClient,
+		refusedNetwork: refusedNetwork,
+		counts:         make(map[string]int),
+		networks:       make(map[string]int),
+	}
+}
+
+// add counts a connection of a client and its network if both are within their caps; otherwise
+// it returns the reason of the cap that refuses it
+func (p *connCounts) add(key, network string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.counts[key] >= maxPendingConnsPerIP {
-		return refusedClient
-	} else if p.networks[network] >= maxPendingConnsPerNetwork {
-		return refusedNetwork
+	if p.counts[key] >= p.maxClient {
+		return p.refusedClient
+	} else if p.networks[network] >= p.maxNetwork {
+		return p.refusedNetwork
 	}
 	p.counts[key]++
 	p.networks[network]++
@@ -244,7 +291,7 @@ func (p *pendingConns) add(key, network string) string {
 	return ""
 }
 
-func (p *pendingConns) remove(key, network string) {
+func (p *connCounts) remove(key, network string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	decrement(p.counts, key)
@@ -252,8 +299,8 @@ func (p *pendingConns) remove(key, network string) {
 	p.total--
 }
 
-// count is the number of pending connections, for the metrics
-func (p *pendingConns) count() float64 {
+// count is the number of connections counted, for the metrics
+func (p *connCounts) count() float64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return float64(p.total)

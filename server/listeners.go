@@ -164,6 +164,8 @@ func (s *Server) bindPublic(conf *config.Config, listeners []*config.Listener) (
 				Listener: ln,
 				metrics:  s.metrics,
 				open:     &s.clientConns,
+				byClient: s.openConns,
+				config:   &s.config,
 			},
 			tls: l.TLS,
 		}

@@ -300,6 +300,16 @@ connection, and both must fit in `LimitNOFILE` (1M). Past it, `countingListener`
 connections right away (also `ntlb_connections_refused_total`); without it, a flood of
 connections would use up the descriptors and fail the upstream dials of every client instead.
 
+Open connections, requests sent or not, are capped as well, per client key at
+`maxOpenConnsPerClient` (500) and per network at `maxOpenConnsPerNetwork` (2000), counted by
+`countingListener` from accept to close (also hijacked streams and WebSockets), like nginx's
+`limit_conn`. The limit rule cannot bound them: a request that never ends (a stalled upload, a
+stream) costs one token, so with a burst of 1000 one IPv6 /48 (256 client keys of /56) could hold
+about 256k connections, and two of them `maxClientConns`, locking every other client out with
+nobody over a limit. On ntfy.sh (lb-2, 2026-11-19, 53k connections) the busiest IPv4 address or
+/24 held 38, the busiest IPv6 address 48 and /48 79, so the caps leave room for carrier NATs.
+Over them, the connection is closed at accept, before the TLS handshake.
+
 ## Rules and bans (`rules/`, `match/`, `config/rules.go`, `server/rules.go`)
 
 All expressions in the config (rule and stream `match`, access log `match`, redirect `location`)
@@ -378,8 +388,8 @@ finisher as the access log (`Server.observe`), so detached streams are counted w
   none serves the host; upstream empty if none answered; code 499 if the client left before a
   response)
 - `ntlb_request_duration_seconds{kind="request"}`, `ntlb_stream_duration_seconds`
-- `ntlb_connections_refused_total{reason}`: connections closed right away, by the cap (client,
-  network, total; see "Requests Go rejects"); `ntlb_connections_pending`: connections without a
+- `ntlb_connections_refused_total{reason}`: connections closed right away, by the cap (client and
+  network: pending; client_open and network_open: open; total; see "Requests Go rejects"); `ntlb_connections_pending`: connections without a
   request yet, what the pending caps count
 - `ntlb_connections`, `ntlb_connections_accepted_total`: client connections on the public
   listeners, like nginx's `stub_status` active and accepted. Counted at the listener (accept to
