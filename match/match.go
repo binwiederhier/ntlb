@@ -185,6 +185,11 @@ func (p *Program) String(env *Env) string {
 func (p *Program) run(env any) any {
 	v := vmPool.Get().(*vm.VM)
 	defer func() {
+		// A predicate (any, all, filter, map) left its input in the VM's scopes, which expr keeps
+		// in a private pool that nothing here can clear: such a VM is dropped instead of pooled
+		if cap(v.Scopes) > 0 {
+			return
+		}
 		// Run clears only the stack's length and leaves what it popped: drop the request's values
 		// before the VM waits in the pool
 		clear(v.Stack[:cap(v.Stack)])

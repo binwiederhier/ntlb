@@ -402,3 +402,16 @@ func TestMatch_PooledVMKeepsNothing(t *testing.T) {
 		require.Nil(t, value, "stack slot %d", i)
 	}
 }
+
+func TestMatch_PooledVMKeepsNoScopes(t *testing.T) {
+	// A predicate (any, all, filter, map) keeps its input in the VM's scopes, which expr does not
+	// clear and ntlb cannot reach: a VM that used one must not go back to the pool, or the input
+	// (here a client's cookies) stays referenced
+	p, err := Compile(`any(split(header("Cookie"), ";"), {# == "a=1"})`, Request)
+	require.NoError(t, err)
+	r := testRequest("GET", "/", "203.0.113.9:1234", "Cookie", "b=2;a=1")
+	require.True(t, p.Match(NewEnv(r)))
+	v := vmPool.Get().(*vm.VM) // The same P, so the VM the run used if it went back
+	defer vmPool.Put(v)
+	require.Zero(t, cap(v.Scopes))
+}
