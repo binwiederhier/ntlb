@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +28,18 @@ var (
 	// lingerTimeout bounds how long the rest of a request body that the answer did not read may
 	// take to arrive after the handler, like nginx's lingering_timeout (a var for the tests)
 	lingerTimeout = 5 * time.Second
+
+	// sideReadTimeout bounds a whole request on the admin, metrics, health and profiler listeners,
+	// body included, and maxSideConns their connections each: they share the process's file
+	// descriptors and memory with the public side, and health may face the internet (vars for
+	// the tests)
+	sideReadTimeout = 10 * time.Second
+	maxSideConns    = 256
+)
+
+const (
+	sideWriteTimeout        = 30 * time.Second
+	sideProfileWriteTimeout = 5 * time.Minute // pprof refuses a profile or trace longer than this
 )
 
 // sideServer is the server of a listener that does not proxy: admin, metrics, health, profiler
@@ -90,14 +103,16 @@ func (s *Server) listen(conf *config.Config) error {
 	}
 
 	// The other listeners: admin always, the rest if set
+	// (writeTimeout: admin and profiler serve CPU profiles and traces of up to a few minutes)
 	sides := []struct {
-		name, addr string
-		handler    func() http.Handler
+		name, addr   string
+		handler      func() http.Handler
+		writeTimeout time.Duration
 	}{
-		{listenerAdmin, conf.ListenAdmin, s.adminHandler},
-		{listenerMetrics, conf.ListenMetrics, s.metricsHandler},
-		{listenerHealth, conf.ListenHealth, s.healthHandler},
-		{listenerProfiler, conf.ListenProfiler, profilerHandler},
+		{listenerAdmin, conf.ListenAdmin, s.adminHandler, sideProfileWriteTimeout},
+		{listenerMetrics, conf.ListenMetrics, s.metricsHandler, sideWriteTimeout},
+		{listenerHealth, conf.ListenHealth, s.healthHandler, sideWriteTimeout},
+		{listenerProfiler, conf.ListenProfiler, profilerHandler, sideProfileWriteTimeout},
 	}
 	for _, side := range sides {
 		if side.addr == "" {
@@ -109,8 +124,8 @@ func (s *Server) listen(conf *config.Config) error {
 		}
 		s.side = append(s.side, &sideServer{
 			name: side.name,
-			srv:  newHTTPServer(side.name, side.handler()),
-			ln:   ln,
+			srv:  newSideHTTPServer(side.name, side.handler(), side.writeTimeout),
+			ln:   newCappedListener(ln, maxSideConns),
 		})
 	}
 	return nil
@@ -244,6 +259,73 @@ func (s *Server) listenerAddr(name string) string {
 		return ps.ln.Addr().String()
 	}
 	return ""
+}
+
+// newSideHTTPServer creates the server of a side listener: unlike the public side, a request
+// must arrive whole (body included) within sideReadTimeout, and its answer within writeTimeout
+func newSideHTTPServer(name string, handler http.Handler, writeTimeout time.Duration) *http.Server {
+	srv := newHTTPServer(name, handler)
+	srv.ReadHeaderTimeout = sideReadTimeout
+	srv.ReadTimeout = sideReadTimeout
+	srv.WriteTimeout = writeTimeout
+	return srv
+}
+
+// cappedListener accepts at most a number of connections at once; the next ones wait in the
+// kernel's backlog until one closes
+type cappedListener struct {
+	net.Listener
+	slots     chan struct{}
+	closed    chan struct{} // Closed by Close, so that an Accept waiting for a slot returns
+	closeOnce sync.Once
+}
+
+// newCappedListener caps a listener at max open connections
+func newCappedListener(ln net.Listener, max int) *cappedListener {
+	return &cappedListener{
+		Listener: ln,
+		slots:    make(chan struct{}, max),
+		closed:   make(chan struct{}),
+	}
+}
+
+// Accept waits for a free slot, then for a connection
+func (l *cappedListener) Accept() (net.Conn, error) {
+	select {
+	case l.slots <- struct{}{}:
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.slots
+		return nil, err
+	}
+	return &cappedConn{
+		Conn:    c,
+		release: func() { <-l.slots },
+	}, nil
+}
+
+// Close closes the listener, also for an Accept that waits for a slot
+func (l *cappedListener) Close() error {
+	l.closeOnce.Do(func() {
+		close(l.closed)
+	})
+	return l.Listener.Close()
+}
+
+// cappedConn gives its listener's slot back when it closes, once
+type cappedConn struct {
+	net.Conn
+	release func()
+	once    sync.Once
+}
+
+// Close closes the connection and frees its slot
+func (c *cappedConn) Close() error {
+	c.once.Do(c.release)
+	return c.Conn.Close()
 }
 
 // newHTTPServer creates a server without read or write timeouts beyond the request header (its
