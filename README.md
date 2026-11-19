@@ -234,8 +234,9 @@ cannot be hijacked.
   the garbage line and 400/414. They count for response rules like `status == 400 &&
   upstream_status == 0`. A header over 64 KiB gets 431 (nginx: 400/414 over 8 KiB per line).
 - The access log escapes like nginx (`\xHH` for quotes, backslashes, non-printable bytes, and
-  spaces in the unquoted fields), caps each field at 4 KiB, and redacts `auth=` query values (the
-  web app's credentials), which nginx logged verbatim.
+  spaces in the unquoted fields), caps each field at 512 bytes (HTTP/2 resends large headers for a few
+  bytes each), and redacts `auth=` query values (the web app's credentials) in the request target
+  and the Referer, and the userinfo of absolute URLs, which nginx logged verbatim.
 - HTTP/2 `:path` and `:authority` are checked like Go's HTTP/1 parser does it (400 otherwise).
 - A request a rule answers (block, limit, redirect, static) is answered without reading its body,
   and its connection closes after the answer if it had one (nginx reads and discards the body).

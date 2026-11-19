@@ -151,6 +151,8 @@ func TestAccessLog_LineFormat(t *testing.T) {
 		"exactly max":   {target: "/", ua: strings.Repeat("u", maxLogField), host: "ntfy.sh", o: Outcome{Site: "ntfy"}, status: 200},
 		"upstream 101":  {target: "/mytopic/ws", ua: "ntfy", host: "ntfy.sh", o: Outcome{Site: "ntfy", Upstream: "app3", UpstreamStatus: 101, Bytes: 4096}, status: 101},
 		"auth in path?": {target: "/auth?Auth=x&AUTH=y&auth", host: "ntfy.sh", o: Outcome{Site: "ntfy"}, status: 200},
+		"auth referer":  {target: "/x", referer: "https://ntfy.sh/mytopic?auth=secret", host: "ntfy.sh", o: Outcome{Site: "ntfy"}, status: 200},
+		"userinfo":      {target: "http://phil:secret@ntfy.sh/x", host: "ntfy.sh", o: Outcome{Site: "ntfy"}, status: 200},
 	} {
 		f, err := os.Create(filepath.Join(dir, strings.ReplaceAll(name, " ", "-")+".log"))
 		require.NoError(t, err)
@@ -187,7 +189,7 @@ func TestAccessLog_LineFormat(t *testing.T) {
 		want := fmt.Sprintf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\" http_host=%s site=%s request_time=",
 			"203.0.113.7", start.Format(timeFormat),
 			escapeUnquoted("GET")+" "+escapeUnquoted(redactAuth(tc.target))+" "+escapeUnquoted("HTTP/1.1"),
-			tc.status, tc.o.Bytes, orDash(escape(tc.referer)), orDash(escape(tc.ua)), orDash(escapeUnquoted(tc.host)), site)
+			tc.status, tc.o.Bytes, orDash(escape(redactAuth(tc.referer))), orDash(escape(tc.ua)), orDash(escapeUnquoted(tc.host)), site)
 		line := string(b)
 		require.True(t, strings.HasPrefix(line, want), "%s:\n%s\n%s", name, line, want)
 		rest := strings.TrimPrefix(line, want) // The request time varies: "N.NNN upstream=..."
@@ -217,7 +219,11 @@ func TestAccessLog_EscapeAndRedact(t *testing.T) {
 	require.Equal(t, "/auth", redactAuth("/auth"))
 	require.Equal(t, "/a?%61uth=REDACTED&x=1", redactAuth("/a?%61uth=secret&x=1")) // ntfy decodes the name
 	require.Equal(t, "/a?%41UT%48=REDACTED", redactAuth("/a?%41UT%48=secret"))
-	require.Equal(t, "/a?%zzauth=x", redactAuth("/a?%zzauth=x")) // Not a valid escape: not auth either
+	require.Equal(t, "/a?%zzauth=x", redactAuth("/a?%zzauth=x"))                                           // Not a valid escape: not auth either
+	require.Equal(t, "http://REDACTED@ntfy.sh/x", redactAuth("http://phil:secret@ntfy.sh/x"))              // Absolute-form target
+	require.Equal(t, "https://REDACTED@ntfy.sh/a?auth=REDACTED", redactAuth("https://t@ntfy.sh/a?auth=s")) // A Referer
+	require.Equal(t, "/x@y/z", redactAuth("/x@y/z"))                                                       // No authority: no userinfo
+	require.Equal(t, "http://ntfy.sh/x@y", redactAuth("http://ntfy.sh/x@y"))
 }
 
 // flakyWriter fails its first fails writes, then takes everything
@@ -260,4 +266,23 @@ func skipUnderRace(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestAccessLog_LineSizeIsBounded(t *testing.T) {
+	// Over HTTP/2, header compression lets a client resend large headers for a few bytes each:
+	// a line must stay small whatever the client sends, or a cheap flood fills the disk
+	f, err := os.Create(filepath.Join(t.TempDir(), "access.log"))
+	require.NoError(t, err)
+	l := newLog(f)
+	big := strings.Repeat("x", 4096)
+	r := httptest.NewRequest(http.MethodGet, "/"+big, nil)
+	r.Host = big
+	r.Header.Set("User-Agent", big)
+	r.Header.Set("Referer", big)
+	r.Header.Set("Origin", big)
+	l.Write(NewEntry(r, time.Now()), Outcome{Status: http.StatusTooManyRequests})
+	l.close()
+	b, err := os.ReadFile(f.Name())
+	require.NoError(t, err)
+	require.Less(t, len(b), 3*1024)
 }

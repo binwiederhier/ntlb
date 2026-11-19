@@ -26,7 +26,7 @@ var (
 const (
 	lineSize    = 320                          // Room for a typical line, built in one allocation
 	timeFormat  = "02/Jan/2006:15:04:05 -0700" // nginx's $time_local
-	maxLogField = 4096                         // Bytes per escaped field, so one request cannot write a huge line
+	maxLogField = 512                          // Bytes per escaped field, so one request cannot write a huge line (HTTP/2 resends headers for a few bytes)
 )
 
 // Log is a buffered log file that a reload can swap for a reopened one (for logrotate). As
@@ -82,7 +82,7 @@ func NewEntry(r *http.Request, start time.Time) *Entry {
 		Start:      start,
 		RemoteAddr: remoteAddr,
 		Request:    escapeUnquoted(r.Method) + " " + escapeUnquoted(redactAuth(r.RequestURI)) + " " + escapeUnquoted(r.Proto),
-		Referer:    escape(r.Referer()),
+		Referer:    escape(redactAuth(r.Referer())),
 		UserAgent:  escape(r.UserAgent()),
 		Host:       escapeUnquoted(r.Host),
 		Origin:     escape(r.Header.Get("Origin")),
@@ -238,9 +238,10 @@ func escaped(c byte, spaces bool) bool {
 	return c < 0x20 || c > 0x7e || c == '"' || c == '\\' || (spaces && c == ' ')
 }
 
-// redactAuth hides the values of auth query parameters (the web app's credentials). A URI without
-// one is returned as it is.
+// redactAuth hides the values of auth query parameters (the web app's credentials) and the
+// userinfo of an absolute URL. A URI without either is returned as it is.
 func redactAuth(uri string) string {
+	uri = redactUserinfo(uri)
 	path, query, ok := strings.Cut(uri, "?")
 	if !ok || !hasAuthParam(query) {
 		return uri
@@ -252,6 +253,24 @@ func redactAuth(uri string) string {
 		}
 	}
 	return path + "?" + strings.Join(params, "&")
+}
+
+// redactUserinfo hides the user and password of an absolute URL (http://user:pass@host/...), as
+// an absolute-form request target or a Referer can carry them
+func redactUserinfo(uri string) string {
+	scheme, rest, ok := strings.Cut(uri, "://")
+	if !ok || strings.ContainsAny(scheme, "/?") {
+		return uri
+	}
+	authority := rest
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		authority = rest[:i]
+	}
+	at := strings.LastIndexByte(authority, '@')
+	if at < 0 {
+		return uri
+	}
+	return scheme + "://REDACTED" + rest[at:]
 }
 
 // hasAuthParam reports whether a query has an auth=... parameter, any case

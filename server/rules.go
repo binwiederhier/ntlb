@@ -19,7 +19,7 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request, env *match.Env, 
 	case config.ActionRedirect:
 		location := rule.LocationProgram.String(env)
 		if location == "" {
-			slog.Warn("Redirect rule has no location for a request", "rule", rule.Name, "uri", env.URI)
+			slog.Warn("Redirect rule has no location for a request", "rule", rule.Name, "path", env.Path) // Not the query: it may hold auth=
 			writeError(w, pages, httpErrNoLocation)
 			return
 		}
