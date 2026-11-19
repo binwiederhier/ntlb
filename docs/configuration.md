@@ -126,6 +126,10 @@ flowchart TD
     def -- no --> nf["404, logged with site=-"]
 ```
 
+A request that no site serves gets only the global rules, not any site's, so a limit in a site's
+`rules` does not see it. It costs no upstream (the 404 is ntlb's own), but to limit or ban every
+request, put the `limit` in the global `rules`, or give the listener a site without `hosts`.
+
 On HTTPS, the certificate is the one of the listener's site that matches the client's SNI the same
 way, else the listener's first site's.
 
