@@ -47,12 +47,14 @@ func (s *Server) adminHandler() http.Handler {
 }
 
 // localOnly refuses requests from web pages: cross-origin ones (CSRF), which browsers mark with
-// an Origin header, and DNS rebinding, where a page's own hostname resolves to this listener. It
+// an Origin header, or, for a GET from an <img> and the like that has none, with Sec-Fetch-Site
+// ("none" is a URL typed into the address bar), and DNS rebinding, where a page's own hostname resolves to this listener. It
 // also refuses clients outside loopback and private networks: nothing here authenticates, so a
 // listener bound to a public address by mistake must not hand out reloads, drains and pprof.
 func localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(headerOrigin) != "" || !localHost(r.Host) || !privateClient(r.RemoteAddr) {
+		fromPage := r.Header.Get(headerOrigin) != "" || r.Header.Get(headerSecFetchSite) != "" && r.Header.Get(headerSecFetchSite) != "none"
+		if fromPage || !localHost(r.Host) || !privateClient(r.RemoteAddr) {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return
 		}

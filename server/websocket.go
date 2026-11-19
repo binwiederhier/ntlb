@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+const (
+	upgradeWebSocket = "websocket" // The only protocol a request may upgrade to
+)
+
 // WebSockets take the stream path (see stream.go): instead of the reverse proxy, which holds four
 // goroutines and four buffers per WebSocket for its whole life, the client connection is
 // hijacked, the handshake sent to the upstream on a raw connection, and after its 101 both
@@ -108,12 +112,17 @@ func takeBuffered(r *bufio.Reader) []byte {
 }
 
 // upgradeType returns the protocol a request upgrades to, or "" if it is no upgrade: an Upgrade
-// header counts only with "Upgrade" in Connection, like the reverse proxy has it
+// header counts only with "Upgrade" in Connection, like the reverse proxy has it, and only for
+// WebSocket. Another protocol (h2c) that an upstream switched to would be a raw tunnel past the
+// rules, limits and logs; such a request goes as a plain one, its Upgrade header dropped.
 func upgradeType(h http.Header) string {
 	for _, field := range h.Values(headerConnection) {
 		for _, token := range strings.Split(field, ",") {
 			if strings.EqualFold(strings.TrimSpace(token), headerUpgrade) {
-				return h.Get(headerUpgrade)
+				if upgrade := h.Get(headerUpgrade); strings.EqualFold(upgrade, upgradeWebSocket) {
+					return upgrade
+				}
+				return ""
 			}
 		}
 	}

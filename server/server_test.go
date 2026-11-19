@@ -225,7 +225,7 @@ func (u *testUpstream) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer conn.Close()
-		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")
+		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 		brw.Flush()
 		io.Copy(conn, brw)
 	default:

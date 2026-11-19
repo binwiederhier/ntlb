@@ -207,7 +207,7 @@ func TestGzip_UpgradesUntouched(t *testing.T) {
 	conn, err := net.Dial("tcp", s.HTTPAddr())
 	require.NoError(t, err)
 	defer conn.Close()
-	fmt.Fprint(conn, "GET /echo/ws HTTP/1.1\r\nHost: x\r\nUpgrade: test\r\nConnection: Upgrade\r\nAccept-Encoding: gzip\r\n\r\n")
+	fmt.Fprint(conn, "GET /echo/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nAccept-Encoding: gzip\r\n\r\n")
 	r := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(r, nil)
 	require.NoError(t, err)

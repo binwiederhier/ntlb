@@ -174,7 +174,7 @@ func TestProxy_DrainingRefusesNewSubscriptions(t *testing.T) {
 	conn, err := net.Dial("tcp", s.HTTPAddr())
 	require.NoError(t, err)
 	defer conn.Close()
-	fmt.Fprint(conn, "GET /v1/upgrade HTTP/1.1\r\nHost: x\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")
+	fmt.Fprint(conn, "GET /v1/upgrade HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	require.NoError(t, err)
 	resp.Body.Close()
@@ -1198,7 +1198,7 @@ func upgradeThen(then func(net.Conn)) http.HandlerFunc {
 			return
 		}
 		defer conn.Close()
-		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")
+		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 		brw.Flush()
 		then(conn)
 	}
@@ -1211,7 +1211,7 @@ func openUpgrade(t testing.TB, addr, path string) (net.Conn, *bufio.Reader) {
 	t.Cleanup(func() {
 		conn.Close()
 	})
-	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: x\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n", path)
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", path)
 	r := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(r, nil)
 	require.NoError(t, err)

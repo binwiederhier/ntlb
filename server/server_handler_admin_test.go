@@ -232,6 +232,25 @@ func TestAdmin_RejectsBrowserRequests(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, do(http.MethodGet, s.AdminAddr(), "/v1/status", "evil.example:"+port, ""))
 	require.Equal(t, http.StatusForbidden, do(http.MethodGet, s.ProfilerAddr(), "/debug/pprof/", "evil.example", ""))
 
+	// A page's GET to an IP literal can come without an Origin (an <img>, say), but browsers mark
+	// it with Sec-Fetch-Site; only "none" (typed into the address bar) is let through
+	for _, site := range []string{"cross-site", "same-site", "same-origin"} {
+		req, err := http.NewRequest(http.MethodGet, "http://"+s.ProfilerAddr()+"/debug/pprof/heap?gc=1", nil)
+		require.NoError(t, err)
+		req.Header.Set("Sec-Fetch-Site", site)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusForbidden, resp.StatusCode, site)
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://"+s.ProfilerAddr()+"/debug/pprof/", nil)
+	require.NoError(t, err)
+	req.Header.Set("Sec-Fetch-Site", "none")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
 	// IP literals and localhost, as curl and Prometheus send them, are fine
 	for _, host := range []string{"", "localhost:" + port, "localhost", "[::1]:" + port} {
 		require.Equal(t, http.StatusOK, do(http.MethodGet, s.AdminAddr(), "/v1/status", host, ""), host)

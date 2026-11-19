@@ -48,6 +48,7 @@ const (
 	headerETag            = "ETag"
 	headerHost            = "Host"
 	headerOrigin          = "Origin"
+	headerSecFetchSite    = "Sec-Fetch-Site"
 	headerVary            = "Vary"
 	encodingGzip          = "gzip"
 	connectionClose       = "close"
@@ -159,7 +160,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stream := bodyless && subscription && !upgrade || upgraded
 	longLived := subscription || upgraded // An upgrade is long-lived whether streams.match says so or not
 	switch {
-	case longLived && upgrade:
+	case upgraded:
 		pr.kind = kindWebSocket
 	case longLived:
 		pr.kind = kindStream

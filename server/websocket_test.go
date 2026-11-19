@@ -326,7 +326,7 @@ func TestWebSocket_DrainClosesWithoutCloseFrame(t *testing.T) {
 	conn, err := net.Dial("tcp", s.HTTPAddr())
 	require.NoError(t, err)
 	defer conn.Close()
-	_, err = conn.Write([]byte("GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")) // The fake upstream speaks "test"
+	_, err = conn.Write([]byte("GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 	require.NoError(t, err)
 	r := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(r, nil)
@@ -360,4 +360,26 @@ func TestWebSocket_EndsWhenUpstreamCloses(t *testing.T) {
 	waitFor(t, func() bool {
 		return s.balancer.Status().Streams == 0
 	})
+}
+
+func TestWebSocket_OnlyWebSocketUpgrades(t *testing.T) {
+	// Only WebSocket switches protocols: any other upgrade (h2c, say) to an upstream that would
+	// accept it would give the client a raw tunnel past the rules, limits and logs. It is proxied
+	// as a plain request, without its Upgrade header
+	app1 := newTestUpstream(t, "app1")
+	app1.on("/echo-upgrade", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "upgrade=%q", r.Header.Get("Upgrade"))
+	})
+	s, _ := newTestServer(t, "", app1)
+	c, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = io.WriteString(c, "GET /echo-upgrade HTTP/1.1\r\nHost: x\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n")
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, `upgrade=""`, string(body))
 }
