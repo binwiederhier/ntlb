@@ -21,9 +21,9 @@ import (
 const (
 	interval   = 250 * time.Millisecond // How often the use is sampled
 	minProcs   = 3                      // Never fewer: at 2, a fan-out to thousands of streams at once took twice as long
-	targetUse  = 0.4                    // Use per P after a change: room for bursts
-	raiseAbove = 0.6                    // Use per P above which Ps are added right away
-	lowerBelow = 0.25                   // Use per P below which Ps are taken away, once it held for lowerAfter samples
+	targetUse  = 0.2                    // Use per P after a change: room for bursts, and idle Ps for the GC (docs/design.md, Scale test)
+	raiseAbove = 0.3                    // Use per P above which Ps are added right away
+	lowerBelow = 0.12                   // Use per P below which Ps are taken away, once it held for lowerAfter samples
 	lowerAfter = 8                      // Samples (2s)
 )
 

@@ -654,8 +654,9 @@ and going back to sleep. Locally, 5,000 streams at one message a second took 0.3
 
 All runs: 0 lost, 0 errors. The timers (see [Proxy](#proxy-serverproxygo)) and one read per
 message (see [Stream path](#stream-path-serverstreamgo)) save 3%. `procs` samples the process's
-CPU time every 250ms and sets GOMAXPROCS to keep each P at 40% busy: raised at once when a P is
-above 60%, lowered once every P stayed below 25% for 2s, between a minimum and all CPUs. An
+CPU time every 250ms and sets GOMAXPROCS to keep each P at 20% busy: raised at once when a P is
+above 30%, lowered once every P stayed below 12% for 2s, between a minimum and all CPUs (40%,
+60% and 25% until the scale test, see [Scale test](#scale-test-2026-11-19)). An
 operator's `GOMAXPROCS` disables it. The scheduler's share fell from 18% to 15% (12% at a minimum of 2); most of what is
 left above nginx is HTTP/2's frame writer, a goroutine and a TLS write per flush, inside
 net/http.
@@ -703,6 +704,59 @@ the weight cannot help, and assists are the runtime working as designed.
 The live heap is spread over many owners, none worth a rewrite on its own: HTTP/2 server state
 (~19% of live objects), the per-request observe and proxy state, TLS handshake state the
 connection keeps (~6%), and goroutine stacks (~21% of the mark CPU).
+
+## Scale test (2026-11-19)
+
+How far one ntlb goes, with the prod config (roles/ntlb templates, GOGC and the unit as in prod
+unless noted). Lab: ntlb on a 16 vCPU / 24 GB VM (Ryzen 7 8745HS), the generator on a 16 vCPU /
+18 GB VM, a stub ntfy (Go, holds streams, fans out publishes, answers polls) on an 8 vCPU / 11 GB
+VM, 10 GbE. Clients from 10.96.0.0/11 (a local route on the generator), 4 streams per IP, the
+soak mix (h2 70%, h1+TLS 20%, h1 5%, ws 3%, sse 2%), per 100k streams 125 publishes/s and 500
+polls/s, 30 min mean stream life. The generator and the stub ran out of memory first, so 350k
+streams (194k connections) is the harness's limit, not ntlb's.
+
+| Streams | GOGC | Cores | RSS | Per stream | Goroutines | fds |
+|---|---|---|---|---|---|---|
+| 100k | 100 | 0.37 | 4.1 GB | 41 KB | 148k | 156k |
+| 100k | 50 | 0.3-0.5 | 3.8 GB | 38 KB | 148k | 156k |
+| 200k | 100 | 0.64-0.79 | 8.4 GB | 42 KB | 297k | 312k |
+| 300k | 50 | 1.1 | 10.2 GB | 34 KB | 445k | 469k |
+| 350k | 50 | 1.7-2.2 | 12.2 GB | 35 KB | 520k | 547k |
+
+All steady runs: 0 lost, 0 errors. Memory is linear; at 100k it is ~13 KB of live heap, ~12 KB
+of goroutine stacks (1.47 goroutines per stream, 8 KB each) and the GC's headroom. The heap is
+mostly the standard library's: HTTP/2's per-stream response writer (a 4 KB bufio.Writer),
+TLS (record buffers and AES-GCM state, ~5 KB per connection), HTTP/2 connection state; ntlb's
+own (contexts, timers, the response env, the log entry) is ~2 KB per stream. Running the
+upstream dial in a goroutine of its own did not shrink the handler stacks (they stay at 8 KB).
+
+GOMAXPROCS at 350k streams (GOGC=50, 90s windows, ntlb's request durations, ~2,200 req/s):
+
+| Ps | Cores | Requests < 5 ms | < 100 ms | Scheduler p99 |
+|---|---|---|---|---|
+| `procs` at 40% per P (5 Ps) | 1.74 | 92.0% | 97.6% | 10 ms |
+| `GOMAXPROCS=16` | 2.17 | 97.5% | 99.8% | 0.08 ms |
+| `procs` at 20% per P (7 Ps) | 1.88 | 97.4% | 99.8% | 0.9 ms |
+
+The delays came with GC cycles (one every ~20s on a 5 GB live heap): with few idle Ps the GC's
+marking takes Ps from the requests and adds assists. At prod's load (85k streams, about half a
+core) that is 3 Ps before and 3-4 after.
+
+Storms: a restart at 350k streams took 2 min of drain at 4-9.5 cores (the drained clients came
+straight back, were turned away with a 503 after a full TLS handshake each: in the lab there is
+no other load balancer to go to), then 250k streams were back within ~70s, peaking at 6.7 cores.
+A crash of the stub at 300k (all streams cut at once) peaked at 14.8 cores; ntlb stayed up.
+
+Memory pressure: capped at 9 GB (memory.high) of its 12.3 GB with zswap and a swap file, ntlb
+went to 12.5 cores (7.2 of them GC), 19% of requests under 5 ms and a tenth of the throughput,
+and its health checks timed out until both upstreams were marked down. The GC walks the whole
+heap and every stack each cycle, so no page stays cold: no swap, zram or zswap on a load
+balancer; size the RAM (~40 KB per stream at GOGC=100) and set GOMEMLIMIT below it so the GC
+works harder before the kernel steps in.
+
+Limits ahead: LimitNOFILE=1000000 (pkg/ntlb.service) at ~1.55 fds per stream ends at ~640k
+streams; maxClientConns (400k connections) at ~1.8 streams per connection at ~720k. The kernel
+was no limit (no drops, softirq under 10% in storms, ~4 KB of kernel memory per socket).
 
 ## Faults under load (2026-11-11)
 
