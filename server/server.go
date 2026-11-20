@@ -306,6 +306,9 @@ func (s *Server) observe(listen string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		markHandled(r.Context())
+		if connExpired(r.Context(), start) {
+			w.Header().Set(headerConnection, connectionClose) // HTTP/2: a GOAWAY, see maxConnAge
+		}
 		boundWrites := boundFinalWrites(w, r)
 		defer boundWrites()
 		conf := s.config.Load()

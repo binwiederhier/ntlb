@@ -446,7 +446,7 @@ Taken over from the ntfy.sh nginx config: `hash $binary_remote_addr` (now consis
 lbagent health checks and hysteresis, `proxy_next_upstream error timeout http_503`, 5s connect
 timeout, 3m read timeout, `proxy_buffering off`, `proxy_request_buffering off`,
 `client_max_body_size 0`, `X-Forwarded-For` appending (`$proxy_add_x_forwarded_for`) and `Host`
-passthrough, WebSocket upgrades, HTTP/2, `keepalive_timeout 65`, multiple ports per node, access
+passthrough, WebSocket upgrades, HTTP/2, `keepalive_timeout 65` and `keepalive_time 1h`, multiple ports per node, access
 logs in the `combined_ssl` format split by outcome, `gzip` (level 6, `gzip_min_length 1100`,
 `gzip_proxied any`; subscriptions are not compressed, where nginx would compress a `/raw` stream),
 `worker_shutdown_timeout`-style draining (now paced), and, as rules, the abuse maps, `limit_req`

@@ -45,6 +45,12 @@ var (
 	// or /24, 48 per IPv6 address, 79 per /48 (vars for the tests).
 	maxOpenConnsPerClient  = 500
 	maxOpenConnsPerNetwork = 2000
+
+	// maxConnAge closes a client connection this old after the response it is on, like nginx's
+	// keepalive_time (1h). A client that polls over one kept-alive connection never goes idle, so
+	// without it the client stays on this load balancer for good, and DNS never spreads it over
+	// the others again (HTTP/2: a GOAWAY, its open streams run on; a variable for the tests).
+	maxConnAge = time.Hour
 )
 
 const (
@@ -122,12 +128,14 @@ type connInfo struct {
 	key     string      // The client, for pending
 	network string      // The client's network, for pending
 	counted atomic.Bool // In pending, until the first request or the close
+	opened  time.Time   // Accepted, for maxConnAge
 }
 
 // connContext registers a new connection, as http.Server.ConnContext
 func (t *connTracker) connContext(ctx context.Context, c net.Conn) context.Context {
 	remote := c.RemoteAddr().String() // Always ip:port from a TCP listener
 	info := &connInfo{
+		opened:  time.Now(),
 		pending: t.pending,
 		key:     string(clientKey(remote, t.config.Load().ClientKey)),
 		network: string(clientkey.Of(clientkey.Parse(remote), pendingIPv4PrefixBits, pendingIPv6PrefixBits)),
@@ -253,6 +261,12 @@ func markHandled(ctx context.Context) {
 		info.handled.Store(true)
 		info.release()
 	}
+}
+
+// connExpired reports whether the request's connection is older than maxConnAge
+func connExpired(ctx context.Context, now time.Time) bool {
+	info, ok := ctx.Value(connInfoKey{}).(*connInfo)
+	return ok && now.Sub(info.opened) > maxConnAge
 }
 
 // release takes the connection out of its client's pending count, once

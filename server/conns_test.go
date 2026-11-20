@@ -2,11 +2,13 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strings"
@@ -379,4 +381,75 @@ func TestConns_OpenPerNetworkCapped(t *testing.T) {
 	require.False(t, closedByServer(dialFrom(t, "127.0.1.1", s.HTTPAddr()))) // Another /24
 	_, metrics := adminDo(t, s, http.MethodGet, "/metrics", "")
 	require.Contains(t, metrics, `ntlb_connections_refused_total{reason="network_open"} 1`)
+}
+
+func TestConns_OldHTTP1ConnectionIsClosedAfterItsNextResponse(t *testing.T) {
+	// Like nginx's keepalive_time: a kept-alive connection older than maxConnAge is closed after
+	// the response it is on, so a client that polls over one connection forever reconnects, and
+	// DNS spreads it over the load balancers again
+	t.Cleanup(func(d time.Duration) func() { return func() { maxConnAge = d } }(maxConnAge))
+	maxConnAge = 300 * time.Millisecond
+	s, _ := newTestServer(t, "", newTestUpstream(t, "app1"))
+	conn, err := net.Dial("tcp", s.HTTPAddr())
+	require.NoError(t, err)
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	poll := func() *http.Response {
+		_, err := io.WriteString(conn, "GET /name HTTP/1.1\r\nHost: x\r\n\r\n")
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err)
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		return resp
+	}
+	require.False(t, poll().Close)
+	time.Sleep(maxConnAge + 100*time.Millisecond)
+	require.True(t, poll().Close)
+	require.True(t, closedByServer(conn))
+}
+
+func TestConns_OldHTTP2ConnectionGetsGoAwayAndKeepsItsStreams(t *testing.T) {
+	// HTTP/2: the response on a connection older than maxConnAge carries a GOAWAY, so the client
+	// sends its next request on a new connection, while the streams open on the old one run on
+	t.Cleanup(func(d time.Duration) func() { return func() { maxConnAge = d } }(maxConnAge))
+	maxConnAge = 300 * time.Millisecond
+	s := newTLSTestServer(t, "", newTestUpstream(t, "app1"))
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		ForceAttemptHTTP2: true,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	base := "https://" + s.HTTPSAddr()
+	stream, closeStream := openStream(t, client, base+"/mytopic/json")
+	defer closeStream()
+	var conns []net.Conn
+	poll := func() {
+		trace := &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				conns = append(conns, info.Conn)
+			},
+		}
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, base+"/name", nil)
+		require.NoError(t, err)
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.Equal(t, 2, resp.ProtoMajor)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+	}
+	poll()
+	time.Sleep(maxConnAge + 100*time.Millisecond)
+	poll() // Still on the old connection, which this response closes with a GOAWAY
+	waitFor(t, func() bool {
+		poll()
+		return conns[len(conns)-1] != conns[0]
+	})
+	require.Equal(t, conns[0], conns[1])
+	require.False(t, streamClosed(stream), "a stream on the old connection was cut")
 }

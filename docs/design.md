@@ -162,7 +162,10 @@ drained stream logs there.
 
 `New` binds all listeners (errors surface before serving). `Serve` runs the first health round,
 then serves. HTTP servers have only `ReadHeaderTimeout` (30s) and `IdleTimeout` (65s): no
-read/write timeouts, as requests are long streams both ways. Client TCP keepalives are set on the
+read/write timeouts, as requests are long streams both ways. A client connection older than an hour
+is closed after the response it is on (`maxConnAge`, nginx's `keepalive_time`; HTTP/2: a GOAWAY,
+its open streams run on), so a client that polls over one kept-alive connection reconnects and DNS
+spreads it over the load balancers again. Client TCP keepalives are set on the
 `net.ListenConfig`. HTTPS gets its certificate from an `atomic.Pointer` that `Reload` replaces.
 
 `Shutdown(d)`: `Drain(d)`, wait until no session is open (or `d` + 2s), then cancel whatever is
